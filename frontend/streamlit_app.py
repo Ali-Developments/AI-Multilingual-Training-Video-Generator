@@ -1,0 +1,513 @@
+"""Streamlit Frontend Application for AI Training Video Generation Platform.
+
+Provides an interactive dashboard for:
+- Inputting training video requirements (topic, content, locales, duration, audience, tone).
+- Inspecting canonical and localized scripts (with RTL/LTR and cultural notes).
+- Audio waveform tracks and playback.
+- Avatar video segments and eligibility.
+- Supporting visual slide graphics and subtitle cues (SRT/VTT).
+- Composed final multilingual training videos with preview and download.
+- Manifest lifecycle tracking, idempotency, and partial pipeline resume.
+"""
+
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+import streamlit as st
+
+from frontend.helpers import (
+    DEFAULT_BACKEND_URL,
+    DIRECT_ENGINE_AVAILABLE,
+    APIClientError,
+    check_backend_health,
+    create_project_via_api,
+    fetch_project_manifest_via_api,
+    fetch_projects_direct,
+    fetch_projects_via_api,
+    format_api_error_detail,
+    load_manifest_direct,
+    resume_project_via_api,
+    run_project_via_api,
+    serialize_create_project_payload,
+)
+
+try:
+    from app.core.config import settings
+    from app.models.schemas import TrainingVideoRequest
+    from app.workflows.orchestrator import ProjectOrchestrator
+except ImportError:
+    settings = None
+    TrainingVideoRequest = None
+    ProjectOrchestrator = None
+
+logger = logging.getLogger(__name__)
+
+def render_app():
+    """Main Streamlit UI renderer."""
+    st.set_page_config(
+        page_title="AI Multilingual Training Video Studio",
+        page_icon="🎬",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
+
+    # ---------------------------------------------------------------------------
+    # Sidebar UI: Mode, Providers & Project Selector
+    # ---------------------------------------------------------------------------
+
+    with st.sidebar:
+        st.title("⚙️ Video Studio")
+        st.caption("Multilingual AI Video Orchestration")
+
+        # Engine Connection Mode
+        st.subheader("Connection Mode")
+        backend_url = st.text_input("FastAPI Backend URL", value=DEFAULT_BACKEND_URL)
+        health = check_backend_health(backend_url)
+
+        if health:
+            st.success("🟢 Backend Connected (API Mode)")
+            api_mode = True
+        else:
+            st.warning("🟡 Backend Offline — Direct Mode Active")
+            api_mode = False
+
+        st.markdown("---")
+        st.subheader("Provider Status")
+
+        # Provider Badges
+        has_heygen_key = bool(settings and settings.HEYGEN_API_KEY)
+        live_tests_enabled = bool(settings and settings.ENABLE_LIVE_API_TESTS)
+
+        st.markdown("- **LLM Provider:** `Groq (Llama-3.3-70b)`")
+        st.markdown("- **TTS Engine:** `Edge-TTS (Local Free Tier)`")
+        if has_heygen_key and live_tests_enabled:
+            st.markdown("- **Avatar Engine:** `HeyGen (Live API Active)`")
+        else:
+            st.markdown("- **Avatar Engine:** `Mock Mode Active (0 Credits Used)`")
+        st.markdown("- **Visual Engine:** `Local Visuals (Pillow Full HD)`")
+        st.markdown("- **Compositor:** `FFmpeg Local Native Engine`")
+
+        st.markdown("---")
+        st.subheader("Select Project")
+
+        # Load project list
+        if api_mode:
+            project_list = fetch_projects_via_api(backend_url)
+        else:
+            project_list = fetch_projects_direct()
+
+        project_options = {p["project_id"]: f"{p['project_id'][:8]} — {p.get('topic', 'Untitled')[:25]}" for p in project_list}
+
+        selected_project_id = st.selectbox(
+            "Current Active Project",
+            options=list(project_options.keys()),
+            format_func=lambda x: project_options.get(x, x),
+            index=0 if project_options else None,
+        )
+
+        if st.button("🔄 Refresh Projects"):
+            st.rerun()
+
+    # ---------------------------------------------------------------------------
+    # Main Tabs UI
+    # ---------------------------------------------------------------------------
+
+    tab_create, tab_script, tab_media, tab_visuals, tab_composed, tab_manifest = st.tabs([
+        "🚀 New Project",
+        "📜 Scripts & Locales",
+        "🎙️ Audio & 👤 Avatars",
+        "🖼️ Visuals & 💬 Subtitles",
+        "🎬 Final Composed Videos",
+        "📋 Project Manifest",
+    ])
+
+    # ---------------------------------------------------------------------------
+    # TAB 1: New Project Creation & Execution
+    # ---------------------------------------------------------------------------
+    with tab_create:
+        st.header("Create & Launch Training Video Project")
+        st.markdown(
+            "Define your instructional requirements. The orchestrator will generate canonical scripts, "
+            "localize into target languages, synthesize voiceovers, prepare avatars and slide graphics, "
+            "and compose final videos with FFmpeg."
+        )
+
+        with st.form("project_creation_form"):
+            col_left, col_right = st.columns(2)
+
+            with col_left:
+                topic_input = st.text_input(
+                    "Training Topic *",
+                    value="Workplace Phishing Defense Essentials",
+                    help="The core subject matter or instructional title.",
+                )
+                source_content_input = st.text_area(
+                    "Source Content / Reference Notes (Optional)",
+                    value="Phishing emails often mimic IT department urgent password reset requests. Always inspect the sender domain, avoid clicking links in unsolicited messages, and report suspicious emails to the security operations center immediately.",
+                    height=120,
+                    help="Raw reference documentation or lesson curriculum.",
+                )
+                audience_input = st.text_input(
+                    "Target Audience",
+                    value="Corporate Employees",
+                    help="Who this video is designed to train.",
+                )
+                learning_objectives_input = st.text_area(
+                    "Learning Objectives (One per line)",
+                    value="Recognize deceptive sender email addresses\nVerify password reset links safely\nReport suspicious communications to IT security",
+                    height=90,
+                )
+
+            with col_right:
+                base_lang_input = st.selectbox(
+                    "Base Language",
+                    options=["en-US", "ar-SA", "bn-BD", "es-ES", "fr-FR"],
+                    index=0,
+                )
+                target_locales_input = st.multiselect(
+                    "Target Locales *",
+                    options=["ar-SA", "bn-BD", "es-ES", "fr-FR", "de-DE", "zh-CN"],
+                    default=["ar-SA", "bn-BD"],
+                    help="Select target multilingual locales to produce video packages for.",
+                )
+                target_duration_input = st.slider(
+                    "Target Duration (seconds) *",
+                    min_value=30,
+                    max_value=300,
+                    value=60,
+                    step=10,
+                    help="Target runtime for the composed training video.",
+                )
+                col_tone, col_diff = st.columns(2)
+                with col_tone:
+                    tone_input = st.selectbox(
+                        "Tone",
+                        options=["professional", "authoritative", "encouraging", "conversational"],
+                        index=0,
+                    )
+                with col_diff:
+                    difficulty_input = st.selectbox(
+                        "Difficulty",
+                        options=["beginner", "intermediate", "advanced"],
+                        index=0,
+                    )
+
+                force_regenerate = st.checkbox("Force Regenerate (Overwrite existing assets)", value=False)
+
+            submit_btn = st.form_submit_button("🎬 Create & Generate Full Video Package", use_container_width=True)
+
+        if submit_btn:
+            if not topic_input and not source_content_input:
+                st.error("Please provide at least a Topic or Source Content.")
+            elif not target_locales_input:
+                st.error("Please select at least one Target Locale.")
+            else:
+                objectives = [line.strip() for line in learning_objectives_input.split("\n") if line.strip()]
+                payload = serialize_create_project_payload(
+                    topic=topic_input,
+                    source_content=source_content_input or None,
+                    audience=audience_input,
+                    base_language=base_lang_input,
+                    target_languages=target_locales_input,
+                    target_duration_seconds=target_duration_input,
+                    tone=tone_input,
+                    difficulty_level=difficulty_input,
+                    learning_objectives=objectives,
+                )
+
+                with st.spinner("Initializing and executing autonomous video pipeline..."):
+                    if api_mode:
+                        try:
+                            create_res = create_project_via_api(backend_url, payload, raise_for_status=True)
+                            if create_res:
+                                new_pid = create_res["project_id"]
+                                st.info(f"Project initialized: `{new_pid}`. Running pipeline...")
+                                run_res = run_project_via_api(backend_url, new_pid, force_regenerate=force_regenerate)
+                                if run_res:
+                                    st.success(f"🎉 Pipeline completed successfully with status: {run_res['status']}!")
+                                    st.rerun()
+                                else:
+                                    st.error("Pipeline execution failed to start or complete.")
+                        except APIClientError as api_err:
+                            st.error(f"❌ Project creation failed (HTTP {api_err.status_code}): {api_err.message}")
+                            st.markdown(format_api_error_detail(api_err.detail))
+                            if api_err.detail:
+                                with st.expander("🔍 View Technical Server Response", expanded=False):
+                                    st.json({"status_code": api_err.status_code, "detail": api_err.detail})
+                        except Exception as exc:
+                            st.error(f"❌ Unexpected error connecting to API: {exc}")
+                    elif DIRECT_ENGINE_AVAILABLE and ProjectOrchestrator and TrainingVideoRequest:
+                        try:
+                            req = TrainingVideoRequest(**payload["request"])
+                            orchestrator = ProjectOrchestrator()
+                            manifest = orchestrator.create_project(req)
+                            st.info(f"Project initialized directly: `{manifest.project_id}`. Running pipeline...")
+                            result_manifest = orchestrator.run_pipeline(manifest.project_id, force_regenerate=force_regenerate)
+                            st.success(f"🎉 Pipeline finished directly with status: {result_manifest.status}!")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Direct pipeline run error: {exc}")
+                    else:
+                        st.error("Neither backend API nor direct engine is accessible.")
+
+    # ---------------------------------------------------------------------------
+    # Load Manifest for Active Project
+    # ---------------------------------------------------------------------------
+
+    active_manifest: Optional[Dict[str, Any]] = None
+    if selected_project_id:
+        if api_mode:
+            active_manifest = fetch_project_manifest_via_api(backend_url, selected_project_id)
+        else:
+            active_manifest = load_manifest_direct(selected_project_id)
+
+    if not active_manifest:
+        with tab_script:
+            st.info("No project selected or manifest empty. Create or select a project in the sidebar.")
+        with tab_media:
+            st.info("No project selected or manifest empty.")
+        with tab_visuals:
+            st.info("No project selected or manifest empty.")
+        with tab_composed:
+            st.info("No project selected or manifest empty.")
+        with tab_manifest:
+            st.info("No project selected or manifest empty.")
+    else:
+        # -----------------------------------------------------------------------
+        # TAB 2: Scripts & Locales
+        # -----------------------------------------------------------------------
+        with tab_script:
+            st.header(f"Scripts & Localization — Project `{selected_project_id[:8]}`")
+            status_col1, status_col2, status_col3 = st.columns(3)
+            with status_col1:
+                st.metric("Overall Status", active_manifest.get("status", "unknown").upper())
+            with status_col2:
+                st.metric("Script Status", active_manifest.get("script_status", "unknown").upper())
+            with status_col3:
+                st.metric("Localization Status", active_manifest.get("localization_status", "unknown").upper())
+
+            # Canonical Source Script
+            source_script = active_manifest.get("source_script")
+            if source_script:
+                st.subheader("Canonical Source Script (English / Base)")
+                st.markdown(f"**Title:** {source_script.get('title', 'N/A')} | **Target Duration:** {source_script.get('target_duration_seconds', 0)}s | **Estimated Duration:** {source_script.get('estimated_duration_seconds', 0)}s")
+                
+                scenes = source_script.get("scenes", [])
+                for sc in scenes:
+                    with st.expander(f"Scene {sc.get('scene_id')}: {sc.get('scene_type', 'generic').upper()} ({sc.get('estimated_duration_seconds', 0)}s)", expanded=False):
+                        st.markdown(f"**Narration:** {sc.get('narration')}")
+                        st.markdown(f"**Visual Direction:** {sc.get('visual_direction')}")
+                        st.markdown(f"**On-Screen Text:** {sc.get('on_screen_text') or '*None*'}")
+                        if sc.get("learning_objective_ids"):
+                            st.caption(f"Objectives: {', '.join(sc.get('learning_objective_ids', []))}")
+            else:
+                st.warning("Canonical source script not yet generated.")
+
+            # Localized Scripts
+            loc_bundle = active_manifest.get("localization_bundle")
+            if loc_bundle and loc_bundle.get("scripts"):
+                st.markdown("---")
+                st.subheader("Localized Multilingual Scripts")
+                loc_tabs = st.tabs(list(loc_bundle["scripts"].keys()))
+                for ltab, (loc_code, loc_sc) in zip(loc_tabs, loc_bundle["scripts"].items()):
+                    with ltab:
+                        dir_badge = "➡️ LTR" if loc_sc.get("text_direction") == "ltr" else "⬅️ RTL"
+                        st.markdown(f"**Locale:** `{loc_code}` | **Direction:** {dir_badge} | **Duration:** {loc_sc.get('estimated_duration_seconds', 0)}s")
+                        
+                        if loc_sc.get("cultural_adaptations"):
+                            with st.info("Cultural Guidance & Notes"):
+                                for k, v in loc_sc.get("cultural_adaptations", {}).items():
+                                    st.markdown(f"- **{k}:** {v}")
+
+                        for sc in loc_sc.get("scenes", []):
+                            with st.expander(f"Scene {sc.get('scene_id')}: {sc.get('scene_type', 'scene').upper()}", expanded=False):
+                                st.markdown(f"**Localized Narration:** {sc.get('narration')}")
+                                st.markdown(f"**Visual Direction:** {sc.get('visual_direction')}")
+                                st.markdown(f"**On-Screen Text:** {sc.get('on_screen_text') or '*None*'}")
+
+        # -----------------------------------------------------------------------
+        # TAB 3: Audio & Avatars
+        # -----------------------------------------------------------------------
+        with tab_media:
+            st.header("Audio Tracks & Avatar Video Segments")
+            audio_bundle = active_manifest.get("audio_tracks", {})
+            avatar_bundle = active_manifest.get("avatar_tracks", {})
+
+            col_audio, col_avatar = st.columns(2)
+
+            with col_audio:
+                st.subheader("🎙️ Synthesized Speech (Edge-TTS)")
+                if not audio_bundle:
+                    st.info("Audio tracks not synthesized yet.")
+                else:
+                    for loc_code, track in audio_bundle.items():
+                        with st.expander(f"Locale `{loc_code}` — Total: {track.get('total_duration_seconds', 0.0):.1f}s", expanded=True):
+                            st.caption(f"Voice ID: `{track.get('voice_id')}` | Provider: `{track.get('provider')}`")
+                            for sc_audio in track.get("scene_audios", []):
+                                st.markdown(f"**Scene {sc_audio.get('scene_id')}** ({sc_audio.get('duration_seconds', 0.0):.2f}s):")
+                                audio_path = sc_audio.get("audio_path")
+                                if audio_path and Path(audio_path).is_file():
+                                    st.audio(audio_path)
+                                else:
+                                    st.caption(f"File: `{audio_path}`")
+
+            with col_avatar:
+                st.subheader("👤 Talking Avatar Segments")
+                if not avatar_bundle:
+                    st.info("Avatar video segments not generated yet.")
+                else:
+                    for loc_code, av_track in avatar_bundle.items():
+                        with st.expander(f"Locale `{loc_code}` Avatar Segments", expanded=True):
+                            for av_asset in av_track.get("avatar_videos", []):
+                                st.markdown(f"**Scene {av_asset.get('scene_id')}** ({av_asset.get('status', 'unknown')})")
+                                vpath = av_asset.get("video_path")
+                                if vpath and Path(vpath).is_file():
+                                    st.video(vpath)
+                                else:
+                                    st.caption(f"Asset Path: `{vpath}` (Duration: {av_asset.get('duration_seconds', 0)}s)")
+
+        # -----------------------------------------------------------------------
+        # TAB 4: Visuals & Subtitles
+        # -----------------------------------------------------------------------
+        with tab_visuals:
+            st.header("Visual Slide Graphics & Subtitles")
+            vis_bundle = active_manifest.get("visual_tracks", {})
+            sub_bundle = active_manifest.get("subtitle_tracks", {})
+
+            vcol, scol = st.columns(2)
+
+            with vcol:
+                st.subheader("🖼️ Full HD Visual Slide Cards (1920x1080)")
+                if not vis_bundle:
+                    st.info("Visual slide assets not generated yet.")
+                else:
+                    for loc_code, vtrack in vis_bundle.items():
+                        st.markdown(f"**Locale `{loc_code}` Visual Assets:**")
+                        for vis in vtrack.get("visual_assets", []):
+                            img_path = vis.get("image_path")
+                            caption = f"Scene {vis.get('scene_id')} | Layout: {vis.get('visual_type')} | {vis.get('headline')}"
+                            if img_path and Path(img_path).is_file():
+                                st.image(img_path, caption=caption, use_container_width=True)
+                            else:
+                                st.caption(f"Scene {vis.get('scene_id')}: `{img_path}`")
+
+            with scol:
+                st.subheader("💬 Subtitle Tracks (SRT & VTT)")
+                if not sub_bundle:
+                    st.info("Subtitles not generated yet.")
+                else:
+                    for loc_code, strack in sub_bundle.items():
+                        with st.expander(f"Locale `{loc_code}` Subtitle Files", expanded=True):
+                            srt_path = strack.get("srt_path")
+                            vtt_path = strack.get("vtt_path")
+                            if srt_path and Path(srt_path).is_file():
+                                content = Path(srt_path).read_text(encoding="utf-8")
+                                st.markdown(f"**SRT File (`{Path(srt_path).name}`):**")
+                                st.code(content[:800] + ("..." if len(content) > 800 else ""), language="text")
+                                st.download_button(
+                                    f"⬇️ Download {loc_code} SRT",
+                                    data=content,
+                                    file_name=f"{loc_code}.srt",
+                                    mime="text/plain",
+                                    key=f"dl_srt_{loc_code}",
+                                )
+                            if vtt_path and Path(vtt_path).is_file():
+                                vtt_content = Path(vtt_path).read_text(encoding="utf-8")
+                                st.download_button(
+                                    f"⬇️ Download {loc_code} VTT",
+                                    data=vtt_content,
+                                    file_name=f"{loc_code}.vtt",
+                                    mime="text/vtt",
+                                    key=f"dl_vtt_{loc_code}",
+                                )
+
+        # -----------------------------------------------------------------------
+        # TAB 5: Composed Final Videos
+        # -----------------------------------------------------------------------
+        with tab_composed:
+            st.header("🎬 Final Composed Training Videos")
+            comp_track = active_manifest.get("composition_track")
+            
+            if not comp_track or not comp_track.get("final_videos"):
+                st.info("Final video composition has not been completed yet.")
+            else:
+                final_videos = comp_track.get("final_videos", {})
+                for loc_code, fvid in final_videos.items():
+                    st.subheader(f"Video Package: `{loc_code}`")
+                    c1, c2 = st.columns([3, 2])
+                    with c1:
+                        vpath = fvid.get("video_path")
+                        if vpath and Path(vpath).is_file():
+                            st.video(vpath)
+                            with open(vpath, "rb") as vf:
+                                vbytes = vf.read()
+                            st.download_button(
+                                label=f"⬇️ Download {loc_code} Training Video (MP4)",
+                                data=vbytes,
+                                file_name=f"training_{loc_code}.mp4",
+                                mime="video/mp4",
+                                key=f"dl_video_{loc_code}",
+                                use_container_width=True,
+                            )
+                        else:
+                            st.warning(f"Video file not found at path: `{vpath}`")
+
+                    with c2:
+                        st.markdown("### 📊 Composition Details")
+                        st.markdown(f"- **Locale:** `{fvid.get('locale')}`")
+                        st.markdown(f"- **Duration:** `{fvid.get('duration_seconds', 0.0):.2f} seconds`")
+                        st.markdown(f"- **Resolution:** `{fvid.get('resolution', '1920x1080')}` Full HD")
+                        st.markdown(f"- **Framerate:** `{fvid.get('fps', 25)} FPS`")
+                        st.markdown(f"- **Scene Count:** `{fvid.get('scene_count', 0)} scenes`")
+                        st.markdown(f"- **File Path:** `{fvid.get('video_path')}`")
+
+        # -----------------------------------------------------------------------
+        # TAB 6: Manifest & Project Operations
+        # -----------------------------------------------------------------------
+        with tab_manifest:
+            st.header("📋 Project Manifest & Pipeline Actions")
+            
+            col_act1, col_act2, col_act3 = st.columns(3)
+            with col_act1:
+                if st.button("▶️ Run Pipeline (Idempotent)", use_container_width=True):
+                    with st.spinner("Executing pipeline..."):
+                        if api_mode:
+                            run_res = run_project_via_api(backend_url, selected_project_id, force_regenerate=False)
+                        elif DIRECT_ENGINE_AVAILABLE and ProjectOrchestrator:
+                            orchestrator = ProjectOrchestrator()
+                            run_res = orchestrator.run_pipeline(selected_project_id, force_regenerate=False)
+                        st.success("Pipeline executed!")
+                        st.rerun()
+
+            with col_act2:
+                if st.button("🔁 Resume Pipeline", use_container_width=True):
+                    with st.spinner("Resuming pipeline..."):
+                        if api_mode:
+                            res_res = resume_project_via_api(backend_url, selected_project_id)
+                        elif DIRECT_ENGINE_AVAILABLE and ProjectOrchestrator:
+                            orchestrator = ProjectOrchestrator()
+                            res_res = orchestrator.resume_pipeline(selected_project_id)
+                        st.success("Pipeline resumed!")
+                        st.rerun()
+
+            with col_act3:
+                if st.button("⚡ Force Regenerate All Assets", use_container_width=True):
+                    with st.spinner("Force regenerating all pipeline stages..."):
+                        if api_mode:
+                            run_res = run_project_via_api(backend_url, selected_project_id, force_regenerate=True)
+                        elif DIRECT_ENGINE_AVAILABLE and ProjectOrchestrator:
+                            orchestrator = ProjectOrchestrator()
+                            run_res = orchestrator.run_pipeline(selected_project_id, force_regenerate=True)
+                        st.success("Force regeneration completed!")
+                        st.rerun()
+
+            st.markdown("---")
+            st.subheader("Raw `project.json` Manifest")
+            st.json(active_manifest)
+
+
+if __name__ == "__main__" or "streamlit" in __name__:
+    render_app()
