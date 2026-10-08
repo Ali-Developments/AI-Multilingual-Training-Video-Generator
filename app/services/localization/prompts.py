@@ -227,14 +227,120 @@ TIMING METRICS:
 CORRECTION INSTRUCTIONS:
 1. Fix the narration length, missing fields, or formatting issues identified above.
 2. If the duration is too long, tighten and condense the narration sentences while preserving core learning points.
-3. If the duration is too short, enrich the educational explanation naturally with relevant context.
-4. DO NOT change scene IDs, scene count, scene order, or scene types.
-5. Ensure all on-screen text entries are non-whitespace, or null where appropriate.
-
 <<<SOURCE_SCRIPT_DATA_BEGIN>>>
 {json.dumps(current_data_block, indent=2, ensure_ascii=False)}
 <<<SOURCE_SCRIPT_DATA_END>>>
 
 Output the revised, fully corrected LocalizedScript adhering strictly to the schema.
+"""
+    return prompt
+
+
+SYSTEM_PROMPT_POST_TTS_DURATION_REVISER = """You are an expert educational audio director and localization editor.
+Real text-to-speech (TTS) speech synthesis has been generated and measured for this localized script, and the measured spoken audio duration significantly exceeds the client's target video duration.
+
+Your mission is to CONDENSE and SHORTEN the spoken narration across the scenes so that speech synthesis will hit the target duration, while strictly preserving pedagogical excellence.
+
+CRITICAL RULES:
+1. CONDENSE SPOKEN NARRATION:
+   - Edit the narration text to be more concise, punchy, and direct in the target language.
+   - Remove filler phrasing, repetitive transitions, and wordiness.
+   - Do NOT reduce core factual meaning, compliance instructions, or safety principles.
+2. SENSITIVE SCENE ALLOCATION:
+   - Maintain the educational structure: introductory hook, core instruction, and summary recap.
+   - Prioritize compression on scenes contributing most to the excess duration.
+3. IMMUTABLE STRUCTURE:
+   - Keep the exact same number of scenes in the exact same sequence.
+   - NEVER alter scene_id, order, scene_type, or learning_objective_ids.
+   - NEVER change the locale, language, or cultural setting.
+4. HONEST TIMING:
+   - Update estimated_duration_seconds to reflect the condensed text honestly.
+   - Do NOT fake timing numbers without shortening the actual text.
+5. PRESERVE TERMINOLOGY:
+   - Retain all technical terms, security terms, and protected names intact.
+"""
+
+
+def build_post_tts_duration_revision_prompt(
+    current_script: LocalizedScript,
+    measured_total_seconds: float,
+    target_duration_seconds: float,
+    scene_durations: dict,
+) -> str:
+    """Build targeted prompt instructing LLM to shorten narration based on real measured TTS duration."""
+    excess_seconds = measured_total_seconds - target_duration_seconds
+    compression_ratio = target_duration_seconds / measured_total_seconds if measured_total_seconds > 0 else 1.0
+    reduction_pct = round((1.0 - compression_ratio) * 100, 1)
+
+    scene_breakdown = []
+    # Identify scenes contributing most to excess
+    sorted_scenes = sorted(
+        current_script.scenes,
+        key=lambda s: scene_durations.get(s.scene_id, s.estimated_duration_seconds),
+        reverse=True
+    )
+
+    for s in current_script.scenes:
+        measured_s = scene_durations.get(s.scene_id, s.estimated_duration_seconds)
+        words = len(s.narration.split())
+        target_budget_s = round(measured_s * compression_ratio, 1)
+        scene_breakdown.append(
+            f"- Scene '{s.scene_id}' ({s.scene_type}): Current TTS = {measured_s:.2f}s ({words} words) -> Target Budget ≈ {target_budget_s:.1f}s"
+        )
+
+    scenes_breakdown_text = "\n".join(scene_breakdown)
+    top_excess_scenes = [s.scene_id for s in sorted_scenes[:2]]
+
+    current_data_block = {
+        "title": current_script.title,
+        "locale": current_script.locale,
+        "opening_hook": current_script.opening_hook,
+        "closing_summary": current_script.closing_summary,
+        "total_estimated_duration_seconds": current_script.total_estimated_duration_seconds,
+        "target_duration_seconds": target_duration_seconds,
+        "scenes": [
+            {
+                "scene_id": s.scene_id,
+                "order": s.order,
+                "scene_type": s.scene_type,
+                "title": s.title,
+                "purpose": s.purpose,
+                "narration": s.narration,
+                "estimated_duration_seconds": s.estimated_duration_seconds,
+                "visual_direction": s.visual_direction,
+                "on_screen_text": s.on_screen_text,
+                "learning_objective_ids": s.learning_objective_ids,
+            }
+            for s in current_script.scenes
+        ]
+    }
+
+    prompt = f"""POST-TTS DURATION RECONCILIATION & SCRIPT CONDENSATION
+
+CRITICAL DURATION OVERRUN DETECTED:
+- Client Target Duration: {target_duration_seconds:.1f} seconds
+- Real Measured Audio Duration: {measured_total_seconds:.2f} seconds
+- Net Excess Duration: +{excess_seconds:.2f} seconds ({round((excess_seconds / target_duration_seconds) * 100, 1)}% over target)
+- Required Text Compression Ratio: ~{compression_ratio:.2f} (approx. {reduction_pct}% reduction in spoken words)
+
+SCENE TIMING BREAKDOWN (MEASURED TTS WAVEFORM):
+{scenes_breakdown_text}
+
+PRIORITY REDUCTION TARGETS:
+Scenes contributing most to excess duration: {top_excess_scenes}.
+Ensure instructional clarity is preserved, but significantly tighten the phrasing across these scenes.
+
+CONDENSATION INSTRUCTIONS:
+1. SHORTEN THE SPOKEN NARRATION for each scene so that speaking it takes ~{compression_ratio:.2f}x of the current time.
+2. Retain all core instructional facts, security principles, and learning objectives.
+3. Keep the exact same scene_ids: {[s.scene_id for s in current_script.scenes]} in the exact same order.
+4. Do NOT change scene_type or learning_objective_ids.
+5. Preserve technical terminology and cultural adaptation naturalness.
+
+<<<SOURCE_SCRIPT_DATA_BEGIN>>>
+{json.dumps(current_data_block, indent=2, ensure_ascii=False)}
+<<<SOURCE_SCRIPT_DATA_END>>>
+
+Output the revised, condensed LocalizedScript adhering strictly to the schema.
 """
     return prompt

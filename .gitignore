@@ -60,3 +60,15 @@ storage/projects/*
 *.swo
 .DS_Store
 Thumbs.db
+
+# Isolated Avatar Runtimes & Weights
+tools/
+external/
+.sadtalker-venv/
+checkpoints/
+*.safetensors
+*.pth
+*.pth.tar
+*.ckpt
+*.ass
+*.meta.json

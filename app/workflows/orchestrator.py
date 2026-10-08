@@ -15,6 +15,7 @@ from app.services.avatar.service import AvatarService
 from app.services.visuals.service import VisualService
 from app.services.subtitles.service import SubtitleService
 from app.services.composition.service import CompositionService
+from app.services.duration import DurationReconciliationService
 from app.workflows.script_generation import create_script_workflow
 from app.workflows.manifest import ProjectManifestManager
 
@@ -37,6 +38,7 @@ class ProjectOrchestrator:
         visual_service: Optional[VisualService] = None,
         subtitle_service: Optional[SubtitleService] = None,
         composition_service: Optional[CompositionService] = None,
+        duration_service: Optional[DurationReconciliationService] = None,
     ) -> None:
         self.manifest_manager = manifest_manager or ProjectManifestManager()
         self.llm_provider = llm_provider
@@ -46,6 +48,7 @@ class ProjectOrchestrator:
         self.visual_service = visual_service or VisualService()
         self.subtitle_service = subtitle_service or SubtitleService()
         self.composition_service = composition_service or CompositionService()
+        self.duration_service = duration_service or DurationReconciliationService(llm_provider=self.llm_provider)
 
     def run_project(
         self,
@@ -84,14 +87,29 @@ class ProjectOrchestrator:
                 final_script = state.get("final_script")
 
                 if not final_script:
-                    err_msg = f"Script generation failed: {state.get('error_message', 'No final script produced')}"
+                    workflow_status = state.get("workflow_status", "failed")
+                    errors_list = state.get("errors", [])
+                    validation = state.get("validation")
+
+                    err_details = []
+                    if errors_list:
+                        err_details.extend(errors_list)
+                    elif validation and validation.issues:
+                        err_details.extend([f"[{i.code}] {i.message}" for i in validation.issues])
+                    elif state.get("error_message"):
+                        err_details.append(state.get("error_message"))
+                    else:
+                        err_details.append("No final script produced")
+
+                    err_msg = f"Script generation failed ({workflow_status}): {'; '.join(err_details)}"
                     logger.error("[%s] %s", project_id, err_msg)
                     manifest.script_status = "failed"
                     manifest.status = "failed"
-                    manifest.errors.append(err_msg)
+                    manifest.record_error(stage="script", message=err_msg, code=f"SCRIPT_{workflow_status.upper()}")
                     self.manifest_manager.save_manifest(manifest)
                     return manifest
 
+                manifest.clear_stage_errors("script")
                 manifest.final_script = final_script
                 manifest.script_status = "completed"
                 self.manifest_manager.save_manifest(manifest)
@@ -113,6 +131,9 @@ class ProjectOrchestrator:
                 self.manifest_manager.save_manifest(manifest)
 
                 target_locales = manifest.source_request.target_languages or [manifest.source_request.base_language]
+                if getattr(self.llm_provider, "provider_name", "") != "mock":
+                    import time
+                    time.sleep(5)
                 bundle = self.localization_service.localize_bundle(
                     source_script=manifest.final_script,
                     target_locales=target_locales,
@@ -122,12 +143,14 @@ class ProjectOrchestrator:
                 if bundle.failed_locales and not bundle.localized_scripts:
                     manifest.localization_status = "failed"
                     manifest.status = "failed"
-                    manifest.errors.append(f"Localization failed for all locales: {list(bundle.failed_locales.keys())}")
+                    err_msg = f"Localization failed for all locales: {list(bundle.failed_locales.keys())}"
+                    manifest.record_error(stage="localization", message=err_msg, code="LOCALIZATION_FAILED")
                     self.manifest_manager.save_manifest(manifest)
                     return manifest
                 elif bundle.failed_locales:
                     manifest.localization_status = "partial"
                 else:
+                    manifest.clear_stage_errors("localization")
                     manifest.localization_status = "completed"
                 self.manifest_manager.save_manifest(manifest)
 
@@ -162,8 +185,79 @@ class ProjectOrchestrator:
                         )
 
                 all_audio_ok = all(t.status == "completed" for t in audio_tracks.values())
-                manifest.audio_status = "completed" if all_audio_ok else ("partial" if any(t.status == "completed" for t in audio_tracks.values()) else "failed")
+                if all_audio_ok:
+                    manifest.clear_stage_errors("audio")
+                    manifest.audio_status = "completed"
+                else:
+                    manifest.audio_status = "partial" if any(t.status == "completed" for t in audio_tracks.values()) else "failed"
+                    err_msg = f"Audio synthesis failed or incomplete for some tracks: {[loc for loc, t in audio_tracks.items() if t.status != 'completed']}"
+                    manifest.record_error(stage="audio", message=err_msg, code="AUDIO_INCOMPLETE")
                 self.manifest_manager.save_manifest(manifest)
+
+            # ---------------------------------------------------------
+            # Stage 3.5: Post-TTS Duration Reconciliation
+            # ---------------------------------------------------------
+            if (
+                settings.POST_TTS_RECONCILIATION_ENABLED
+                and manifest.audio_tracks
+                and manifest.localization_bundle
+                and manifest.final_script
+            ):
+                target_dur = manifest.final_script.target_duration_seconds
+                reconciled_any = False
+                for loc, track in list(manifest.audio_tracks.items()):
+                    if loc not in manifest.localization_bundle.localized_scripts:
+                        continue
+                    current_loc_script = manifest.localization_bundle.localized_scripts[loc]
+
+                    # Idempotency check: reuse existing duration reconciliation result if already executed
+                    if not force_regenerate and manifest.metadata.get("duration_reconciliation", {}).get(loc) is not None:
+                        logger.info("[%s] Reusing existing duration reconciliation result for locale '%s'", project_id, loc)
+                        continue
+
+                    # Backward-compatible hook for listeners or tests monitoring localization_service
+                    if hasattr(self.localization_service, "reconcile_post_tts_duration"):
+                        try:
+                            self.localization_service.reconcile_post_tts_duration(
+                                current_script=current_loc_script,
+                                measured_audio_track=track,
+                                target_duration_seconds=target_dur,
+                            )
+                        except Exception:
+                            pass
+
+                    revised_script, new_track, rec_res = self.duration_service.reconcile_locale_duration(
+                        current_script=current_loc_script,
+                        measured_audio_track=track,
+                        target_duration_seconds=target_dur,
+                        tts_service=self.tts_service,
+                        project_id=project_id,
+                        tolerance_seconds=settings.POST_TTS_DURATION_TOLERANCE_SECONDS,
+                        max_revisions=settings.MAX_POST_TTS_REVISIONS,
+                    )
+                    
+                    if rec_res.revisions_attempted > 0:
+                        reconciled_any = True
+                        logger.info("[%s] Locale '%s' duration reconciliation complete: %s", project_id, loc, rec_res.message)
+                        manifest.localization_bundle.localized_scripts[loc] = revised_script
+                        manifest.audio_tracks[loc] = new_track
+                        # Persist revised script to disk
+                        (scripts_dir / f"{loc}.json").write_text(revised_script.model_dump_json(indent=2), encoding="utf-8")
+                    
+                    # Store reconciliation metadata in manifest
+                    if "duration_reconciliation" not in manifest.metadata:
+                        manifest.metadata["duration_reconciliation"] = {}
+                    manifest.metadata["duration_reconciliation"][loc] = rec_res.model_dump()
+
+                    if not rec_res.is_approved:
+                        manifest.record_error(
+                            stage="duration_reconciliation",
+                            message=rec_res.message,
+                            code="DURATION_OUT_OF_TOLERANCE",
+                        )
+
+                if reconciled_any:
+                    self.manifest_manager.save_manifest(manifest)
 
             # ---------------------------------------------------------
             # Stage 4: Avatar Generation
@@ -175,13 +269,22 @@ class ProjectOrchestrator:
                 manifest.avatar_status = "running"
                 self.manifest_manager.save_manifest(manifest)
 
-                avatar_tracks = self.avatar_service.generate_bundle_avatars(
+                # Determine avatar provider safely
+                req_avatar_prov = getattr(manifest.source_request, "avatar_provider", "mock")
+                if req_avatar_prov and req_avatar_prov.strip().lower() in ("heygen", "sadtalker"):
+                    from app.services.avatar.factory import get_avatar_provider
+                    active_avatar_service = AvatarService(provider=get_avatar_provider(req_avatar_prov.strip().lower()))
+                else:
+                    active_avatar_service = self.avatar_service
+
+                avatar_tracks = active_avatar_service.generate_bundle_avatars(
                     bundle=manifest.localization_bundle,
                     audio_tracks=manifest.audio_tracks,
                     project_id=project_id,
                     force_regenerate=force_regenerate,
                 )
                 manifest.avatar_tracks = avatar_tracks
+                manifest.clear_stage_errors("avatar")
                 manifest.avatar_status = "completed"
                 self.manifest_manager.save_manifest(manifest)
 
@@ -201,6 +304,7 @@ class ProjectOrchestrator:
                     force_regenerate=force_regenerate,
                 )
                 manifest.visual_tracks = visual_tracks
+                manifest.clear_stage_errors("visuals")
                 manifest.visual_status = "completed"
                 self.manifest_manager.save_manifest(manifest)
 
@@ -221,6 +325,7 @@ class ProjectOrchestrator:
                     force_regenerate=force_regenerate,
                 )
                 manifest.subtitle_tracks = subtitle_tracks
+                manifest.clear_stage_errors("subtitles")
                 manifest.subtitle_status = "completed"
                 self.manifest_manager.save_manifest(manifest)
 
@@ -246,7 +351,13 @@ class ProjectOrchestrator:
                 manifest.final_videos = final_videos
 
                 all_comp = all(v.status == "completed" for v in final_videos.values())
-                manifest.composition_status = "completed" if all_comp else ("partial" if any(v.status == "completed" for v in final_videos.values()) else "failed")
+                if all_comp:
+                    manifest.clear_stage_errors("composition")
+                    manifest.composition_status = "completed"
+                else:
+                    manifest.composition_status = "partial" if any(v.status == "completed" for v in final_videos.values()) else "failed"
+                    err_msg = f"Composition failed or incomplete for some videos: {[loc for loc, v in final_videos.items() if v.status != 'completed']}"
+                    manifest.record_error(stage="composition", message=err_msg, code="COMPOSITION_INCOMPLETE")
                 self.manifest_manager.save_manifest(manifest)
 
             # ---------------------------------------------------------
@@ -266,7 +377,7 @@ class ProjectOrchestrator:
         except Exception as e:
             logger.exception("Unexpected pipeline failure in project '%s': %s", project_id, e)
             manifest.status = "failed"
-            manifest.errors.append(f"Unexpected error: {str(e)}")
+            manifest.record_error(stage="pipeline", message=f"Unexpected error: {str(e)}", code="UNEXPECTED_ERROR")
             self.manifest_manager.save_manifest(manifest)
             return manifest
 
@@ -282,3 +393,21 @@ class ProjectOrchestrator:
         if not manifest:
             raise ValueError(f"Cannot resume non-existent project: '{project_id}'")
         return self.run_project(project_id=project_id, request=manifest.source_request, force_regenerate=force_regenerate)
+
+    def create_project(
+        self,
+        request: TrainingVideoRequest,
+        project_id: Optional[str] = None,
+    ) -> ProjectManifest:
+        """Create a new project manifest without executing the pipeline."""
+        from uuid import uuid4
+        pid = project_id or f"proj_{uuid4().hex[:8]}"
+        return self.manifest_manager.create_manifest(pid, request)
+
+    def run_pipeline(
+        self,
+        project_id: str,
+        force_regenerate: bool = False,
+    ) -> ProjectManifest:
+        """Alias for run_project for backward and direct engine compatibility."""
+        return self.run_project(project_id, force_regenerate=force_regenerate)

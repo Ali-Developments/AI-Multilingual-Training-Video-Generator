@@ -77,16 +77,42 @@ def render_app():
         st.markdown("---")
         st.subheader("Provider Status")
 
-        # Provider Badges
-        has_heygen_key = bool(settings and settings.HEYGEN_API_KEY)
-        live_tests_enabled = bool(settings and settings.ENABLE_LIVE_API_TESTS)
-
-        st.markdown("- **LLM Provider:** `Groq (Llama-3.3-70b)`")
-        st.markdown("- **TTS Engine:** `Edge-TTS (Local Free Tier)`")
-        if has_heygen_key and live_tests_enabled:
-            st.markdown("- **Avatar Engine:** `HeyGen (Live API Active)`")
+        # Dynamic Provider Badges (ISSUE-003 & ISSUE-002)
+        health_details = health.get("details", {}) if health else {}
+        if health:
+            llm_provider_name = health_details.get("llm_provider") or health_details.get("default_llm", "groq")
+            llm_model_name = health_details.get("llm_model", "openai/gpt-oss-20b")
+            tts_engine_name = health_details.get("default_tts", "edge_tts")
+            avatar_engine_name = health_details.get("default_avatar", "mock")
+            live_heygen_gate = health_details.get("enable_live_heygen", False)
+        elif settings:
+            llm_provider_name = settings.DEFAULT_LLM_PROVIDER
+            llm_model_name = settings.GROQ_MODEL if settings.DEFAULT_LLM_PROVIDER == "groq" else settings.DEFAULT_LLM_PROVIDER
+            tts_engine_name = settings.DEFAULT_TTS_PROVIDER
+            avatar_engine_name = settings.DEFAULT_AVATAR_PROVIDER
+            live_heygen_gate = getattr(settings, "ENABLE_LIVE_HEYGEN", False)
         else:
-            st.markdown("- **Avatar Engine:** `Mock Mode Active (0 Credits Used)`")
+            llm_provider_name = "Unavailable"
+            llm_model_name = "Unavailable"
+            tts_engine_name = "Unavailable"
+            avatar_engine_name = "Unavailable"
+            live_heygen_gate = False
+
+        if llm_provider_name == "Unavailable":
+            st.markdown("- **LLM Provider:** `Unavailable`")
+            st.markdown("- **TTS Engine:** `Unavailable`")
+            st.markdown("- **Avatar Engine:** `Unavailable`")
+        else:
+            st.markdown(f"- **LLM Provider:** `{llm_provider_name.capitalize()} ({llm_model_name})`")
+            st.markdown(f"- **TTS Engine:** `{tts_engine_name.replace('_', '-').capitalize()} (Local Free Tier)`")
+            has_heygen_key = bool(settings and settings.HEYGEN_API_KEY)
+            if avatar_engine_name == "heygen" and live_heygen_gate and has_heygen_key:
+                st.markdown("- **Avatar Engine:** `HeyGen (Live API Active)`")
+            elif avatar_engine_name == "sadtalker":
+                st.markdown("- **Avatar Engine:** `SadTalker Local (Free)`")
+            else:
+                st.markdown("- **Avatar Engine:** `Mock Mode Active (0 Credits Used)`")
+
         st.markdown("- **Visual Engine:** `Local Visuals (Pillow Full HD)`")
         st.markdown("- **Compositor:** `FFmpeg Local Native Engine`")
 
@@ -163,9 +189,10 @@ def render_app():
 
             with col_right:
                 base_lang_input = st.selectbox(
-                    "Base Language",
+                    "Source / Base Language",
                     options=["en-US", "ar-SA", "bn-BD", "es-ES", "fr-FR"],
                     index=0,
+                    help="Language of the source content. Must match the language of your topic / source text.",
                 )
                 target_locales_input = st.multiselect(
                     "Target Locales *",
@@ -195,15 +222,53 @@ def render_app():
                         index=0,
                     )
 
+                st.markdown("---")
+                avatar_choice = st.selectbox(
+                    "Avatar Engine Mode",
+                    options=[
+                        "Mock (0 Credits - Safe Local)",
+                        "SadTalker Local — Free (Runs locally. No API credits required.)",
+                        "HeyGen Live — Paid (External paid API. May consume credits.)",
+                    ],
+                    index=0,
+                    help="Mock generates local safe placeholders. SadTalker runs locally for free without external API credits. HeyGen Live connects to external paid cloud API.",
+                )
+                ack_paid_credits = False
+                if "SadTalker" in avatar_choice:
+                    avatar_provider = "sadtalker"
+                    st.info("ℹ️ **SadTalker Local:** Runs locally. No API credits required.")
+                    portrait_path_input = st.text_input(
+                        "Local Presenter Portrait Path",
+                        value="assets/avatars/local_presenter.png",
+                        help="Path to source portrait image used by SadTalker.",
+                    )
+                elif "HeyGen" in avatar_choice:
+                    avatar_provider = "heygen"
+                    st.warning("⚠️ **Credit Warning:** External paid API. May consume credits.")
+                    ack_paid_credits = st.checkbox(
+                        "I acknowledge and confirm that this action will consume paid HeyGen credits.",
+                        value=False,
+                    )
+                else:
+                    avatar_provider = "mock"
+
                 force_regenerate = st.checkbox("Force Regenerate (Overwrite existing assets)", value=False)
 
             submit_btn = st.form_submit_button("🎬 Create & Generate Full Video Package", use_container_width=True)
 
         if submit_btn:
+            from app.core.language import validate_source_language_mismatch
+            source_check_text = (source_content_input or topic_input or "").strip()
+            lang_mismatch = validate_source_language_mismatch(source_check_text, base_lang_input)
+
             if not topic_input and not source_content_input:
                 st.error("Please provide at least a Topic or Source Content.")
+            elif lang_mismatch:
+                st.error(f"⚠️ **Language Mismatch Detected:** {lang_mismatch}")
             elif not target_locales_input:
                 st.error("Please select at least one Target Locale.")
+            elif avatar_provider == "heygen" and not ack_paid_credits:
+                st.error("⚠️ You must check the acknowledgement box to proceed with paid HeyGen Live rendering.")
             else:
                 objectives = [line.strip() for line in learning_objectives_input.split("\n") if line.strip()]
                 payload = serialize_create_project_payload(
@@ -216,6 +281,8 @@ def render_app():
                     tone=tone_input,
                     difficulty_level=difficulty_input,
                     learning_objectives=objectives,
+                    avatar_provider=avatar_provider,
+                    ack_paid_credits=ack_paid_credits,
                 )
 
                 with st.spinner("Initializing and executing autonomous video pipeline..."):
@@ -368,6 +435,37 @@ def render_app():
                                     st.video(vpath)
                                 else:
                                     st.caption(f"Asset Path: `{vpath}` (Duration: {av_asset.get('duration_seconds', 0)}s)")
+
+            # -------------------------------------------------------------------
+            # Post-TTS Duration Reconciliation UI (Step 8.1)
+            # -------------------------------------------------------------------
+            duration_rec_meta = active_manifest.get("metadata", {}).get("duration_reconciliation", {})
+            if duration_rec_meta:
+                st.markdown("---")
+                st.subheader("⏱️ Post-TTS Duration Reconciliation & Timing Ground Truth")
+                for loc_code, rec_data in duration_rec_meta.items():
+                    with st.expander(f"Locale `{loc_code}` Duration Reconciliation State", expanded=True):
+                        d_col1, d_col2, d_col3, d_col4 = st.columns(4)
+                        with d_col1:
+                            st.metric("Requested Target", f"{rec_data.get('target_duration_seconds', 0.0):.1f}s")
+                        with d_col2:
+                            st.metric("Initial TTS Audio", f"{rec_data.get('initial_duration_seconds', 0.0):.1f}s")
+                        with d_col3:
+                            st.metric("Final Approved Audio", f"{rec_data.get('final_duration_seconds', 0.0):.1f}s")
+                        with d_col4:
+                            st.metric("Status", rec_data.get("status", "unknown").upper())
+
+                        history = rec_data.get("history", [])
+                        if history:
+                            st.markdown("#### Revision Iterations")
+                            for h in history:
+                                st.markdown(
+                                    f"- **Revision {h.get('revision_number')}:** Before={h.get('measured_duration_before', 0.0):.2f}s "
+                                    f"| Ratio={h.get('compression_ratio', 1.0):.3f} "
+                                    f"| After={h.get('measured_duration_after', 0.0):.2f}s "
+                                    f"| Delta=±{h.get('delta_seconds', 0.0):.2f}s"
+                                )
+                        st.caption(rec_data.get("message", ""))
 
         # -----------------------------------------------------------------------
         # TAB 4: Visuals & Subtitles

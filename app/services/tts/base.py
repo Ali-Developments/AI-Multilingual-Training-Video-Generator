@@ -13,6 +13,12 @@ from app.models.schemas import (
 )
 from app.services.localization.locale_utils import normalize_locale
 from app.services.tts.audio_probe import get_audio_duration
+from app.core.caching import (
+    is_audio_asset_valid,
+    save_asset_metadata,
+    hash_text,
+    hash_file,
+)
 
 
 class TTSProvider(ABC):
@@ -113,11 +119,21 @@ class TTSProvider(ABC):
             file_ext = ".wav" if self.provider_name == "mock" else ".mp3"
             scene_file = locale_audio_dir / f"{scene.scene_id}{file_ext}"
 
-            # Idempotency check: reuse valid existing asset
-            if not force_regenerate and scene_file.exists() and scene_file.stat().st_size > 0:
+            # Content-aware idempotency check: only reuse if narration matches
+            if (
+                not force_regenerate
+                and scene_file.exists()
+                and scene_file.stat().st_size > 0
+                and is_audio_asset_valid(
+                    audio_path=scene_file,
+                    expected_narration=scene.narration,
+                    expected_voice=voice_id,
+                    expected_provider=self.provider_name,
+                )
+            ):
                 try:
                     dur = get_audio_duration(scene_file)
-                    logger.info("Reusing existing audio asset for scene '%s' (%s, %.2fs)", scene.scene_id, locale, dur)
+                    logger.info("Reusing existing validated audio asset for scene '%s' (%s, %.2fs)", scene.scene_id, locale, dur)
                     scene_assets.append(
                         SceneAudioAsset(
                             scene_id=scene.scene_id,
@@ -145,6 +161,19 @@ class TTSProvider(ABC):
                     voice=voice_id,
                 )
                 asset.scene_id = scene.scene_id
+                # Persist sidecar metadata for content-aware cache validation
+                save_asset_metadata(
+                    scene_file,
+                    {
+                        "scene_id": scene.scene_id,
+                        "locale": locale,
+                        "narration_hash": hash_text(scene.narration),
+                        "audio_hash": hash_file(scene_file),
+                        "duration": asset.duration_seconds,
+                        "provider": self.provider_name,
+                        "voice_id": voice_id,
+                    },
+                )
                 scene_assets.append(asset)
             except Exception as e:
                 logger.error("TTS synthesis failed for scene '%s' in locale '%s': %s", scene.scene_id, locale, str(e))

@@ -9,6 +9,7 @@ from app.services.subtitles.formatter import (
     split_narration_into_chunks,
     serialize_srt,
     serialize_vtt,
+    serialize_ass,
 )
 
 
@@ -18,6 +19,7 @@ class DeterministicSubtitleProvider(SubtitleProvider):
     
     Splits validated narration into readable caption blocks and aligns them
     proportionally across measured audio waveform lengths.
+    Generates SRT, WebVTT, and Advanced SubStation Alpha (.ass) for complex RTL shaping.
     """
 
     @property
@@ -35,17 +37,20 @@ class DeterministicSubtitleProvider(SubtitleProvider):
         output_dir.mkdir(parents=True, exist_ok=True)
         srt_path = output_dir / f"{scene_id}.srt"
         vtt_path = output_dir / f"{scene_id}.vtt"
+        ass_path = output_dir / f"{scene_id}.ass"
         direction = get_text_direction(locale)
 
         if not narration or not narration.strip() or duration_seconds <= 0:
             logger.info("Scene '%s' has empty narration or zero duration; creating blank subtitle asset.", scene_id)
             srt_path.write_text("", encoding="utf-8")
             vtt_path.write_text("WEBVTT\n\n", encoding="utf-8")
+            ass_path.write_text("", encoding="utf-8")
             return SceneSubtitleAsset(
                 scene_id=scene_id,
                 locale=locale,
                 srt_path=str(srt_path.resolve()),
                 vtt_path=str(vtt_path.resolve()),
+                ass_path=str(ass_path.resolve()),
                 chunk_count=0,
                 duration_seconds=duration_seconds,
                 text_direction=direction,
@@ -56,10 +61,12 @@ class DeterministicSubtitleProvider(SubtitleProvider):
 
         srt_content = serialize_srt(chunks)
         vtt_content = serialize_vtt(chunks)
+        ass_content = serialize_ass(chunks, locale=locale)
 
         # Explicit UTF-8 encoding ensures Arabic and Bengali text integrity
         srt_path.write_text(srt_content, encoding="utf-8")
         vtt_path.write_text(vtt_content, encoding="utf-8")
+        ass_path.write_text(ass_content, encoding="utf-8")
 
         logger.info(
             "Generated subtitles for scene '%s' (%s, %d cues, duration=%.2fs)",
@@ -71,6 +78,7 @@ class DeterministicSubtitleProvider(SubtitleProvider):
             locale=locale,
             srt_path=str(srt_path.resolve()),
             vtt_path=str(vtt_path.resolve()),
+            ass_path=str(ass_path.resolve()),
             chunk_count=len(chunks),
             duration_seconds=duration_seconds,
             text_direction=direction,

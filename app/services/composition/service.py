@@ -93,10 +93,10 @@ class CompositionService:
 
             duration = audio_asset.duration_seconds
 
-            # Idempotency check: reuse existing valid MP4 video
+            # Idempotency check: reuse existing valid MP4 video ONLY if duration matches current audio
             if not force_regenerate and out_file.exists() and out_file.stat().st_size > 0:
                 measured = get_video_duration(out_file)
-                if measured > 0:
+                if measured > 0 and abs(measured - duration) <= 0.5:
                     logger.info("Reusing existing rendered scene '%s' for locale '%s'", scene.scene_id, locale)
                     has_av = scene.scene_id in avatar_map
                     has_sub = scene.scene_id in sub_map
@@ -112,6 +112,13 @@ class CompositionService:
                         )
                     )
                     continue
+                elif measured > 0:
+                    logger.warning(
+                        "Stale rendered scene asset detected for '%s' (file duration %.2fs != audio duration %.2fs). Re-rendering scene.",
+                        scene.scene_id,
+                        measured,
+                        duration,
+                    )
 
             vis_asset = visual_map.get(scene.scene_id)
             vis_path = Path(vis_asset.image_path) if vis_asset and vis_asset.image_path else None
@@ -177,10 +184,11 @@ class CompositionService:
                 error="No successful scene videos available for concatenation.",
             )
 
-        # Idempotency check: reuse final video if already rendered
+        # Idempotency check: reuse final video ONLY if duration matches sum of scene videos
+        expected_total = sum(s.duration_seconds for s in successful_scenes)
         if not force_regenerate and final_output.exists() and final_output.stat().st_size > 0:
             measured = get_video_duration(final_output)
-            if measured > 0:
+            if measured > 0 and abs(measured - expected_total) <= 0.5:
                 logger.info("Reusing existing final video for locale '%s'", locale)
                 return FinalVideoAsset(
                     locale=locale,
@@ -190,6 +198,13 @@ class CompositionService:
                     scene_videos=scene_videos,
                     status="completed",
                     metadata={"provider": self.provider.provider_name, "reused": True},
+                )
+            elif measured > 0:
+                logger.warning(
+                    "Stale final video asset detected for locale '%s' (measured %.2fs != scenes sum %.2fs). Re-concatenating.",
+                    locale,
+                    measured,
+                    expected_total,
                 )
 
         try:

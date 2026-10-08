@@ -16,27 +16,74 @@ from app.models.schemas import (
 )
 
 
+class LocaleDurationEstimator:
+    """
+    Extensible locale-aware pre-TTS duration estimator.
+    
+    Calibrates words-per-minute (WPM) speech rates per linguistic group to prevent
+    systematic duration miscalculations for morphologically dense languages like Arabic
+    or syllabically longer languages like Bengali.
+    
+    Actual synthesized TTS audio remains the final source of truth.
+    """
+
+    DEFAULT_WPM: int = 140
+
+    # Calibrated speech rate (words-per-minute) by primary language code prefix
+    LOCALE_WPM_MAP = {
+        "en": 140,  # English baseline (~140 WPM)
+        "ar": 115,  # Arabic: agglutinative affixes & dense particles mean fewer space tokens per second
+        "bn": 120,  # Bengali: longer morphemic structures and syllable pacing
+    }
+
+    @classmethod
+    def get_wpm_for_locale(cls, locale_or_language: Optional[str] = None) -> int:
+        if not locale_or_language:
+            return cls.DEFAULT_WPM
+        lang_prefix = locale_or_language.strip().lower().replace("_", "-").split("-")[0]
+        return cls.LOCALE_WPM_MAP.get(lang_prefix, cls.DEFAULT_WPM)
+
+    @classmethod
+    def estimate_duration_seconds(
+        cls,
+        narration: str,
+        words_per_minute: Optional[int] = None,
+        language: Optional[str] = None,
+        locale: Optional[str] = None,
+    ) -> int:
+        if not narration or not narration.strip():
+            return 0
+        wpm = words_per_minute or cls.get_wpm_for_locale(language or locale)
+        words = len(narration.split())
+        if words == 0:
+            return 0
+        return max(2, round((words / wpm) * 60))
+
+
 def estimate_narration_duration_seconds(
     narration: str,
-    words_per_minute: Optional[int] = None
+    words_per_minute: Optional[int] = None,
+    language: Optional[str] = None,
+    locale: Optional[str] = None,
 ) -> int:
     """
-    Estimate spoken narration duration in seconds based on word count.
+    Estimate spoken narration duration in seconds based on word count and locale speech rate.
     
-    Formula: max(2, round((len(narration.split()) / wpm) * 60))
     NOTE: This is a pre-TTS estimate. Actual timing will be determined by
     the TTS provider in Step 5.
     """
-    wpm = words_per_minute or settings.SCRIPT_WORDS_PER_MINUTE
-    words = len(narration.split())
-    if words == 0:
-        return 0
-    return max(2, round((words / wpm) * 60))
+    return LocaleDurationEstimator.estimate_duration_seconds(
+        narration=narration,
+        words_per_minute=words_per_minute,
+        language=language,
+        locale=locale,
+    )
 
 
 def normalize_script_durations(
     script: ScriptDraft,
-    words_per_minute: Optional[int] = None
+    words_per_minute: Optional[int] = None,
+    language: Optional[str] = None,
 ) -> ScriptDraft:
     """
     Deterministically recalculate and normalize estimated_duration_seconds for each scene
@@ -44,9 +91,13 @@ def normalize_script_durations(
     
     Also recalculates total_estimated_duration_seconds as the strict sum of scene durations.
     """
-    wpm = words_per_minute or settings.SCRIPT_WORDS_PER_MINUTE
+    lang = language or getattr(script, "language", None)
     for scene in script.scenes:
-        scene.estimated_duration_seconds = estimate_narration_duration_seconds(scene.narration, wpm)
+        scene.estimated_duration_seconds = estimate_narration_duration_seconds(
+            narration=scene.narration,
+            words_per_minute=words_per_minute,
+            language=lang,
+        )
     script.total_estimated_duration_seconds = sum(s.estimated_duration_seconds for s in script.scenes)
     return script
 
@@ -56,7 +107,8 @@ def validate_script_draft(
     target_duration_seconds: int,
     analysis: Optional[ContentAnalysis] = None,
     tolerance_percent: Optional[int] = None,
-    words_per_minute: Optional[int] = None
+    words_per_minute: Optional[int] = None,
+    language: Optional[str] = None,
 ) -> ScriptValidationResult:
     """
     Perform deterministic validation on a generated script draft.
@@ -67,13 +119,20 @@ def validate_script_draft(
         analysis: Pedagogical analysis against which objective coverage is verified.
         tolerance_percent: Maximum allowable duration deviation percentage.
         words_per_minute: Optional speech rate override for narration estimation.
+        language: Language or locale code for speech rate calibration (e.g. 'ar-SA', 'bn-BD', 'en-US').
     """
-    tolerance = tolerance_percent if tolerance_percent is not None else settings.SCRIPT_DURATION_TOLERANCE_PERCENT
-    wpm = words_per_minute or settings.SCRIPT_WORDS_PER_MINUTE
+    base_tolerance = tolerance_percent if tolerance_percent is not None else settings.SCRIPT_DURATION_TOLERANCE_PERCENT
+    # For short target durations (<= 45s), allow a sensible minimum buffer (at least +-8s) if tolerance not overridden
+    if tolerance_percent is None and target_duration_seconds <= 45:
+        tolerance = max(base_tolerance, round((8.0 / target_duration_seconds) * 100, 1))
+    else:
+        tolerance = base_tolerance
+
+    lang = language or getattr(script, "language", None)
     issues: List[ValidationIssue] = []
 
     # 1. Normalize scene durations deterministically before validation
-    normalize_script_durations(script, words_per_minute=wpm)
+    normalize_script_durations(script, words_per_minute=words_per_minute, language=lang)
 
     # 2. Basic Scene Presence
     if not script.scenes:

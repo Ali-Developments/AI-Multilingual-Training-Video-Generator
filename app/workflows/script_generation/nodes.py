@@ -66,6 +66,15 @@ class ScriptWorkflowNodes:
                 "errors": ["Request must include at least non-empty 'topic' or 'source_content'."]
             }
 
+        from app.core.language import validate_source_language_mismatch
+        source_text = source_clean or topic_clean
+        mismatch_err = validate_source_language_mismatch(source_text, req.base_language)
+        if mismatch_err:
+            return {
+                "workflow_status": "failed",
+                "errors": [mismatch_err]
+            }
+
         if req.target_duration_seconds < 15 or req.target_duration_seconds > 3600:
             return {
                 "workflow_status": "failed",
@@ -140,7 +149,7 @@ class ScriptWorkflowNodes:
                 system_prompt=SYSTEM_PROMPT_SCRIPT_WRITER,
                 temperature=0.3
             )
-            normalize_script_durations(script_draft)
+            normalize_script_durations(script_draft, language=req.base_language)
             return {"draft_script": script_draft}
         except Exception as e:
             logger.error("Error during script generation: %s", str(e))
@@ -166,7 +175,8 @@ class ScriptWorkflowNodes:
         validation_result = validate_script_draft(
             script=draft,
             target_duration_seconds=req.target_duration_seconds,
-            analysis=state.analysis
+            analysis=state.analysis,
+            language=req.base_language or draft.language
         )
 
         logger.info(
@@ -205,7 +215,7 @@ class ScriptWorkflowNodes:
                 system_prompt=SYSTEM_PROMPT_SCRIPT_REVISER,
                 temperature=0.2
             )
-            normalize_script_durations(revised_script)
+            normalize_script_durations(revised_script, language=req.base_language)
             return {
                 "draft_script": revised_script,
                 "revision_count": current_rev
@@ -264,7 +274,13 @@ class ScriptWorkflowNodes:
             "Executing node: mark_needs_review. Script failed validation after %d revisions.",
             state.revision_count
         )
+        err_details = [f"Script validation failed after {state.revision_count} revision(s)."]
+        if state.validation and state.validation.issues:
+            for issue in state.validation.issues:
+                err_details.append(f"[{issue.code}] {issue.message}")
+        new_errors = list(state.errors) + err_details
         return {
             "workflow_status": "needs_review",
-            "final_script": None
+            "final_script": None,
+            "errors": new_errors
         }

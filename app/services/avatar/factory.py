@@ -18,10 +18,20 @@ def get_avatar_provider(provider_type: Optional[str] = None) -> AvatarProvider:
 
     if active_type == "mock":
         return MockAvatarProvider()
+    elif active_type == "sadtalker":
+        from app.services.avatar.sadtalker_provider import SadTalkerProvider
+        return SadTalkerProvider()
     elif active_type == "heygen":
+        if not getattr(settings, "ENABLE_LIVE_HEYGEN", False):
+            raise PermissionError(
+                "Live HeyGen avatar generation is blocked by safety configuration (ENABLE_LIVE_HEYGEN=False). "
+                "Both DEFAULT_AVATAR_PROVIDER and ENABLE_LIVE_HEYGEN must explicitly allow live generation."
+            )
+        if not settings.HEYGEN_API_KEY:
+            raise ValueError("HEYGEN_API_KEY is not configured for live HeyGen avatar generation.")
         return HeyGenProvider()
     else:
         raise ValueError(
             f"Unsupported Avatar provider: '{active_type}'. "
-            "Supported providers: 'mock', 'heygen'."
+            "Supported providers: 'mock', 'sadtalker', 'heygen'."
         )

@@ -24,13 +24,16 @@ from app.services.localization.locale_utils import (
 from app.services.localization.prompts import (
     SYSTEM_PROMPT_LOCALIZER,
     SYSTEM_PROMPT_LOCALIZATION_REVISER,
+    SYSTEM_PROMPT_POST_TTS_DURATION_REVISER,
     build_localization_prompt,
     build_localization_revision_prompt,
+    build_post_tts_duration_revision_prompt,
 )
 from app.services.localization.validators import (
     normalize_localized_structure_and_durations,
     validate_localized_script,
 )
+from app.workflows.script_generation.validators import estimate_narration_duration_seconds
 
 
 class LocalizationService:
@@ -336,3 +339,145 @@ class LocalizationService:
             },
         )
         return bundle
+
+    def reconcile_post_tts_duration(
+        self,
+        current_script: LocalizedScript,
+        measured_audio_track: Any,
+        target_duration_seconds: float,
+        tolerance_percent: Optional[float] = None,
+    ) -> Tuple[LocalizedScript, bool, str]:
+        """
+        Evaluate measured TTS audio duration against target duration.
+        If actual speech duration overruns target by more than tolerance_percent,
+        invoke LLM to intelligently shorten spoken narration while strictly
+        preserving learning objectives, scene structure, and pedagogical fidelity.
+
+        Returns:
+            Tuple of (reconciled_script, was_reconciled, summary_message)
+        """
+        tolerance_pct = (
+            tolerance_percent
+            if tolerance_percent is not None
+            else settings.POST_TTS_TOLERANCE_PERCENT
+        )
+        measured_total = (
+            getattr(measured_audio_track, "total_audio_duration_seconds", None)
+            or getattr(measured_audio_track, "total_duration_seconds", 0.0)
+        )
+        if measured_total <= 0.0:
+            return current_script, False, "No valid measured audio duration found."
+
+        allowed_diff = target_duration_seconds * (tolerance_pct / 100.0)
+        diff = measured_total - target_duration_seconds
+
+        # Only trigger reconciliation if audio genuinely overruns target beyond tolerance
+        if abs(diff) <= allowed_diff:
+            logger.info(
+                "Post-TTS timing check passed for locale '%s': measured=%.2fs, target=%.1fs (diff=%.2fs <= %.2fs tolerance)",
+                current_script.locale,
+                measured_total,
+                target_duration_seconds,
+                diff,
+                allowed_diff,
+            )
+            return (
+                current_script,
+                False,
+                f"Audio duration ({measured_total:.2f}s) is within {tolerance_pct}% of target ({target_duration_seconds:.1f}s)",
+            )
+
+        logger.warning(
+            "Post-TTS duration overrun for locale '%s': measured=%.2fs vs target=%.1fs (diff=%.2fs > %.2fs tolerance). Initiating condensation revision.",
+            current_script.locale,
+            measured_total,
+            target_duration_seconds,
+            diff,
+            allowed_diff,
+        )
+
+        audio_items = (
+            getattr(measured_audio_track, "scene_audio", None)
+            or getattr(measured_audio_track, "scene_audios", [])
+        )
+        scene_durations = {
+            sa.scene_id: sa.duration_seconds
+            for sa in audio_items
+        }
+
+        prompt = build_post_tts_duration_revision_prompt(
+            current_script=current_script,
+            measured_total_seconds=measured_total,
+            target_duration_seconds=target_duration_seconds,
+            scene_durations=scene_durations,
+        )
+
+        try:
+            raw_revised = self.llm_provider.generate_structured(
+                prompt=prompt,
+                schema=LocalizedScript,
+                system_prompt=SYSTEM_PROMPT_POST_TTS_DURATION_REVISER,
+            )
+
+            # Preserve immutable structural fields from current_script
+            revised = current_script.model_copy(deep=True)
+            revised.title = raw_revised.title or current_script.title
+            revised.opening_hook = raw_revised.opening_hook or current_script.opening_hook
+            revised.closing_summary = raw_revised.closing_summary or current_script.closing_summary
+            revised.target_duration_seconds = target_duration_seconds
+
+            # Align scenes
+            if len(raw_revised.scenes) == len(current_script.scenes):
+                for idx, src_s in enumerate(current_script.scenes):
+                    rev_s = raw_revised.scenes[idx]
+                    # Retain structural IDs
+                    revised.scenes[idx].scene_id = src_s.scene_id
+                    revised.scenes[idx].order = src_s.order
+                    revised.scenes[idx].scene_type = src_s.scene_type
+                    revised.scenes[idx].learning_objective_ids = src_s.learning_objective_ids
+                    # Apply shortened narration
+                    if rev_s.narration and rev_s.narration.strip():
+                        revised.scenes[idx].narration = rev_s.narration.strip()
+                    if rev_s.title:
+                        revised.scenes[idx].title = rev_s.title
+                    if rev_s.purpose:
+                        revised.scenes[idx].purpose = rev_s.purpose
+                    if rev_s.visual_direction:
+                        revised.scenes[idx].visual_direction = rev_s.visual_direction
+                    if src_s.on_screen_text is None:
+                        revised.scenes[idx].on_screen_text = None
+                    elif rev_s.on_screen_text:
+                        revised.scenes[idx].on_screen_text = rev_s.on_screen_text
+
+                    # Recalculate honest estimated duration
+                    est_dur = estimate_narration_duration_seconds(
+                        revised.scenes[idx].narration,
+                        locale=current_script.locale,
+                    )
+                    revised.scenes[idx].estimated_duration_seconds = est_dur
+            else:
+                logger.warning(
+                    "Post-TTS revised script scene count mismatch (%d vs %d); falling back to existing script.",
+                    len(raw_revised.scenes),
+                    len(current_script.scenes),
+                )
+                return current_script, False, "Revision produced scene count mismatch"
+
+            revised.total_estimated_duration_seconds = sum(
+                s.estimated_duration_seconds for s in revised.scenes
+            )
+
+            logger.info(
+                "Post-TTS duration reconciliation complete for locale '%s': condensed text estimated at %.2fs (down from measured %.2fs)",
+                current_script.locale,
+                revised.total_estimated_duration_seconds,
+                measured_total,
+            )
+            return (
+                revised,
+                True,
+                f"Condensed narration from measured {measured_total:.2f}s towards target {target_duration_seconds:.1f}s",
+            )
+        except Exception as e:
+            logger.error("Failed post-TTS duration reconciliation LLM call: %s", e)
+            return current_script, False, f"Reconciliation error: {e}"

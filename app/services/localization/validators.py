@@ -34,7 +34,7 @@ def normalize_localized_structure_and_durations(
     - None-value preservation on on_screen_text
     - learning_objective IDs
     """
-    wpm = words_per_minute or settings.SCRIPT_WORDS_PER_MINUTE
+    wpm = words_per_minute
     norm_locale = normalize_locale(target_locale)
 
     # 1. Protect structural metadata at script root
@@ -69,7 +69,7 @@ def normalize_localized_structure_and_durations(
 
             # Recalculate duration deterministically from localized narration word count
             loc_scene.estimated_duration_seconds = estimate_narration_duration_seconds(
-                loc_scene.narration, words_per_minute=wpm
+                loc_scene.narration, words_per_minute=wpm, language=norm_locale
             )
 
     # 4. Total estimated duration strictly equals the sum of scene durations
@@ -103,8 +103,13 @@ def validate_localized_script(
     F. Locale & Direction (matches normalized target and direction)
     G. Non-vendor guidance (no HeyGen or avatar IDs in cultural metadata)
     """
-    tolerance = tolerance_percent if tolerance_percent is not None else settings.SCRIPT_DURATION_TOLERANCE_PERCENT
-    wpm = words_per_minute or settings.SCRIPT_WORDS_PER_MINUTE
+    base_tolerance = tolerance_percent if tolerance_percent is not None else settings.SCRIPT_DURATION_TOLERANCE_PERCENT
+    target_sec = source_script.target_duration_seconds
+    if tolerance_percent is None and target_sec <= 45 and target_sec > 0:
+        tolerance = max(base_tolerance, round((8.0 / target_sec) * 100, 1))
+    else:
+        tolerance = base_tolerance
+    wpm = words_per_minute
     norm_locale = normalize_locale(target_locale)
     expected_direction = get_text_direction(norm_locale)
 

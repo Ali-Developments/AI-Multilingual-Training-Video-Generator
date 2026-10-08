@@ -174,6 +174,9 @@ def serialize_create_project_payload(
     else:
         req_body["locale"] = None
 
+    req_body["avatar_provider"] = kwargs.get("avatar_provider", "mock")
+    req_body["ack_paid_credits"] = kwargs.get("ack_paid_credits", False)
+
     return {
         "project_id": project_id,
         "request": req_body,

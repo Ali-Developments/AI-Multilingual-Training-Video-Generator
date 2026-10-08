@@ -25,7 +25,7 @@ class GroqProvider(LLMProvider):
         self,
         api_key: Optional[str] = None,
         model: Optional[str] = None,
-        max_retries: int = 3,
+        max_retries: int = 5,
         retry_backoff_factor: float = 1.5,
         client: Optional[Any] = None
     ) -> None:
@@ -76,13 +76,21 @@ class GroqProvider(LLMProvider):
 
     def _execute_with_retry(self, api_call_fn):
         """Execute a Groq API call with exponential backoff on retryable errors."""
+        import re
         last_exception = None
         for attempt in range(1, self.max_retries + 1):
             try:
                 return api_call_fn()
             except RateLimitError as e:
                 last_exception = e
-                delay = (self.retry_backoff_factor ** attempt)
+                # Check if Groq suggested a specific wait time (e.g. 'try again in 8.28s')
+                delay = max(4.0, (self.retry_backoff_factor ** attempt) * 2.0)
+                match = re.search(r"try again in ([\d\.]+)s", str(e))
+                if match:
+                    try:
+                        delay = max(delay, float(match.group(1)) + 2.0)
+                    except ValueError:
+                        pass
                 logger.warning(
                     "Groq RateLimitError on attempt %d/%d (model: %s). Backing off for %.2fs: %s",
                     attempt, self.max_retries, self._model, delay, str(e)
@@ -90,7 +98,7 @@ class GroqProvider(LLMProvider):
                 time.sleep(delay)
             except APIConnectionError as e:
                 last_exception = e
-                delay = (self.retry_backoff_factor ** attempt)
+                delay = max(2.0, (self.retry_backoff_factor ** attempt))
                 logger.warning(
                     "Groq APIConnectionError on attempt %d/%d. Backing off for %.2fs: %s",
                     attempt, self.max_retries, delay, str(e)
@@ -100,13 +108,19 @@ class GroqProvider(LLMProvider):
                 logger.error("Groq AuthenticationError: Invalid API key. Non-retryable: %s", str(e))
                 raise
             except APIError as e:
-                # 5xx status errors are retryable
-                if getattr(e, "status_code", 0) >= 500:
+                err_dict = getattr(e, "body", {}) or {}
+                err_code = err_dict.get("error", {}).get("code", "") if isinstance(err_dict, dict) else ""
+                # json_validate_failed with empty generation is a known transient Groq rate/queue artifact
+                is_transient_json_fail = (
+                    err_code == "json_validate_failed"
+                    and not err_dict.get("error", {}).get("failed_generation")
+                )
+                if getattr(e, "status_code", 0) >= 500 or is_transient_json_fail:
                     last_exception = e
-                    delay = (self.retry_backoff_factor ** attempt)
+                    delay = max(3.5, (self.retry_backoff_factor ** attempt) * 2.0)
                     logger.warning(
-                        "Groq Server Error (%s) on attempt %d/%d. Backing off for %.2fs: %s",
-                        getattr(e, "status_code", "5xx"), attempt, self.max_retries, delay, str(e)
+                        "Groq transient error (%s / %s) on attempt %d/%d. Backing off for %.2fs: %s",
+                        getattr(e, "status_code", "unknown"), err_code or "transient", attempt, self.max_retries, delay, str(e)
                     )
                     time.sleep(delay)
                 else:
@@ -153,7 +167,8 @@ class GroqProvider(LLMProvider):
         prompt: str,
         schema: Type[T],
         system_prompt: Optional[str] = None,
-        temperature: float = 0.2
+        temperature: float = 0.2,
+        max_tokens: Optional[int] = 4096,
     ) -> T:
         """
         Generate structured output adhering to a Pydantic schema using JSON mode.
@@ -163,7 +178,8 @@ class GroqProvider(LLMProvider):
         schema_json = json.dumps(schema.model_json_schema(), indent=2)
         augmented_system_prompt = (
             f"{system_prompt or 'You are a helpful assistant.'}\n\n"
-            f"You MUST output ONLY a valid JSON object matching this JSON Schema:\n{schema_json}"
+            f"You MUST output ONLY a valid JSON object matching this JSON Schema:\n{schema_json}\n\n"
+            "Ensure the JSON object includes all required fields and complete scenes. Do not omit or truncate any arrays."
         )
 
         messages = [
@@ -172,13 +188,22 @@ class GroqProvider(LLMProvider):
         ]
 
         def _call():
-            response = client.chat.completions.create(
-                model=self._model,
-                messages=messages,
-                temperature=temperature,
-                response_format={"type": "json_object"}
-            )
-            raw_content = response.choices[0].message.content
+            params = {
+                "model": self._model,
+                "messages": messages,
+                "temperature": temperature,
+                "response_format": {"type": "json_object"},
+            }
+            if max_tokens:
+                params["max_tokens"] = max_tokens
+            response = client.chat.completions.create(**params)
+            choice = response.choices[0]
+            if choice.finish_reason == "length":
+                logger.warning(
+                    "Groq structured response was truncated by max_tokens limit (model: %s).",
+                    self._model
+                )
+            raw_content = choice.message.content
             return raw_content
 
         raw_json_str = self._execute_with_retry(_call)

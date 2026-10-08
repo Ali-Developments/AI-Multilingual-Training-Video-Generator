@@ -14,6 +14,7 @@ from app.models.schemas import (
 from app.services.avatar.base import AvatarProvider, is_avatar_eligible
 from app.services.avatar.factory import get_avatar_provider
 from app.services.tts.audio_probe import get_audio_duration
+from app.core.caching import is_avatar_asset_valid, save_asset_metadata, hash_file
 
 
 class AvatarService:
@@ -90,11 +91,21 @@ class AvatarService:
 
             dest_file = avatar_dir / f"{scene.scene_id}.mp4"
 
-            # 3. Idempotency Check
-            if not force_regenerate and dest_file.exists() and dest_file.stat().st_size > 0:
+            # 3. Content-aware idempotency check: only reuse if input audio hash matches
+            audio_file_path = Path(audio_asset.audio_path)
+            if (
+                not force_regenerate
+                and dest_file.exists()
+                and dest_file.stat().st_size > 0
+                and is_avatar_asset_valid(
+                    avatar_video_path=dest_file,
+                    audio_path=audio_file_path,
+                    expected_provider=self.provider.provider_name,
+                )
+            ):
                 try:
                     dur = get_audio_duration(dest_file)
-                    logger.info("Reusing existing avatar video for scene '%s' (%s, %.2fs)", scene.scene_id, locale, dur)
+                    logger.info("Reusing existing validated avatar video for scene '%s' (%s, %.2fs)", scene.scene_id, locale, dur)
                     scene_avatars.append(
                         AvatarVideoAsset(
                             scene_id=scene.scene_id,
@@ -116,10 +127,23 @@ class AvatarService:
                 asset = self.provider.generate_scene_avatar(
                     scene_id=scene.scene_id,
                     locale=locale,
-                    audio_path=Path(audio_asset.audio_path),
+                    audio_path=audio_file_path,
                     destination_path=dest_file,
                     avatar_id=avatar_id,
+                    force_regenerate=force_regenerate,
                 )
+                if dest_file.exists() and dest_file.stat().st_size > 0:
+                    save_asset_metadata(
+                        dest_file,
+                        {
+                            "scene_id": scene.scene_id,
+                            "locale": locale,
+                            "audio_hash": hash_file(audio_file_path),
+                            "duration": asset.duration_seconds,
+                            "provider": self.provider.provider_name,
+                            "avatar_id": avatar_id or getattr(self.provider, "default_source_image", None),
+                        },
+                    )
                 scene_avatars.append(asset)
             except Exception as e:
                 logger.error("Avatar generation failed for scene '%s': %s", scene.scene_id, str(e))

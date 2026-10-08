@@ -1,6 +1,8 @@
 """Pydantic schemas for API requests, responses, content analysis, and video scripts."""
 
+import re
 from typing import Dict, Any, Optional, List
+from datetime import datetime, timezone
 from pydantic import BaseModel, Field, model_validator
 
 
@@ -29,14 +31,35 @@ class TrainingVideoRequest(BaseModel):
     difficulty_level: Optional[str] = Field(default="intermediate", description="Difficulty level: beginner, intermediate, advanced")
     learning_objectives: Optional[List[str]] = Field(default=None, description="Explicit desired learning outcomes")
     locale: Optional[str] = Field(default=None, description="Cultural / regional locale hint (e.g., sa-Gulf, us-Corporate)")
+    avatar_provider: str = Field(default="mock", description="Avatar provider: 'mock' or 'heygen'")
+    ack_paid_credits: bool = Field(default=False, description="User acknowledgement for paid HeyGen credit usage")
 
     @model_validator(mode="after")
     def validate_content_presence(self) -> "TrainingVideoRequest":
-        """Ensure that at least topic or source_content is provided and non-empty."""
+        """Ensure that content is provided, matches base_language, and adheres to avatar safety gates."""
         has_topic = bool(self.topic and self.topic.strip())
         has_source = bool(self.source_content and self.source_content.strip())
         if not (has_topic or has_source):
             raise ValueError("At least one of 'topic' or 'source_content' must be provided.")
+        
+        from app.core.language import validate_source_language_mismatch
+        source_text = self.source_content or self.topic
+        mismatch_err = validate_source_language_mismatch(source_text, self.base_language)
+        if mismatch_err:
+            raise ValueError(mismatch_err)
+
+        prov = self.avatar_provider.strip().lower()
+        if prov == "heygen":
+            from app.core.config import settings
+            if not getattr(settings, "ENABLE_LIVE_HEYGEN", False):
+                raise ValueError(
+                    "Live HeyGen avatar generation is blocked: ENABLE_LIVE_HEYGEN is False in system configuration."
+                )
+            if not self.ack_paid_credits:
+                raise ValueError(
+                    "Live HeyGen avatar generation requires explicit acknowledgement that paid credits may be consumed."
+                )
+            
         return self
 
 
@@ -334,12 +357,13 @@ class SubtitleChunk(BaseModel):
 
 
 class SceneSubtitleAsset(BaseModel):
-    """Generated subtitle files (.srt and .vtt) for a specific scene."""
+    """Generated subtitle files (.srt, .vtt, and .ass) for a specific scene."""
 
     scene_id: str = Field(..., description="Unique scene identifier")
     locale: str = Field(..., description="Target locale code")
     srt_path: str = Field(..., description="Path to generated .srt file")
     vtt_path: Optional[str] = Field(default=None, description="Path to generated .vtt file")
+    ass_path: Optional[str] = Field(default=None, description="Path to generated .ass file with native RTL styling")
     chunk_count: int = Field(default=0, ge=0, description="Total number of caption cues")
     duration_seconds: float = Field(default=0.0, ge=0.0, description="Scene audio duration covered")
     text_direction: str = Field(default="ltr", description="Text layout direction: ltr or rtl")
@@ -354,6 +378,7 @@ class LocalizedSubtitleTrack(BaseModel):
     scene_subtitles: List[SceneSubtitleAsset] = Field(default_factory=list, description="Ordered per-scene subtitle assets")
     srt_path: Optional[str] = Field(default=None, description="Path to combined full-track .srt file")
     vtt_path: Optional[str] = Field(default=None, description="Path to combined full-track .vtt file")
+    ass_path: Optional[str] = Field(default=None, description="Path to combined full-track .ass file")
     status: str = Field(default="completed", description="Track status: completed, partial, failed")
     metadata: Dict[str, Any] = Field(default_factory=dict, description="Subtitle pipeline metadata")
 
@@ -422,12 +447,46 @@ class FinalVideoAsset(BaseModel):
 # =====================================================================
 
 
+class ManifestError(BaseModel):
+    """Structured diagnostic error record for pipeline stages."""
+
+    stage: str = Field(..., description="Pipeline stage where the error occurred")
+    code: str = Field(default="UNKNOWN", description="Machine-readable error code")
+    message: str = Field(..., description="Human-readable error description")
+    timestamp: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat(), description="ISO 8601 timestamp")
+    occurrence_count: int = Field(default=1, ge=1, description="Number of times this error was observed")
+
+
+def sanitize_diagnostic_message(msg: str) -> str:
+    """
+    Sanitize diagnostic error messages to strip API keys, Bearer tokens, or authorization data
+    before persistence in project manifests or exposure in APIs and UI.
+    """
+    if not msg:
+        return ""
+    clean = str(msg)
+    try:
+        from app.core.config import settings
+        if settings.GROQ_API_KEY and len(settings.GROQ_API_KEY) > 6:
+            clean = clean.replace(settings.GROQ_API_KEY, "[REDACTED_GROQ_KEY]")
+        if settings.HEYGEN_API_KEY and len(settings.HEYGEN_API_KEY) > 6:
+            clean = clean.replace(settings.HEYGEN_API_KEY, "[REDACTED_HEYGEN_KEY]")
+    except Exception:
+        pass
+
+    # Regex redact generic provider keys, tokens, auth headers
+    clean = re.sub(r"gsk_[A-Za-z0-9_\-]{15,}", "gsk_[REDACTED]", clean)
+    clean = re.sub(r"(?i)bearer\s+[A-Za-z0-9_\-\.]{15,}", "Bearer [REDACTED]", clean)
+    clean = re.sub(r"(?i)(api[_-]?key|authorization|token)[\"'\s:=]+[A-Za-z0-9_\-]{16,}", r"\1: [REDACTED]", clean)
+    return clean
+
+
 class ProjectManifest(BaseModel):
     """Persistent project manifest tracking end-to-end lifecycle and artifacts."""
 
     project_id: str = Field(..., description="Unique project identifier")
-    created_at: str = Field(..., description="ISO 8601 creation timestamp")
-    updated_at: str = Field(..., description="ISO 8601 last update timestamp")
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat(), description="ISO 8601 creation timestamp")
+    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat(), description="ISO 8601 last update timestamp")
     status: str = Field(default="pending", description="Pipeline status: pending, running, completed, needs_review, failed")
     source_request: TrainingVideoRequest = Field(..., description="Original input request parameters")
     script_status: str = Field(default="pending", description="Script workflow status: pending, running, completed, failed")
@@ -444,8 +503,38 @@ class ProjectManifest(BaseModel):
     visual_tracks: Dict[str, LocalizedVisualTrack] = Field(default_factory=dict, description="Supporting visual tracks by locale")
     subtitle_tracks: Dict[str, LocalizedSubtitleTrack] = Field(default_factory=dict, description="Subtitle tracks by locale")
     final_videos: Dict[str, FinalVideoAsset] = Field(default_factory=dict, description="Composed final training videos by locale")
+    error_details: List[ManifestError] = Field(default_factory=list, description="Structured error records with occurrence counts and stages")
     errors: List[str] = Field(default_factory=list, description="Diagnostic error log")
     metadata: Dict[str, Any] = Field(default_factory=dict, description="Arbitrary pipeline metadata")
+
+    def record_error(self, stage: str, message: str, code: str = "ERROR") -> None:
+        """
+        Record or update a structured diagnostic error without duplicating identical messages.
+        Sanitizes secret keys and preserves insertion order and occurrence count.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        clean_msg = sanitize_diagnostic_message(message)
+        for err in self.error_details:
+            if err.stage == stage and err.message == clean_msg:
+                err.occurrence_count += 1
+                err.timestamp = now
+                return
+
+        new_err = ManifestError(
+            stage=stage,
+            code=code,
+            message=clean_msg,
+            timestamp=now,
+            occurrence_count=1,
+        )
+        self.error_details.append(new_err)
+        if clean_msg not in self.errors:
+            self.errors.append(clean_msg)
+
+    def clear_stage_errors(self, stage: str) -> None:
+        """Clear active errors associated with a specific stage upon successful execution/retry."""
+        self.error_details = [e for e in self.error_details if e.stage != stage]
+        self.errors = [e.message for e in self.error_details]
 
 
 # =====================================================================
