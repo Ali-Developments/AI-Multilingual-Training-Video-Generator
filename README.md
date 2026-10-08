@@ -607,45 +607,58 @@ If you have an NVIDIA GPU and want local talking avatar rendering:
 
 ---
 
-### 4. Running the Backend API
+## 🚀 Quickstart Guide — Running the V2 Platform
+
+The primary V2 application consists of the **FastAPI REST Backend** (serving media synthesis, project manifests, and static video storage) and the **Next.js 14 Web Studio** (providing the interactive 3-column production workspace).
+
+Running the complete platform requires **TWO terminals**:
+
+### Terminal 1 — FastAPI Backend
 
 ```powershell
-# Ensure your virtual environment is active
+cd "D:\Freelancing-Projects\Video-Automation\AI-Multilingual-Training-Video-Generator"
+
 .\.venv\Scripts\Activate.ps1
 
-# Start FastAPI backend
 python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
 - **Backend API:** `http://localhost:8000`
 - **Swagger / OpenAPI Documentation:** `http://localhost:8000/docs`
-- **Health Probe:** `http://localhost:8000/api/v1/health`
+- **Health Check Probe:** `http://localhost:8000/api/v1/health`
+
+> 💡 **Troubleshooting Port Conflicts (`WinError 10013`):**  
+> If uvicorn fails with `[WinError 10013] An attempt was made to access a socket in a way forbidden by its access permissions`, an existing uvicorn instance is already bound to port 8000. Terminate the active process before launching (`Stop-Process -Name python -Force` in PowerShell).
 
 ---
 
-### 5. Running the Next.js Video Studio
+### Terminal 2 — Next.js Video Studio
 
-In a separate terminal window:
+In a second terminal window, launch the Next.js development server:
 
 ```powershell
-cd web
-npm install
+cd "D:\Freelancing-Projects\Video-Automation\AI-Multilingual-Training-Video-Generator\web"
+
 npm run dev
 ```
 
 - **Next.js Studio Interface:** `http://localhost:3000`
-- *(Next.js proxies backend API and `/storage` requests to `http://localhost:8000` automatically).*
+- *(Next.js automatically proxies `/api` and `/storage` requests to the FastAPI backend at `http://localhost:8000`).*
 
 ---
 
-### 6. Legacy Streamlit UI (Developer Debugging Only)
+### Optional: Legacy Streamlit UI (Developer Debugging Only)
 
-The legacy Streamlit dashboard is retained for backend diagnostic inspection:
+The legacy Streamlit dashboard is preserved strictly for low-level developer diagnostics and stage-by-stage debugging. It is **not** the primary V2 production interface:
 
 ```powershell
+cd "D:\Freelancing-Projects\Video-Automation\AI-Multilingual-Training-Video-Generator"
+
+.\.venv\Scripts\Activate.ps1
+
 python -m streamlit run frontend/streamlit_app.py
 ```
-*(Available at `http://localhost:8501`. Note: Next.js Studio is the primary V2 interface).*
+*(Available at `http://localhost:8501`).*
 
 ---
 
