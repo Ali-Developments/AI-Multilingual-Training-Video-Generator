@@ -1,15 +1,30 @@
-# AI Multilingual Training Video Generation Platform
+# AI Multilingual Training Video Generation Platform — Studio V2
 
-> **Project Classification:** Autonomous Multi-Modal Educational Video Pipeline  
-> **Status:** LOCAL VIDEO GENERATION COMPLETE — PRODUCTION HARDENED (October 2026)  
+> **Project Classification:** Autonomous Multi-Modal Educational Video Studio & Generation Platform  
+> **Status:** VIDEO STUDIO V2 OPERATIONAL — PRESENTER-LED ARCHITECTURE & NEXT.JS STUDIO (October 2026)  
 > **Maintainer:** Ali Mostafa ([Ali-Developments](https://github.com/Ali-Developments))  
-> **Key Reports:** [LOCAL_VIDEO_GENERATION_FINAL_REPORT.md](LOCAL_VIDEO_GENERATION_FINAL_REPORT.md) | [POST_TTS_DURATION_TARGETING_REPORT.md](POST_TTS_DURATION_TARGETING_REPORT.md) | [LOCAL_FREE_AVATAR_PROVIDER_REPORT.md](LOCAL_FREE_AVATAR_PROVIDER_REPORT.md) | [LOCAL_TIMING_AND_COMPOSITION_REMEDIATION.md](LOCAL_TIMING_AND_COMPOSITION_REMEDIATION.md)
+> **Key Architecture Documents:**
+> - [VIDEO_STUDIO_V2_ARCHITECTURE.md](VIDEO_STUDIO_V2_ARCHITECTURE.md)
+> - [VIDEO_STUDIO_V2_FRONTEND.md](VIDEO_STUDIO_V2_FRONTEND.md)
+> - [SCENE_MEDIA_ARCHITECTURE.md](SCENE_MEDIA_ARCHITECTURE.md)
+> - [VIDEO_STUDIO_V2_ACCEPTANCE_REPORT.md](VIDEO_STUDIO_V2_ACCEPTANCE_REPORT.md)
 
-An enterprise-grade autonomous platform designed to transform curriculum texts and educational outlines into composed, localized training video packages with talking-head presenters, supporting graphics, and subtitles.
+An enterprise-grade autonomous studio designed to transform curriculum texts and educational outlines into composed, localized training video packages with talking-head presenters, supporting graphics, motion visuals, and subtitles.
 
 ---
 
-## 🎯 System Overview
+## 🎯 Studio V2 Highlights
+
+1. **Professional Next.js 14 Web Studio (`web/`):** Dedicated App Router interface replacing Streamlit as the primary production dashboard. Features 5-step Project Wizard, 3-column Scene Studio with live HTML5 player & subtitle safe zone, interactive timeline strip, and delivery dashboard.
+2. **Presenter-Led Composition Engine:** Replaces legacy slide cards with natural video layouts:
+   - `presenter_split`: 42% presenter width on dark studio canvas paired with 58% contextual media.
+   - `presenter_full`: Centered 960×960 framed avatar on studio slate with dedicated lower-third subtitles.
+   - `media_full` & `media_with_overlay`: Full-bleed cinematic B-roll with contextual keyphrases.
+3. **Local Motion Visual Engine:** Free, local Ken Burns pan/zoom generation using FFmpeg (`zoompan` filter) turning concepts into dynamic B-roll.
+4. **AI Storyboard Planning:** Automatic intelligent allocation of presenter vs. B-roll vs. quiz vs. outro scenes based on selected video style (`hybrid_presenter_broll`, `demonstration_tutorial`, etc.).
+5. **Zero Developer Metadata:** Complete elimination of internal developer and slide markers (`SCENE 4`, `OUTRO`, `OBJECTIVE`, `Content delivery`) from production video.
+6. **Subprocess-Isolated SadTalker on CUDA:** High-resolution local avatar rendering on NVIDIA RTX 4060 GPU without API credits.
+7. **Legacy / Debug UI:** Streamlit preserved strictly for diagnostic/developer debugging at `frontend/streamlit_app.py`.
 
 The platform converts training topics or raw curriculum materials into localized, multi-asset video packages comprising:
 

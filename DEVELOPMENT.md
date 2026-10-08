@@ -73,8 +73,34 @@ This generates `training_ar-SA.mp4` under `storage/projects/proj_local_video_gen
 .\.venv\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-### Streamlit Studio Frontend
+### Next.js Professional Video Studio (Primary UI)
+```bash
+cd web
+npm install
+npm run dev
+# Or production build:
+npm run build
+npm run start
+```
+Accessible at `http://localhost:3000`. Features:
+- 5-step Project Creation Wizard
+- 3-column Scene Studio & Timeline Editor
+- HTML5 Video Preview with Subtitle Safe Zone
+- Presenter Studio & Asset Management
+- Real-time Hardware Readiness Diagnostics
+
+### Streamlit Studio (Legacy / Internal Debug UI)
 ```bash
 .\.venv\Scripts\python.exe -m streamlit run frontend/streamlit_app.py
 ```
-The Streamlit interface allows selecting **SadTalker Local (Free)**, custom presenter portrait uploads, target durations, and provides a real-time Duration Reconciliation monitor with revision attempt metrics.
+Preserved as a diagnostic tool for internal debugging and prototype testing.
+
+---
+
+## 6. Frontend Testing & Build Validation
+```bash
+cd web
+npm test       # Runs Node 24 native test suite (tests/studio.test.mjs)
+npm run lint   # ESLint checks (0 warnings / 0 errors)
+npm run build  # Production Next.js build verification
+```
