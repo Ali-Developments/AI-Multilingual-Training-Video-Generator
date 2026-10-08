@@ -142,7 +142,12 @@ def serialize_create_project_payload(
     (instead of difficulty) are mapped correctly, and wraps fields inside the
     expected {'project_id': ..., 'request': {...}} schema.
     """
-    target_langs = target_languages or kwargs.get("target_locales") or ["en-US"]
+    if target_languages is not None:
+        target_langs = [str(l).strip() for l in target_languages if str(l).strip()]
+    elif kwargs.get("target_locales") is not None:
+        target_langs = [str(l).strip() for l in kwargs.get("target_locales") if str(l).strip()]
+    else:
+        target_langs = [base_language]
     diff = difficulty_level or kwargs.get("difficulty") or "intermediate"
 
     req_body: Dict[str, Any] = {

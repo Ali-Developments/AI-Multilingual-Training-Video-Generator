@@ -47,6 +47,7 @@ temp/
 # Storage / Artifacts generated at runtime
 storage/projects/*
 !storage/projects/.gitkeep
+storage/sadtalker_temp/
 *.mp4
 *.wav
 *.mp3
@@ -72,3 +73,4 @@ checkpoints/
 *.ckpt
 *.ass
 *.meta.json
+AI-Multilingual-Training-Video-Generator/

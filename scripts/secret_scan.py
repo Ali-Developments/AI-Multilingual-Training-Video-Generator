@@ -3,7 +3,7 @@ import re
 from pathlib import Path
 
 secrets_found = []
-ignore_dirs = {'.venv', '.sadtalker-venv', '.git', 'storage', '__pycache__', 'tools', '.pytest_cache'}
+ignore_dirs = {'.venv', '.sadtalker-venv', '.git', 'storage', '__pycache__', 'tools', '.pytest_cache', 'AI-Multilingual-Training-Video-Generator'}
 
 pattern = re.compile(r'(gsk_[a-zA-Z0-9_-]{20,}|HEYGEN_API_KEY\s*=\s*[\'"][a-zA-Z0-9_-]{20,}[\'"])')
 

@@ -143,12 +143,18 @@ class ProjectOrchestrator:
                 if bundle.failed_locales and not bundle.localized_scripts:
                     manifest.localization_status = "failed"
                     manifest.status = "failed"
-                    err_msg = f"Localization failed for all locales: {list(bundle.failed_locales.keys())}"
-                    manifest.record_error(stage="localization", message=err_msg, code="LOCALIZATION_FAILED")
+                    for fail_loc, fail_data in bundle.failed_locales.items():
+                        err_code = fail_data.get("code", "LOCALIZATION_FAILED")
+                        err_msg = f"Localization failed for locale {fail_loc}: {fail_data.get('error', fail_data.get('issues', 'Validation failure'))}"
+                        manifest.record_error(stage="localization", message=err_msg, code=err_code)
                     self.manifest_manager.save_manifest(manifest)
                     return manifest
                 elif bundle.failed_locales:
                     manifest.localization_status = "partial"
+                    for fail_loc, fail_data in bundle.failed_locales.items():
+                        err_code = fail_data.get("code", "LOCALIZATION_PARTIAL_FAILURE")
+                        err_msg = f"Localization failed for locale {fail_loc}: {fail_data.get('error', fail_data.get('issues', 'Validation failure'))}"
+                        manifest.record_error(stage="localization", message=err_msg, code=err_code)
                 else:
                     manifest.clear_stage_errors("localization")
                     manifest.localization_status = "completed"

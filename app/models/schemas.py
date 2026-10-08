@@ -476,8 +476,8 @@ def sanitize_diagnostic_message(msg: str) -> str:
 
     # Regex redact generic provider keys, tokens, auth headers
     clean = re.sub(r"gsk_[A-Za-z0-9_\-]{15,}", "gsk_[REDACTED]", clean)
-    clean = re.sub(r"(?i)bearer\s+[A-Za-z0-9_\-\.]{15,}", "Bearer [REDACTED]", clean)
-    clean = re.sub(r"(?i)(api[_-]?key|authorization|token)[\"'\s:=]+[A-Za-z0-9_\-]{16,}", r"\1: [REDACTED]", clean)
+    clean = re.sub(r"(?i)bearer\s+[A-Za-z0-9_\-\.]{8,}", "Bearer [REDACTED]", clean)
+    clean = re.sub(r"(?i)(api[_-]?key|authorization|token)[\"'\s:=]+[A-Za-z0-9_\-]{10,}", r"\1: [REDACTED]", clean)
     return clean
 
 

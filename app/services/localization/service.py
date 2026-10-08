@@ -1,6 +1,7 @@
 """Production-grade localization service and multi-locale bundle orchestrator."""
 
-from typing import List, Optional, Tuple, Dict, Any
+import time
+from typing import List, Optional, Tuple, Dict, Any, Type
 from app.core.config import settings
 from app.core.logging import logger
 from app.models.schemas import (
@@ -65,6 +66,28 @@ class LocalizationService:
             max_revisions
             if max_revisions is not None
             else settings.LOCALIZATION_MAX_REVISIONS
+        )
+
+    def _call_llm_structured(
+        self,
+        prompt: str,
+        schema: Type[Any],
+        system_prompt: Optional[str] = None,
+        temperature: float = 0.2,
+        reasoning_effort: Optional[str] = "low",
+    ) -> Any:
+        """Call LLM provider with optional reasoning_effort if supported by the provider signature."""
+        import inspect
+        sig = inspect.signature(self.llm_provider.generate_structured)
+        kwargs: Dict[str, Any] = {}
+        if "reasoning_effort" in sig.parameters or any(p.kind == p.VAR_KEYWORD for p in sig.parameters.values()):
+            kwargs["reasoning_effort"] = reasoning_effort
+        return self.llm_provider.generate_structured(
+            prompt=prompt,
+            schema=schema,
+            system_prompt=system_prompt,
+            temperature=temperature,
+            **kwargs,
         )
 
     def localize(
@@ -146,11 +169,12 @@ class LocalizationService:
         # Generate initial localized script draft
         prompt = build_localization_prompt(request, norm_locale, text_direction)
         try:
-            script_candidate = self.llm_provider.generate_structured(
+            script_candidate = self._call_llm_structured(
                 prompt=prompt,
                 schema=LocalizedScript,
                 system_prompt=SYSTEM_PROMPT_LOCALIZER,
                 temperature=0.2,
+                reasoning_effort="low",
             )
         except Exception as e:
             logger.error("LLM generation failed for locale '%s': %s", norm_locale, str(e))
@@ -194,11 +218,12 @@ class LocalizationService:
 
             rev_prompt = build_localization_revision_prompt(request, current_script, validation)
             try:
-                revised_script = self.llm_provider.generate_structured(
+                revised_script = self._call_llm_structured(
                     prompt=rev_prompt,
                     schema=LocalizedScript,
                     system_prompt=SYSTEM_PROMPT_LOCALIZATION_REVISER,
-                    temperature=0.2,
+                    temperature=0.1,
+                    reasoning_effort="low",
                 )
             except Exception as e:
                 logger.error("LLM revision failed for locale '%s': %s", norm_locale, str(e))
@@ -300,7 +325,10 @@ class LocalizationService:
                 }
 
         # Process each valid target independently (Error Isolation)
-        for target_loc in normalized_targets:
+        for idx, target_loc in enumerate(normalized_targets):
+            if idx > 0:
+                logger.info("Sequential locale pacing: pausing 3.0s before localizing '%s'...", target_loc)
+                time.sleep(3.0)
             try:
                 req = LocalizationRequest(
                     source_script=source_copy,
@@ -316,14 +344,29 @@ class LocalizationService:
                 else:
                     failed_locales[target_loc] = {
                         "status": status,
+                        "code": "LOCALIZATION_VALIDATION_FAILED",
                         "issues": [i.model_dump() for i in val.issues],
                         "script": script.model_dump() if script else None,
+                        "stage": "localization",
                     }
             except Exception as e:
                 logger.error("Localization failed with unhandled error for locale '%s': %s", target_loc, str(e))
+                err_str = str(e)
+                err_type = type(e).__name__
+                if "RateLimit" in err_type or "429" in err_str or "rate limit" in err_str.lower():
+                    code = "LOCALIZATION_RATE_LIMITED"
+                elif "json_validate_failed" in err_str or "Structured" in err_str or "json_schema" in err_str:
+                    code = "LOCALIZATION_STRUCTURED_OUTPUT_ERROR"
+                elif "ValidationError" in err_type or "Schema" in err_str or "validation" in err_str.lower():
+                    code = "LOCALIZATION_SCHEMA_VALIDATION_ERROR"
+                else:
+                    code = "LOCALIZATION_PROVIDER_ERROR"
+
                 failed_locales[target_loc] = {
                     "status": "failed",
+                    "code": code,
                     "error": str(e),
+                    "stage": "localization",
                 }
 
         bundle = LocalizationBundle(

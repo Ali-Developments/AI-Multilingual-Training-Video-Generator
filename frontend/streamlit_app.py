@@ -197,7 +197,7 @@ def render_app():
                 target_locales_input = st.multiselect(
                     "Target Locales *",
                     options=["ar-SA", "bn-BD", "es-ES", "fr-FR", "de-DE", "zh-CN"],
-                    default=["ar-SA", "bn-BD"],
+                    default=["ar-SA"],
                     help="Select target multilingual locales to produce video packages for.",
                 )
                 target_duration_input = st.slider(
@@ -294,7 +294,15 @@ def render_app():
                                 st.info(f"Project initialized: `{new_pid}`. Running pipeline...")
                                 run_res = run_project_via_api(backend_url, new_pid, force_regenerate=force_regenerate)
                                 if run_res:
-                                    st.success(f"🎉 Pipeline completed successfully with status: {run_res['status']}!")
+                                    p_status = run_res.get("status", "unknown")
+                                    if p_status == "completed":
+                                        st.success(f"🎉 Pipeline completed successfully with status: {p_status}!")
+                                    elif p_status == "needs_review":
+                                        st.warning(f"⚠️ Pipeline completed with status: {p_status}. Review required.")
+                                    elif p_status == "failed":
+                                        st.error(f"❌ Pipeline failed with status: {p_status}. Inspect diagnostics below.")
+                                    else:
+                                        st.info(f"ℹ️ Pipeline executed with status: {p_status}.")
                                     st.rerun()
                                 else:
                                     st.error("Pipeline execution failed to start or complete.")
@@ -313,7 +321,14 @@ def render_app():
                             manifest = orchestrator.create_project(req)
                             st.info(f"Project initialized directly: `{manifest.project_id}`. Running pipeline...")
                             result_manifest = orchestrator.run_pipeline(manifest.project_id, force_regenerate=force_regenerate)
-                            st.success(f"🎉 Pipeline finished directly with status: {result_manifest.status}!")
+                            if result_manifest.status == "completed":
+                                st.success(f"🎉 Pipeline finished directly with status: {result_manifest.status}!")
+                            elif result_manifest.status == "needs_review":
+                                st.warning(f"⚠️ Pipeline finished with status: {result_manifest.status}. Review required.")
+                            elif result_manifest.status == "failed":
+                                st.error(f"❌ Pipeline failed directly with status: {result_manifest.status}.")
+                            else:
+                                st.info(f"ℹ️ Pipeline finished with status: {result_manifest.status}.")
                             st.rerun()
                         except Exception as exc:
                             st.error(f"Direct pipeline run error: {exc}")
