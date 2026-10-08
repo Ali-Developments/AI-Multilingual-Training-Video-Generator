@@ -173,6 +173,7 @@ async def get_project_outputs(project_id: str) -> ProjectOutputsResponse:
     return ProjectOutputsResponse(
         project_id=manifest.project_id,
         status=manifest.status,
+        avatar_provider=getattr(manifest, "avatar_provider", "mock"),
         has_final_script=manifest.final_script is not None,
         locales=locales,
         audio_tracks={loc: t.status for loc, t in manifest.audio_tracks.items()},

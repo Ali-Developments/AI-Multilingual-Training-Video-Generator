@@ -41,10 +41,16 @@ class ProjectOrchestrator:
         duration_service: Optional[DurationReconciliationService] = None,
     ) -> None:
         self.manifest_manager = manifest_manager or ProjectManifestManager()
+        if llm_provider is None:
+            try:
+                from app.services.llm.factory import get_llm_provider
+                llm_provider = get_llm_provider()
+            except Exception:
+                llm_provider = None
         self.llm_provider = llm_provider
         self.localization_service = localization_service or LocalizationService(llm_provider=self.llm_provider)
         self.tts_service = tts_service or TTSService()
-        self.avatar_service = avatar_service or AvatarService()
+        self.avatar_service = avatar_service or AvatarService(output_base_dir=self.manifest_manager.storage_base_dir)
         self.visual_service = visual_service or VisualService()
         self.subtitle_service = subtitle_service or SubtitleService()
         self.composition_service = composition_service or CompositionService()
@@ -66,10 +72,44 @@ class ProjectOrchestrator:
             manifest = self.manifest_manager.create_manifest(project_id, request)
         elif request:
             manifest.source_request = request
+            if getattr(request, "avatar_provider", None):
+                manifest.avatar_provider = request.avatar_provider.strip().lower()
+
+        # Determine and persist selected avatar provider for this project
+        selected_avatar_provider = (
+            getattr(manifest, "avatar_provider", None)
+            or (manifest.source_request.avatar_provider if manifest.source_request else None)
+            or settings.DEFAULT_AVATAR_PROVIDER
+        ).strip().lower()
+        manifest.avatar_provider = selected_avatar_provider
+
+        # Detect provider change from previously stored avatar tracks
+        existing_tracks_provider = None
+        if manifest.avatar_tracks:
+            for t in manifest.avatar_tracks.values():
+                if t.metadata and t.metadata.get("provider"):
+                    existing_tracks_provider = t.metadata.get("provider").strip().lower()
+                    break
+
+        if existing_tracks_provider and existing_tracks_provider != selected_avatar_provider:
+            logger.warning(
+                "[%s] Avatar provider changed from '%s' to '%s'. Invalidating avatar and downstream composition assets.",
+                project_id,
+                existing_tracks_provider,
+                selected_avatar_provider,
+            )
+            manifest.avatar_tracks = {}
+            manifest.avatar_status = "pending"
+            manifest.final_videos = {}
+            manifest.composition_status = "pending"
+            rendered_dir = self.manifest_manager.get_project_dir(project_id) / "rendered"
+            if rendered_dir.exists():
+                import shutil
+                shutil.rmtree(rendered_dir, ignore_errors=True)
 
         manifest.status = "running"
         self.manifest_manager.save_manifest(manifest)
-        logger.info("Starting pipeline execution for project '%s'", project_id)
+        logger.info("Starting pipeline execution for project '%s' (avatar_provider=%s)", project_id, selected_avatar_provider)
 
         try:
             # ---------------------------------------------------------
@@ -203,6 +243,7 @@ class ProjectOrchestrator:
             # ---------------------------------------------------------
             # Stage 3.5: Post-TTS Duration Reconciliation
             # ---------------------------------------------------------
+            reconciliation_changed_audio = False
             if (
                 settings.POST_TTS_RECONCILIATION_ENABLED
                 and manifest.audio_tracks
@@ -210,15 +251,18 @@ class ProjectOrchestrator:
                 and manifest.final_script
             ):
                 target_dur = manifest.final_script.target_duration_seconds
+                duration_approved_all = True
                 reconciled_any = False
+
                 for loc, track in list(manifest.audio_tracks.items()):
                     if loc not in manifest.localization_bundle.localized_scripts:
                         continue
                     current_loc_script = manifest.localization_bundle.localized_scripts[loc]
 
-                    # Idempotency check: reuse existing duration reconciliation result if already executed
-                    if not force_regenerate and manifest.metadata.get("duration_reconciliation", {}).get(loc) is not None:
-                        logger.info("[%s] Reusing existing duration reconciliation result for locale '%s'", project_id, loc)
+                    # Idempotency check: reuse existing duration reconciliation result ONLY if approved
+                    cached_rec = manifest.metadata.get("duration_reconciliation", {}).get(loc)
+                    if not force_regenerate and cached_rec is not None and cached_rec.get("is_approved"):
+                        logger.info("[%s] Reusing existing approved duration reconciliation result for locale '%s'", project_id, loc)
                         continue
 
                     # Backward-compatible hook for listeners or tests monitoring localization_service
@@ -241,57 +285,112 @@ class ProjectOrchestrator:
                         tolerance_seconds=settings.POST_TTS_DURATION_TOLERANCE_SECONDS,
                         max_revisions=settings.MAX_POST_TTS_REVISIONS,
                     )
-                    
-                    if rec_res.revisions_attempted > 0:
-                        reconciled_any = True
-                        logger.info("[%s] Locale '%s' duration reconciliation complete: %s", project_id, loc, rec_res.message)
-                        manifest.localization_bundle.localized_scripts[loc] = revised_script
-                        manifest.audio_tracks[loc] = new_track
-                        # Persist revised script to disk
-                        (scripts_dir / f"{loc}.json").write_text(revised_script.model_dump_json(indent=2), encoding="utf-8")
-                    
+
                     # Store reconciliation metadata in manifest
                     if "duration_reconciliation" not in manifest.metadata:
                         manifest.metadata["duration_reconciliation"] = {}
                     manifest.metadata["duration_reconciliation"][loc] = rec_res.model_dump()
 
+                    if rec_res.revisions_attempted > 0:
+                        reconciled_any = True
+                        reconciliation_changed_audio = True
+                        logger.info("[%s] Locale '%s' duration reconciliation complete: %s", project_id, loc, rec_res.message)
+                        manifest.localization_bundle.localized_scripts[loc] = revised_script
+                        manifest.audio_tracks[loc] = new_track
+                        # Persist revised script to disk
+                        (scripts_dir / f"{loc}.json").write_text(revised_script.model_dump_json(indent=2), encoding="utf-8")
+
                     if not rec_res.is_approved:
+                        duration_approved_all = False
                         manifest.record_error(
                             stage="duration_reconciliation",
                             message=rec_res.message,
                             code="DURATION_OUT_OF_TOLERANCE",
                         )
 
-                if reconciled_any:
+                # Invalidate downstream media after reconciliation
+                if reconciliation_changed_audio:
+                    logger.info("[%s] Narration audio modified during duration reconciliation. Invalidating downstream avatar, subtitle, and composition assets.", project_id)
+                    manifest.avatar_tracks = {}
+                    manifest.avatar_status = "pending"
+                    manifest.subtitle_tracks = {}
+                    manifest.subtitle_status = "pending"
+                    manifest.final_videos = {}
+                    manifest.composition_status = "pending"
+                    rendered_dir = self.manifest_manager.get_project_dir(project_id) / "rendered"
+                    if rendered_dir.exists():
+                        import shutil
+                        shutil.rmtree(rendered_dir, ignore_errors=True)
+
+                if reconciled_any or reconciliation_changed_audio:
                     self.manifest_manager.save_manifest(manifest)
+
+                # Strictly require duration approval before moving to downstream stages
+                if not duration_approved_all:
+                    err_msg = f"Duration reconciliation failed: real audio duration remains outside configured tolerance for project '{project_id}'."
+                    logger.error("[%s] %s", project_id, err_msg)
+                    manifest.status = "needs_review"
+                    self.manifest_manager.save_manifest(manifest)
+                    return manifest
 
             # ---------------------------------------------------------
             # Stage 4: Avatar Generation
             # ---------------------------------------------------------
-            if not force_regenerate and manifest.avatar_status == "completed" and manifest.avatar_tracks:
-                logger.info("[%s] Reusing existing avatar tracks", project_id)
+            from app.services.avatar.factory import get_avatar_provider
+            if hasattr(self.avatar_service, "provider") and hasattr(self.avatar_service.provider, "provider_name"):
+                if self.avatar_service.provider.provider_name != selected_avatar_provider:
+                    self.avatar_service.provider = get_avatar_provider(selected_avatar_provider)
+            self.avatar_service.output_base_dir = self.manifest_manager.storage_base_dir
+            active_avatar_service = self.avatar_service
+
+            can_reuse_avatar = (
+                not force_regenerate
+                and not reconciliation_changed_audio
+                and manifest.avatar_status == "completed"
+                and bool(manifest.avatar_tracks)
+                and all(t.status == "completed" for t in manifest.avatar_tracks.values())
+                and all(
+                    (t.metadata.get("provider") if t.metadata else "").strip().lower() == selected_avatar_provider
+                    for t in manifest.avatar_tracks.values()
+                )
+            )
+
+            if can_reuse_avatar:
+                logger.info("[%s] Reusing existing valid completed avatar tracks (%s)", project_id, selected_avatar_provider)
             else:
-                logger.info("[%s] Generating avatar video segments", project_id)
+                logger.info("[%s] Generating avatar video segments with provider '%s'", project_id, selected_avatar_provider)
                 manifest.avatar_status = "running"
                 self.manifest_manager.save_manifest(manifest)
-
-                # Determine avatar provider safely
-                req_avatar_prov = getattr(manifest.source_request, "avatar_provider", "mock")
-                if req_avatar_prov and req_avatar_prov.strip().lower() in ("heygen", "sadtalker"):
-                    from app.services.avatar.factory import get_avatar_provider
-                    active_avatar_service = AvatarService(provider=get_avatar_provider(req_avatar_prov.strip().lower()))
-                else:
-                    active_avatar_service = self.avatar_service
 
                 avatar_tracks = active_avatar_service.generate_bundle_avatars(
                     bundle=manifest.localization_bundle,
                     audio_tracks=manifest.audio_tracks,
                     project_id=project_id,
-                    force_regenerate=force_regenerate,
+                    force_regenerate=force_regenerate or reconciliation_changed_audio,
                 )
                 manifest.avatar_tracks = avatar_tracks
-                manifest.clear_stage_errors("avatar")
-                manifest.avatar_status = "completed"
+
+                all_avatar_ok = all(t.status == "completed" for t in avatar_tracks.values())
+                any_avatar_ok = any(t.status in ("completed", "partial") for t in avatar_tracks.values())
+
+                if all_avatar_ok:
+                    manifest.clear_stage_errors("avatar")
+                    manifest.avatar_status = "completed"
+                elif any_avatar_ok:
+                    manifest.avatar_status = "partial"
+                    manifest.record_error(
+                        stage="avatar",
+                        message=f"Avatar generation partially succeeded for provider '{selected_avatar_provider}'",
+                        code="AVATAR_PARTIAL",
+                    )
+                else:
+                    manifest.avatar_status = "failed"
+                    manifest.record_error(
+                        stage="avatar",
+                        message=f"Avatar generation failed for provider '{selected_avatar_provider}'",
+                        code="AVATAR_FAILED",
+                    )
+
                 self.manifest_manager.save_manifest(manifest)
 
             # ---------------------------------------------------------
@@ -369,9 +468,23 @@ class ProjectOrchestrator:
             # ---------------------------------------------------------
             # Stage 8: Pipeline Completion Assessment
             # ---------------------------------------------------------
-            if manifest.composition_status == "completed":
+            required_avatar_ok = True
+            if selected_avatar_provider in ("sadtalker", "heygen"):
+                required_avatar_ok = (manifest.avatar_status == "completed")
+
+            all_stages_completed = (
+                manifest.script_status == "completed"
+                and manifest.localization_status in ("completed",)
+                and manifest.audio_status == "completed"
+                and required_avatar_ok
+                and manifest.visual_status == "completed"
+                and manifest.subtitle_status == "completed"
+                and manifest.composition_status == "completed"
+            )
+
+            if all_stages_completed:
                 manifest.status = "completed"
-            elif manifest.composition_status == "partial":
+            elif manifest.composition_status in ("completed", "partial"):
                 manifest.status = "needs_review"
             else:
                 manifest.status = "failed"

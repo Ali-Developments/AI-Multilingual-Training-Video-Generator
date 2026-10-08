@@ -57,15 +57,25 @@ class SadTalkerProvider(AvatarProvider):
         preprocess: Optional[str] = None,
         still_mode: Optional[bool] = None,
     ) -> None:
-        self.python_path = Path(python_path or settings.SADTALKER_PYTHON_PATH).resolve()
-        self.sadtalker_root = Path(sadtalker_root or settings.SADTALKER_ROOT).resolve()
-        self.checkpoint_dir = Path(checkpoint_dir or settings.SADTALKER_CHECKPOINT_PATH).resolve()
-        self.default_source_image = Path(default_source_image or settings.SADTALKER_DEFAULT_SOURCE_IMAGE).resolve()
+        self.python_path = self._resolve_path(Path(python_path or settings.SADTALKER_PYTHON_PATH))
+        self.sadtalker_root = self._resolve_path(Path(sadtalker_root or settings.SADTALKER_ROOT))
+        self.checkpoint_dir = self._resolve_path(Path(checkpoint_dir or settings.SADTALKER_CHECKPOINT_PATH))
+        self.default_source_image = self._resolve_path(Path(default_source_image or settings.SADTALKER_DEFAULT_SOURCE_IMAGE))
         self.timeout_seconds = timeout_seconds or settings.SADTALKER_TIMEOUT_SECONDS
         self.size = size or settings.SADTALKER_SIZE
         self.preprocess = preprocess or settings.SADTALKER_PREPROCESS
         self.still_mode = still_mode if still_mode is not None else settings.SADTALKER_STILL
         self._jobs: Dict[str, Dict[str, Any]] = {}
+
+    @staticmethod
+    def _resolve_path(candidate: Path) -> Path:
+        """Resolve candidate path checking cwd and parent directories."""
+        if candidate.exists():
+            return candidate.resolve()
+        parent_candidate = Path("..") / candidate
+        if parent_candidate.exists():
+            return parent_candidate.resolve()
+        return candidate.resolve()
 
     @property
     def provider_name(self) -> str:

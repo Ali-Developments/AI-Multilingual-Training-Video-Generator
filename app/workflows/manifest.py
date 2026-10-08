@@ -98,11 +98,13 @@ class ProjectManifestManager:
     ) -> ProjectManifest:
         """Initialize and persist a new pending project manifest."""
         now = datetime.now(timezone.utc).isoformat()
+        avatar_prov = str(getattr(request, "avatar_provider", "mock") or "mock").strip().lower()
         manifest = ProjectManifest(
             project_id=project_id,
             created_at=now,
             updated_at=now,
             status="pending",
+            avatar_provider=avatar_prov,
             source_request=request,
             script_status="pending",
             localization_status="pending",

@@ -155,6 +155,12 @@ class DurationReconciliationService:
         max_revisions: Optional[int] = None,
         tolerance_seconds: Optional[float] = None,
     ) -> None:
+        if llm_provider is None:
+            try:
+                from app.services.llm.factory import get_llm_provider
+                llm_provider = get_llm_provider()
+            except Exception as e:
+                logger.warning("Could not auto-initialize LLM provider for DurationReconciliationService: %s", e)
         self.llm_provider = llm_provider
         self.max_revisions = max_revisions or getattr(settings, "MAX_POST_TTS_REVISIONS", 2)
         self.tolerance_seconds = tolerance_seconds or getattr(settings, "POST_TTS_DURATION_TOLERANCE_SECONDS", 2.0)
@@ -175,10 +181,12 @@ class DurationReconciliationService:
         Returns:
             (final_script, final_audio_track, reconciliation_result)
         """
-        tol_sec = tolerance_seconds or self.tolerance_seconds
+        tol_sec = tolerance_seconds if tolerance_seconds is not None else self.tolerance_seconds
+        percent_tol = target_duration_seconds * (settings.POST_TTS_TOLERANCE_PERCENT / 100.0)
+        tol_sec = max(tol_sec, percent_tol)
         max_rev = max_revisions or self.max_revisions
 
-        measured_total = getattr(measured_audio_track, "total_duration_seconds", None) or getattr(measured_audio_track, "total_audio_duration_seconds", 0.0)
+        measured_total = getattr(measured_audio_track, "total_audio_duration_seconds", None) or getattr(measured_audio_track, "total_duration_seconds", 0.0)
         diff = abs(measured_total - target_duration_seconds)
 
         initial_dur = measured_total
@@ -323,7 +331,7 @@ class DurationReconciliationService:
                 )
                 tts_service.update_script_with_actual_durations(condensed_script, new_track)
 
-                new_measured = getattr(new_track, "total_duration_seconds", None) or getattr(new_track, "total_audio_duration_seconds", 0.0)
+                new_measured = getattr(new_track, "total_audio_duration_seconds", None) or getattr(new_track, "total_duration_seconds", 0.0)
 
                 attempt = DurationRevisionAttempt(
                     revision_number=revision_count,

@@ -31,7 +31,7 @@ class TrainingVideoRequest(BaseModel):
     difficulty_level: Optional[str] = Field(default="intermediate", description="Difficulty level: beginner, intermediate, advanced")
     learning_objectives: Optional[List[str]] = Field(default=None, description="Explicit desired learning outcomes")
     locale: Optional[str] = Field(default=None, description="Cultural / regional locale hint (e.g., sa-Gulf, us-Corporate)")
-    avatar_provider: str = Field(default="mock", description="Avatar provider: 'mock' or 'heygen'")
+    avatar_provider: str = Field(default="mock", description="Avatar provider: 'mock', 'sadtalker', or 'heygen'")
     ack_paid_credits: bool = Field(default=False, description="User acknowledgement for paid HeyGen credit usage")
 
     @model_validator(mode="after")
@@ -49,6 +49,11 @@ class TrainingVideoRequest(BaseModel):
             raise ValueError(mismatch_err)
 
         prov = self.avatar_provider.strip().lower()
+        if prov not in ("mock", "sadtalker", "heygen"):
+            raise ValueError(
+                f"Unsupported avatar provider '{self.avatar_provider}'. Supported options: 'mock', 'sadtalker', 'heygen'."
+            )
+
         if prov == "heygen":
             from app.core.config import settings
             if not getattr(settings, "ENABLE_LIVE_HEYGEN", False):
@@ -488,7 +493,22 @@ class ProjectManifest(BaseModel):
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat(), description="ISO 8601 creation timestamp")
     updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat(), description="ISO 8601 last update timestamp")
     status: str = Field(default="pending", description="Pipeline status: pending, running, completed, needs_review, failed")
+    avatar_provider: str = Field(default="mock", description="Selected avatar provider for this project: 'mock', 'sadtalker', 'heygen'")
     source_request: TrainingVideoRequest = Field(..., description="Original input request parameters")
+
+    @model_validator(mode="before")
+    @classmethod
+    def populate_avatar_provider(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            if not data.get("avatar_provider"):
+                src = data.get("source_request", {})
+                if isinstance(src, dict) and src.get("avatar_provider"):
+                    data["avatar_provider"] = str(src["avatar_provider"]).strip().lower()
+                else:
+                    data["avatar_provider"] = "mock"
+            else:
+                data["avatar_provider"] = str(data["avatar_provider"]).strip().lower()
+        return data
     script_status: str = Field(default="pending", description="Script workflow status: pending, running, completed, failed")
     localization_status: str = Field(default="pending", description="Localization status: pending, running, completed, partial, failed")
     audio_status: str = Field(default="pending", description="Audio synthesis status: pending, running, completed, partial, failed")
@@ -566,6 +586,7 @@ class ProjectOutputsResponse(BaseModel):
 
     project_id: str = Field(..., description="Project identifier")
     status: str = Field(..., description="Overall pipeline status")
+    avatar_provider: str = Field(default="mock", description="Selected avatar provider")
     has_final_script: bool = Field(..., description="Whether final canonical script exists")
     locales: List[str] = Field(default_factory=list, description="Target locales in project")
     audio_tracks: Dict[str, str] = Field(default_factory=dict, description="Audio track status by locale")

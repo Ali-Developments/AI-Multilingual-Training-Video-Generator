@@ -104,10 +104,15 @@ class AvatarProvider(ABC):
             try:
                 saved_info = json.loads(job_file.read_text(encoding="utf-8"))
                 saved_job_id = saved_info.get("job_id")
-                if saved_job_id and saved_info.get("status") in ("submitted", "pending", "processing", "completed"):
+                saved_prov = saved_info.get("provider") or "heygen"
+                if (
+                    saved_job_id
+                    and saved_prov.strip().lower() == self.provider_name.strip().lower()
+                    and saved_info.get("status") in ("submitted", "pending", "processing", "completed")
+                ):
                     logger.info(
-                        "Found persisted avatar job ID '%s' for scene '%s'; polling existing job instead of resubmitting.",
-                        saved_job_id, scene_id
+                        "Found persisted avatar job ID '%s' for scene '%s' (%s); polling existing job instead of resubmitting.",
+                        saved_job_id, scene_id, self.provider_name
                     )
                     job_id = saved_job_id
             except Exception as ex:

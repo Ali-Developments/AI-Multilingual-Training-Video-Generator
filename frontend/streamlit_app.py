@@ -75,9 +75,38 @@ def render_app():
             api_mode = False
 
         st.markdown("---")
+        st.subheader("Select Project")
+
+        # Load project list
+        if api_mode:
+            project_list = fetch_projects_via_api(backend_url)
+        else:
+            project_list = fetch_projects_direct()
+
+        project_options = {p["project_id"]: f"{p['project_id'][:8]} — {p.get('topic', 'Untitled')[:25]}" for p in project_list}
+
+        selected_project_id = st.selectbox(
+            "Current Active Project",
+            options=list(project_options.keys()),
+            format_func=lambda x: project_options.get(x, x),
+            index=0 if project_options else None,
+        )
+
+        # Load active project manifest early for provider inspection
+        active_manifest: Optional[Dict[str, Any]] = None
+        if selected_project_id:
+            if api_mode:
+                active_manifest = fetch_project_manifest_via_api(backend_url, selected_project_id)
+            else:
+                active_manifest = load_manifest_direct(selected_project_id)
+
+        if st.button("🔄 Refresh Projects"):
+            st.rerun()
+
+        st.markdown("---")
         st.subheader("Provider Status")
 
-        # Dynamic Provider Badges (ISSUE-003 & ISSUE-002)
+        # Dynamic Provider Badges
         health_details = health.get("details", {}) if health else {}
         if health:
             llm_provider_name = health_details.get("llm_provider") or health_details.get("default_llm", "groq")
@@ -101,41 +130,19 @@ def render_app():
         if llm_provider_name == "Unavailable":
             st.markdown("- **LLM Provider:** `Unavailable`")
             st.markdown("- **TTS Engine:** `Unavailable`")
-            st.markdown("- **Avatar Engine:** `Unavailable`")
+            st.markdown("- **Default Avatar Provider:** `Unavailable`")
         else:
             st.markdown(f"- **LLM Provider:** `{llm_provider_name.capitalize()} ({llm_model_name})`")
             st.markdown(f"- **TTS Engine:** `{tts_engine_name.replace('_', '-').capitalize()} (Local Free Tier)`")
-            has_heygen_key = bool(settings and settings.HEYGEN_API_KEY)
-            if avatar_engine_name == "heygen" and live_heygen_gate and has_heygen_key:
-                st.markdown("- **Avatar Engine:** `HeyGen (Live API Active)`")
-            elif avatar_engine_name == "sadtalker":
-                st.markdown("- **Avatar Engine:** `SadTalker Local (Free)`")
+            st.markdown(f"- **Default Avatar Provider:** `{avatar_engine_name}`")
+            if active_manifest:
+                proj_avatar = active_manifest.get("avatar_provider") or active_manifest.get("source_request", {}).get("avatar_provider", "mock")
+                st.markdown(f"- **Current Project Avatar Provider:** `{proj_avatar}`")
             else:
-                st.markdown("- **Avatar Engine:** `Mock Mode Active (0 Credits Used)`")
+                st.markdown("- **Current Project Avatar Provider:** `None selected`")
 
         st.markdown("- **Visual Engine:** `Local Visuals (Pillow Full HD)`")
         st.markdown("- **Compositor:** `FFmpeg Local Native Engine`")
-
-        st.markdown("---")
-        st.subheader("Select Project")
-
-        # Load project list
-        if api_mode:
-            project_list = fetch_projects_via_api(backend_url)
-        else:
-            project_list = fetch_projects_direct()
-
-        project_options = {p["project_id"]: f"{p['project_id'][:8]} — {p.get('topic', 'Untitled')[:25]}" for p in project_list}
-
-        selected_project_id = st.selectbox(
-            "Current Active Project",
-            options=list(project_options.keys()),
-            format_func=lambda x: project_options.get(x, x),
-            index=0 if project_options else None,
-        )
-
-        if st.button("🔄 Refresh Projects"):
-            st.rerun()
 
     # ---------------------------------------------------------------------------
     # Main Tabs UI
@@ -204,7 +211,7 @@ def render_app():
                     "Target Duration (seconds) *",
                     min_value=30,
                     max_value=300,
-                    value=60,
+                    value=30,
                     step=10,
                     help="Target runtime for the composed training video.",
                 )
@@ -226,12 +233,12 @@ def render_app():
                 avatar_choice = st.selectbox(
                     "Avatar Engine Mode",
                     options=[
-                        "Mock (0 Credits - Safe Local)",
-                        "SadTalker Local — Free (Runs locally. No API credits required.)",
-                        "HeyGen Live — Paid (External paid API. May consume credits.)",
+                        "SadTalker Local — Free",
+                        "Mock",
+                        "HeyGen Live — Paid",
                     ],
                     index=0,
-                    help="Mock generates local safe placeholders. SadTalker runs locally for free without external API credits. HeyGen Live connects to external paid cloud API.",
+                    help="SadTalker runs locally for free without external API credits. Mock generates local safe placeholders. HeyGen Live connects to external paid cloud API.",
                 )
                 ack_paid_credits = False
                 if "SadTalker" in avatar_choice:
@@ -336,16 +343,8 @@ def render_app():
                         st.error("Neither backend API nor direct engine is accessible.")
 
     # ---------------------------------------------------------------------------
-    # Load Manifest for Active Project
+    # Project View State
     # ---------------------------------------------------------------------------
-
-    active_manifest: Optional[Dict[str, Any]] = None
-    if selected_project_id:
-        if api_mode:
-            active_manifest = fetch_project_manifest_via_api(backend_url, selected_project_id)
-        else:
-            active_manifest = load_manifest_direct(selected_project_id)
-
     if not active_manifest:
         with tab_script:
             st.info("No project selected or manifest empty. Create or select a project in the sidebar.")
@@ -371,11 +370,18 @@ def render_app():
             with status_col3:
                 st.metric("Localization Status", active_manifest.get("localization_status", "unknown").upper())
 
-            # Canonical Source Script
-            source_script = active_manifest.get("source_script")
+            # Canonical Source Script (mapping final_script or source_script)
+            source_script = active_manifest.get("final_script") or active_manifest.get("source_script")
+            if not source_script and active_manifest.get("localization_bundle"):
+                source_script = active_manifest["localization_bundle"].get("source_script")
+            
             if source_script:
                 st.subheader("Canonical Source Script (English / Base)")
-                st.markdown(f"**Title:** {source_script.get('title', 'N/A')} | **Target Duration:** {source_script.get('target_duration_seconds', 0)}s | **Estimated Duration:** {source_script.get('estimated_duration_seconds', 0)}s")
+                st.markdown(
+                    f"**Title:** {source_script.get('title', 'N/A')} | "
+                    f"**Target Duration:** {source_script.get('target_duration_seconds', 0)}s | "
+                    f"**Estimated Duration:** {source_script.get('estimated_duration_seconds', 0)}s"
+                )
                 
                 scenes = source_script.get("scenes", [])
                 for sc in scenes:
@@ -388,24 +394,35 @@ def render_app():
             else:
                 st.warning("Canonical source script not yet generated.")
 
-            # Localized Scripts
+            # Localized Scripts (mapping localization_bundle.localized_scripts)
             loc_bundle = active_manifest.get("localization_bundle")
-            if loc_bundle and loc_bundle.get("scripts"):
+            localized_scripts = {}
+            if loc_bundle:
+                localized_scripts = loc_bundle.get("localized_scripts") or loc_bundle.get("scripts") or {}
+
+            if localized_scripts:
                 st.markdown("---")
                 st.subheader("Localized Multilingual Scripts")
-                loc_tabs = st.tabs(list(loc_bundle["scripts"].keys()))
-                for ltab, (loc_code, loc_sc) in zip(loc_tabs, loc_bundle["scripts"].items()):
+                loc_tabs = st.tabs(list(localized_scripts.keys()))
+                for ltab, (loc_code, loc_sc) in zip(loc_tabs, localized_scripts.items()):
                     with ltab:
                         dir_badge = "➡️ LTR" if loc_sc.get("text_direction") == "ltr" else "⬅️ RTL"
-                        st.markdown(f"**Locale:** `{loc_code}` | **Direction:** {dir_badge} | **Duration:** {loc_sc.get('estimated_duration_seconds', 0)}s")
+                        dur = loc_sc.get("total_estimated_duration_seconds") or loc_sc.get("estimated_duration_seconds", 0)
+                        st.markdown(f"**Locale:** `{loc_code}` | **Direction:** {dir_badge} | **Duration:** {dur}s")
                         
-                        if loc_sc.get("cultural_adaptations"):
+                        cg = loc_sc.get("cultural_guidance") or loc_sc.get("cultural_adaptations")
+                        if cg:
                             with st.info("Cultural Guidance & Notes"):
-                                for k, v in loc_sc.get("cultural_adaptations", {}).items():
-                                    st.markdown(f"- **{k}:** {v}")
+                                if isinstance(cg, dict):
+                                    for k, v in cg.items():
+                                        if v:
+                                            st.markdown(f"- **{k.replace('_', ' ').capitalize()}:** {v}")
+                                elif isinstance(cg, list):
+                                    for item in cg:
+                                        st.markdown(f"- {item}")
 
                         for sc in loc_sc.get("scenes", []):
-                            with st.expander(f"Scene {sc.get('scene_id')}: {sc.get('scene_type', 'scene').upper()}", expanded=False):
+                            with st.expander(f"Scene {sc.get('scene_id')}: {sc.get('scene_type', 'scene').upper()} ({sc.get('estimated_duration_seconds', 0)}s)", expanded=False):
                                 st.markdown(f"**Localized Narration:** {sc.get('narration')}")
                                 st.markdown(f"**Visual Direction:** {sc.get('visual_direction')}")
                                 st.markdown(f"**On-Screen Text:** {sc.get('on_screen_text') or '*None*'}")
@@ -426,9 +443,20 @@ def render_app():
                     st.info("Audio tracks not synthesized yet.")
                 else:
                     for loc_code, track in audio_bundle.items():
-                        with st.expander(f"Locale `{loc_code}` — Total: {track.get('total_duration_seconds', 0.0):.1f}s", expanded=True):
-                            st.caption(f"Voice ID: `{track.get('voice_id')}` | Provider: `{track.get('provider')}`")
-                            for sc_audio in track.get("scene_audios", []):
+                        total_dur = track.get("total_audio_duration_seconds", track.get("total_duration_seconds", 0.0))
+                        track_meta = track.get("metadata", {})
+                        scene_audio_list = track.get("scene_audio", track.get("scene_audios", []))
+                        
+                        voice_id = track.get("voice_id") or track_meta.get("voice_id")
+                        provider = track.get("provider") or track_meta.get("provider")
+                        if not voice_id and scene_audio_list:
+                            voice_id = scene_audio_list[0].get("voice_id")
+                        if not provider and scene_audio_list:
+                            provider = scene_audio_list[0].get("provider")
+
+                        with st.expander(f"Locale `{loc_code}` — Total: {total_dur:.2f}s", expanded=True):
+                            st.caption(f"Voice ID: `{voice_id or 'N/A'}` | Provider: `{provider or 'N/A'}`")
+                            for sc_audio in scene_audio_list:
                                 st.markdown(f"**Scene {sc_audio.get('scene_id')}** ({sc_audio.get('duration_seconds', 0.0):.2f}s):")
                                 audio_path = sc_audio.get("audio_path")
                                 if audio_path and Path(audio_path).is_file():
@@ -438,21 +466,39 @@ def render_app():
 
             with col_avatar:
                 st.subheader("👤 Talking Avatar Segments")
+                proj_avatar_provider = active_manifest.get("avatar_provider") or active_manifest.get("source_request", {}).get("avatar_provider", "mock")
+                st.caption(f"Selected Avatar Provider: `{proj_avatar_provider}`")
+
                 if not avatar_bundle:
                     st.info("Avatar video segments not generated yet.")
                 else:
                     for loc_code, av_track in avatar_bundle.items():
-                        with st.expander(f"Locale `{loc_code}` Avatar Segments", expanded=True):
-                            for av_asset in av_track.get("avatar_videos", []):
-                                st.markdown(f"**Scene {av_asset.get('scene_id')}** ({av_asset.get('status', 'unknown')})")
+                        track_provider = av_track.get("metadata", {}).get("provider", proj_avatar_provider)
+                        scene_avatars = av_track.get("scene_avatars", av_track.get("avatar_videos", []))
+
+                        with st.expander(f"Locale `{loc_code}` Avatar Segments (Provider: {track_provider})", expanded=True):
+                            if not scene_avatars:
+                                st.caption("No scene avatars found in track.")
+                            for av_asset in scene_avatars:
+                                sc_id = av_asset.get("scene_id")
+                                sc_status = av_asset.get("status", "unknown")
+                                sc_dur = av_asset.get("duration_seconds", 0.0)
                                 vpath = av_asset.get("video_path")
+                                err = av_asset.get("error")
+
+                                eligibility = "Ineligible / Skipped" if sc_status == "skipped" else "Eligible (Avatar Rendered)"
+                                st.markdown(f"**Scene {sc_id}** — Status: `{sc_status.upper()}` | `{eligibility}` | Duration: `{sc_dur:.2f}s`")
+
+                                if err:
+                                    st.error(f"Error: {err}")
+
                                 if vpath and Path(vpath).is_file():
                                     st.video(vpath)
-                                else:
-                                    st.caption(f"Asset Path: `{vpath}` (Duration: {av_asset.get('duration_seconds', 0)}s)")
+                                elif vpath:
+                                    st.caption(f"Asset Path: `{vpath}`")
 
             # -------------------------------------------------------------------
-            # Post-TTS Duration Reconciliation UI (Step 8.1)
+            # Post-TTS Duration Reconciliation UI
             # -------------------------------------------------------------------
             duration_rec_meta = active_manifest.get("metadata", {}).get("duration_reconciliation", {})
             if duration_rec_meta:
@@ -499,9 +545,15 @@ def render_app():
                 else:
                     for loc_code, vtrack in vis_bundle.items():
                         st.markdown(f"**Locale `{loc_code}` Visual Assets:**")
-                        for vis in vtrack.get("visual_assets", []):
+                        scene_visuals = vtrack.get("scene_visuals", vtrack.get("visual_assets", []))
+                        if not scene_visuals:
+                            st.caption("No visual assets in track.")
+                        for vis in scene_visuals:
                             img_path = vis.get("image_path")
-                            caption = f"Scene {vis.get('scene_id')} | Layout: {vis.get('visual_type')} | {vis.get('headline')}"
+                            headline = vis.get("headline", "")
+                            caption = f"Scene {vis.get('scene_id')} | Layout: {vis.get('visual_type')} | Status: {vis.get('status', 'completed')}"
+                            if headline:
+                                caption += f" | {headline}"
                             if img_path and Path(img_path).is_file():
                                 st.image(img_path, caption=caption, use_container_width=True)
                             else:
@@ -542,17 +594,28 @@ def render_app():
         # -----------------------------------------------------------------------
         with tab_composed:
             st.header("🎬 Final Composed Training Videos")
-            comp_track = active_manifest.get("composition_track")
+            final_videos = active_manifest.get("final_videos", {})
+            if not final_videos and active_manifest.get("composition_track"):
+                final_videos = active_manifest["composition_track"].get("final_videos", {})
             
-            if not comp_track or not comp_track.get("final_videos"):
+            if not final_videos:
                 st.info("Final video composition has not been completed yet.")
             else:
-                final_videos = comp_track.get("final_videos", {})
                 for loc_code, fvid in final_videos.items():
                     st.subheader(f"Video Package: `{loc_code}`")
                     c1, c2 = st.columns([3, 2])
+                    vpath = fvid.get("video_path")
+                    scene_videos = fvid.get("scene_videos", [])
+                    total_scenes = fvid.get("scene_count", len(scene_videos))
+                    avatar_scenes_success = sum(1 for sc in scene_videos if sc.get("has_avatar"))
+
+                    avatar_track = active_manifest.get("avatar_tracks", {}).get(loc_code, {})
+                    eligible_avatar_count = sum(
+                        1 for sc in avatar_track.get("scene_avatars", [])
+                        if sc.get("status") != "skipped"
+                    ) or avatar_scenes_success
+                    
                     with c1:
-                        vpath = fvid.get("video_path")
                         if vpath and Path(vpath).is_file():
                             st.video(vpath)
                             with open(vpath, "rb") as vf:
@@ -570,12 +633,27 @@ def render_app():
 
                     with c2:
                         st.markdown("### 📊 Composition Details")
-                        st.markdown(f"- **Locale:** `{fvid.get('locale')}`")
-                        st.markdown(f"- **Duration:** `{fvid.get('duration_seconds', 0.0):.2f} seconds`")
-                        st.markdown(f"- **Resolution:** `{fvid.get('resolution', '1920x1080')}` Full HD")
-                        st.markdown(f"- **Framerate:** `{fvid.get('fps', 25)} FPS`")
-                        st.markdown(f"- **Scene Count:** `{fvid.get('scene_count', 0)} scenes`")
-                        st.markdown(f"- **File Path:** `{fvid.get('video_path')}`")
+                        st.markdown(f"- **Locale:** `{fvid.get('locale', loc_code)}`")
+                        dur = fvid.get("total_duration_seconds", fvid.get("duration_seconds", 0.0))
+                        st.markdown(f"- **Duration:** `{dur:.2f} seconds`")
+                        res = fvid.get("metadata", {}).get("resolution") or fvid.get("resolution", "1920x1080")
+                        fps = fvid.get("metadata", {}).get("fps") or fvid.get("fps", 25)
+                        comp_provider = fvid.get("metadata", {}).get("provider") or "ffmpeg"
+                        proj_provider = active_manifest.get("avatar_provider", "mock")
+                        st.markdown(f"- **Resolution:** `{res}` Full HD")
+                        st.markdown(f"- **Framerate:** `{fps} FPS`")
+                        st.markdown(f"- **Compositor Engine:** `{comp_provider}`")
+                        st.markdown(f"- **Avatar Engine:** `{proj_provider}`")
+                        st.markdown(f"- **Scene Count:** `{total_scenes} scenes`")
+                        st.markdown(f"- **Final Video Path:** `{vpath}`")
+
+                        if eligible_avatar_count > 0:
+                            if avatar_scenes_success == eligible_avatar_count:
+                                st.success(f"✅ **Avatar scenes:** {avatar_scenes_success}/{eligible_avatar_count} successful")
+                            else:
+                                st.error(f"❌ **Avatar scenes:** {avatar_scenes_success}/{eligible_avatar_count} successful (Failure State)")
+                        else:
+                            st.info("ℹ️ **Avatar scenes:** 0/0 (Visual only)")
 
         # -----------------------------------------------------------------------
         # TAB 6: Manifest & Project Operations
