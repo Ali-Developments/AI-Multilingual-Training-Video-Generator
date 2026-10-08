@@ -15,15 +15,17 @@ import {
   Wand2,
   Cpu,
   BookOpen,
+  AlertCircle,
 } from 'lucide-react';
 import { createProject, runPipeline } from '@/lib/api';
-import { VideoStyle, TrainingVideoRequest } from '@/types';
+import { VideoStyle, serializeCreateProjectRequest } from '@/types';
 
 export default function CreateVideoWizard() {
   const router = useRouter();
   const [step, setStep] = useState(1);
   const [submitting, setSubmitting] = useState(false);
   const [statusMessage, setStatusMessage] = useState('');
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   // Form State
   const [topic, setTopic] = useState('Workplace Phishing Defense Essentials');
@@ -98,21 +100,22 @@ export default function CreateVideoWizard() {
   const handleCreate = async (mode: 'studio' | 'quick') => {
     try {
       setSubmitting(true);
+      setErrorMessage(null);
       setStatusMessage('Initializing project manifest...');
 
-      const req: TrainingVideoRequest = {
+      const payload = serializeCreateProjectRequest({
         topic,
-        source_content: sourceContent,
+        sourceContent,
         audience,
-        base_language: baseLanguage,
-        target_languages: targetLanguages,
-        target_duration_seconds: duration,
-        video_style: videoStyle,
-        avatar_provider: avatarProvider,
-        avatar_id: avatarId,
-      };
+        baseLanguage,
+        targetLanguages,
+        duration,
+        videoStyle,
+        avatarProvider,
+        avatarId,
+      });
 
-      const manifest = await createProject(req);
+      const manifest = await createProject(payload);
       const projectId = manifest.project_id;
 
       if (mode === 'quick') {
@@ -124,7 +127,9 @@ export default function CreateVideoWizard() {
         router.push(`/studio/${projectId}`);
       }
     } catch (err: any) {
-      alert(`Project creation failed: ${err.message || err}`);
+      const msg = err?.message || String(err) || 'Failed to create project';
+      setErrorMessage(msg);
+      setStatusMessage('');
       setSubmitting(false);
     }
   };
@@ -467,6 +472,33 @@ export default function CreateVideoWizard() {
                 <span className="font-semibold text-emerald-400 capitalize">{avatarProvider}</span>
               </div>
             </div>
+
+            {errorMessage && (
+              <div className="p-4 rounded-xl bg-rose-950/60 border border-rose-800/80 text-rose-200 space-y-2 shadow-lg animate-in fade-in duration-200">
+                <div className="flex items-start gap-3">
+                  <AlertCircle className="w-5 h-5 text-rose-400 shrink-0 mt-0.5" />
+                  <div className="space-y-1.5 flex-1 min-w-0">
+                    <div className="text-xs font-bold text-rose-200 uppercase tracking-wider flex items-center gap-2">
+                      <span>Unable to Create Project</span>
+                      <span className="text-[10px] px-1.5 py-0.2 rounded bg-rose-900/80 text-rose-300 font-normal">Validation Error</span>
+                    </div>
+                    <div className="text-xs font-mono text-rose-300 whitespace-pre-line leading-relaxed bg-black/40 p-2.5 rounded-lg border border-rose-900/40">
+                      {errorMessage}
+                    </div>
+                    <p className="text-[11px] text-rose-300/80">
+                      Review your project inputs above or click Back to adjust content and language parameters, then retry.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setErrorMessage(null)}
+                    className="text-xs text-rose-400 hover:text-white px-2 py-1 rounded bg-rose-900/40 hover:bg-rose-900 transition-colors"
+                  >
+                    Dismiss
+                  </button>
+                </div>
+              </div>
+            )}
 
             {submitting ? (
               <div className="p-6 rounded-xl bg-slate-950 border border-slate-800 text-center space-y-3">

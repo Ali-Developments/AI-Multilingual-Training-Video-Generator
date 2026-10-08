@@ -60,6 +60,32 @@ class ProjectManifestManager:
                 return ProjectManifest.model_validate(data)
             except Exception as e:
                 logger.error("Failed to load project manifest '%s': %s", project_id, e)
+                try:
+                    raw = manifest_file.read_text(encoding="utf-8")
+                    data = json.loads(raw) if raw.strip() else {}
+                    if isinstance(data, dict):
+                        src_dict = data.get("source_request") if isinstance(data.get("source_request"), dict) else {}
+                        topic = data.get("topic") or src_dict.get("topic") or "Legacy Project"
+                        base_lang = data.get("base_language") or src_dict.get("base_language") or "en-US"
+                        target_langs = data.get("target_languages") or src_dict.get("target_languages") or [base_lang]
+                        dur = data.get("target_duration_seconds") or src_dict.get("target_duration_seconds") or 60
+
+                        return ProjectManifest(
+                            project_id=project_id,
+                            created_at=data.get("created_at") or "",
+                            updated_at=data.get("updated_at") or "",
+                            status=data.get("status", "needs_review"),
+                            avatar_provider=data.get("avatar_provider", "mock"),
+                            source_request=TrainingVideoRequest(
+                                topic=str(topic),
+                                base_language=str(base_lang),
+                                target_languages=list(target_langs) if isinstance(target_langs, list) else [str(base_lang)],
+                                target_duration_seconds=int(dur) if str(dur).isdigit() else 60,
+                            ),
+                            errors=[f"Legacy schema or partial corruption: {str(e)}"],
+                        )
+                except Exception:
+                    pass
                 return None
 
     def save_manifest(self, manifest: ProjectManifest) -> Path:

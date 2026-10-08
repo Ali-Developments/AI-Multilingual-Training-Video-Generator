@@ -798,9 +798,12 @@ class ProjectSummary(BaseModel):
 
     project_id: str = Field(..., description="Project ID")
     topic: str = Field(..., description="Project topic or title")
+    title: Optional[str] = Field(default=None, description="Display title alias for topic")
     base_language: str = Field(default="en-US", description="Base canonical language")
+    source_language: Optional[str] = Field(default=None, description="Display language alias for base_language")
     target_languages: List[str] = Field(default_factory=list, description="Target localization locales")
     target_duration_seconds: int = Field(default=60, description="Target video duration")
+    duration_seconds: Optional[float] = Field(default=None, description="Measured or target duration in seconds")
     status: str = Field(default="pending", description="Overall project status")
     avatar_provider: str = Field(default="mock", description="Selected avatar provider")
     video_style: str = Field(default="hybrid_presenter_broll", description="Selected video style")
@@ -809,6 +812,56 @@ class ProjectSummary(BaseModel):
     scenes_count: int = Field(default=0, description="Number of scenes in script")
     completed_locales: List[str] = Field(default_factory=list, description="Locales with completed final videos")
     thumbnail_url: Optional[str] = Field(default=None, description="URL or relative path to project preview thumbnail")
+    thumbnail_path: Optional[str] = Field(default=None, description="Alias for thumbnail_url")
+    is_legacy: bool = Field(default=False, description="Flag indicating legacy or migrated manifest")
+    migration_required: bool = Field(default=False, description="Flag indicating manifest requires schema migration")
+
+    @model_validator(mode="before")
+    @classmethod
+    def sync_summary_fields_before(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            # Sync title <-> topic
+            if not data.get("topic") and data.get("title"):
+                data["topic"] = data["title"]
+            if not data.get("title") and data.get("topic"):
+                data["title"] = data["topic"]
+
+            # Sync source_language <-> base_language
+            if not data.get("base_language") and data.get("source_language"):
+                data["base_language"] = data["source_language"]
+            if not data.get("source_language") and data.get("base_language"):
+                data["source_language"] = data["base_language"]
+
+            # Sync duration_seconds <-> target_duration_seconds
+            if data.get("duration_seconds") is None and data.get("target_duration_seconds") is not None:
+                data["duration_seconds"] = float(data["target_duration_seconds"])
+            elif data.get("target_duration_seconds") is None and data.get("duration_seconds") is not None:
+                data["target_duration_seconds"] = int(round(data["duration_seconds"]))
+
+            # Sync thumbnail_path <-> thumbnail_url
+            if not data.get("thumbnail_url") and data.get("thumbnail_path"):
+                data["thumbnail_url"] = data["thumbnail_path"]
+            if not data.get("thumbnail_path") and data.get("thumbnail_url"):
+                data["thumbnail_path"] = data["thumbnail_url"]
+        return data
+
+    @model_validator(mode="after")
+    def sync_summary_fields_after(self) -> "ProjectSummary":
+        if not self.title and self.topic:
+            self.title = self.topic
+        if not self.topic and self.title:
+            self.topic = self.title
+        if not self.source_language and self.base_language:
+            self.source_language = self.base_language
+        if not self.base_language and self.source_language:
+            self.base_language = self.source_language
+        if self.duration_seconds is None:
+            self.duration_seconds = float(self.target_duration_seconds)
+        if not self.thumbnail_path and self.thumbnail_url:
+            self.thumbnail_path = self.thumbnail_url
+        if not self.thumbnail_url and self.thumbnail_path:
+            self.thumbnail_url = self.thumbnail_path
+        return self
 
 
 class UploadedMediaItem(BaseModel):

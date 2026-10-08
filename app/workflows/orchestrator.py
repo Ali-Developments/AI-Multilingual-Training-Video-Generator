@@ -127,7 +127,7 @@ class ProjectOrchestrator:
                 state = workflow.invoke({"request": manifest.source_request})
                 final_script = state.get("final_script")
 
-                if not final_script and state.get("draft_script"):
+                if not final_script and state.get("workflow_status") == "completed" and state.get("draft_script"):
                     draft = state.get("draft_script")
                     if draft and getattr(draft, "scenes", None):
                         logger.warning(

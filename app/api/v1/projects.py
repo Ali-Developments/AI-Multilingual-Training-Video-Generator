@@ -82,38 +82,150 @@ async def list_project_summaries() -> List[ProjectSummary]:
     manifests = manifest_manager.list_projects()
     summaries: List[ProjectSummary] = []
     for m in manifests:
-        target_langs = m.source_request.target_languages or [m.source_request.base_language]
-        thumb = None
-        # Check if first scene has visual asset
-        if m.visual_tracks:
-            for v_trk in m.visual_tracks.values():
-                if v_trk.scenes:
-                    first_sc = next(iter(v_trk.scenes.values()), None)
-                    if first_sc and first_sc.visual_asset_path:
-                        thumb = first_sc.visual_asset_path
+        try:
+            pid = getattr(m, "project_id", "unknown")
+            src_req = getattr(m, "source_request", None)
+            topic = getattr(src_req, "topic", None) or "Untitled Project"
+            base_lang = getattr(src_req, "base_language", "en-US") or "en-US"
+            target_langs = (
+                getattr(src_req, "target_languages", None)
+                or [base_lang]
+            )
+            target_dur = int(getattr(src_req, "target_duration_seconds", 60) or 60)
+            v_style = str(getattr(src_req, "video_style", "hybrid_presenter_broll") or "hybrid_presenter_broll")
+            av_prov = str(getattr(m, "avatar_provider", None) or getattr(src_req, "avatar_provider", "mock") or "mock")
+
+            thumb = None
+            # Check canonical visual_tracks[locale].scene_visuals
+            v_tracks = getattr(m, "visual_tracks", None) or {}
+            if isinstance(v_tracks, dict):
+                for v_trk in v_tracks.values():
+                    # Canonical Pydantic field: scene_visuals
+                    scene_visuals = getattr(v_trk, "scene_visuals", None)
+                    if scene_visuals is None and isinstance(v_trk, dict):
+                        scene_visuals = v_trk.get("scene_visuals") or v_trk.get("visual_assets")
+
+                    if scene_visuals and isinstance(scene_visuals, (list, tuple)):
+                        for sc_vis in scene_visuals:
+                            img = getattr(sc_vis, "image_path", None)
+                            if not img and isinstance(sc_vis, dict):
+                                img = sc_vis.get("image_path") or sc_vis.get("visual_asset_path")
+                            if img:
+                                thumb = img
+                                break
+                    # Legacy fallback if scenes dictionary exists
+                    elif hasattr(v_trk, "scenes") or (isinstance(v_trk, dict) and "scenes" in v_trk):
+                        scenes_dict = getattr(v_trk, "scenes", None) if hasattr(v_trk, "scenes") else v_trk.get("scenes")
+                        if isinstance(scenes_dict, dict):
+                            first_sc = next(iter(scenes_dict.values()), None)
+                            if first_sc:
+                                img = getattr(first_sc, "visual_asset_path", None) or getattr(first_sc, "image_path", None)
+                                if not img and isinstance(first_sc, dict):
+                                    img = first_sc.get("visual_asset_path") or first_sc.get("image_path")
+                                if img:
+                                    thumb = img
+                    if thumb:
                         break
 
-        total_dur = 0.0
-        if m.audio_tracks:
-            for trk in m.audio_tracks.values():
-                if trk.total_duration_seconds > 0:
-                    total_dur = trk.total_duration_seconds
-                    break
+            # Audio duration check
+            total_dur = 0.0
+            a_tracks = getattr(m, "audio_tracks", None) or {}
+            if isinstance(a_tracks, dict):
+                for trk in a_tracks.values():
+                    dur = (
+                        getattr(trk, "total_audio_duration_seconds", None)
+                        or getattr(trk, "total_duration_seconds", None)
+                    )
+                    if dur is None and isinstance(trk, dict):
+                        dur = trk.get("total_audio_duration_seconds") or trk.get("total_duration_seconds")
+                    if dur and float(dur) > 0:
+                        total_dur = float(dur)
+                        break
 
-        summaries.append(
-            ProjectSummary(
-                project_id=m.project_id,
-                title=m.source_request.topic or "Untitled Project",
-                source_language=m.source_request.base_language,
-                target_languages=target_langs,
-                duration_seconds=total_dur or float(m.source_request.target_duration_seconds),
-                status=m.status,
-                avatar_provider=m.avatar_provider,
-                thumbnail_path=thumb,
-                created_at=m.created_at,
-                updated_at=m.updated_at,
+            if total_dur == 0.0:
+                f_videos = getattr(m, "final_videos", None) or {}
+                if isinstance(f_videos, dict):
+                    for fv in f_videos.values():
+                        dur = getattr(fv, "total_duration_seconds", None) or getattr(fv, "duration_seconds", None)
+                        if dur is None and isinstance(fv, dict):
+                            dur = fv.get("total_duration_seconds") or fv.get("duration_seconds")
+                        if dur and float(dur) > 0:
+                            total_dur = float(dur)
+                            break
+
+            final_dur = total_dur if total_dur > 0 else float(target_dur)
+
+            # Scene count
+            scenes_cnt = 0
+            if getattr(m, "final_script", None):
+                sc_list = getattr(m.final_script, "scenes", None)
+                if isinstance(sc_list, (list, tuple)):
+                    scenes_cnt = len(sc_list)
+
+            # Completed locales
+            completed_locs: List[str] = []
+            f_vids = getattr(m, "final_videos", None) or {}
+            if isinstance(f_vids, dict):
+                for loc, fv in f_vids.items():
+                    st = getattr(fv, "status", None) if not isinstance(fv, dict) else fv.get("status")
+                    if st == "completed":
+                        completed_locs.append(loc)
+
+            is_legacy = bool(not getattr(src_req, "video_style", None) or not getattr(m, "script_status", None))
+            migration_req = bool(is_legacy and getattr(m, "status", "") != "completed")
+
+            summaries.append(
+                ProjectSummary(
+                    project_id=pid,
+                    topic=topic,
+                    title=topic,
+                    base_language=base_lang,
+                    source_language=base_lang,
+                    target_languages=target_langs,
+                    target_duration_seconds=target_dur,
+                    duration_seconds=final_dur,
+                    status=getattr(m, "status", "pending"),
+                    avatar_provider=av_prov,
+                    video_style=v_style,
+                    created_at=str(getattr(m, "created_at", "") or ""),
+                    updated_at=str(getattr(m, "updated_at", "") or ""),
+                    scenes_count=scenes_cnt,
+                    completed_locales=completed_locs,
+                    thumbnail_url=thumb,
+                    thumbnail_path=thumb,
+                    is_legacy=is_legacy,
+                    migration_required=migration_req,
+                )
             )
-        )
+        except Exception as exc:
+            logger.warning(
+                "Skipping or generating safe fallback for malformed project %s: %s",
+                getattr(m, "project_id", "unknown"),
+                exc,
+            )
+            summaries.append(
+                ProjectSummary(
+                    project_id=getattr(m, "project_id", f"legacy_{uuid.uuid4().hex[:6]}"),
+                    topic=getattr(getattr(m, "source_request", None), "topic", "Legacy Project") or "Legacy Project",
+                    title=getattr(getattr(m, "source_request", None), "topic", "Legacy Project") or "Legacy Project",
+                    base_language="en-US",
+                    source_language="en-US",
+                    target_languages=["en-US"],
+                    target_duration_seconds=60,
+                    duration_seconds=60.0,
+                    status=getattr(m, "status", "failed"),
+                    avatar_provider="mock",
+                    video_style="hybrid_presenter_broll",
+                    created_at=str(getattr(m, "created_at", "") or ""),
+                    updated_at=str(getattr(m, "updated_at", "") or ""),
+                    scenes_count=0,
+                    completed_locales=[],
+                    thumbnail_url=None,
+                    thumbnail_path=None,
+                    is_legacy=True,
+                    migration_required=True,
+                )
+            )
     return summaries
 
 
