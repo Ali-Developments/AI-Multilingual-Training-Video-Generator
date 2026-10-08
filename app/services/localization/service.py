@@ -341,6 +341,25 @@ class LocalizationService:
                 script, val, status = self.localize(req)
                 if status == "completed" and script:
                     localized_scripts[target_loc] = script
+                elif status == "needs_review" and script:
+                    non_duration_issues = [
+                        i for i in val.issues
+                        if i.code not in ("LOCALIZED_DURATION_TOO_LONG", "LOCALIZED_DURATION_TOO_SHORT", "DURATION_DRIFT_EXCEEDED")
+                    ]
+                    if not non_duration_issues:
+                        logger.info(
+                            "Accepting localized script for '%s' despite duration warning; DurationReconciliationService will reconcile timing downstream.",
+                            target_loc,
+                        )
+                        localized_scripts[target_loc] = script
+                    else:
+                        failed_locales[target_loc] = {
+                            "status": status,
+                            "code": "LOCALIZATION_VALIDATION_FAILED",
+                            "issues": [i.model_dump() for i in val.issues],
+                            "script": script.model_dump() if script else None,
+                            "stage": "localization",
+                        }
                 else:
                     failed_locales[target_loc] = {
                         "status": status,

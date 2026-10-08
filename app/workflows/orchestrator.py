@@ -17,6 +17,7 @@ from app.services.subtitles.service import SubtitleService
 from app.services.composition.service import CompositionService
 from app.services.duration import DurationReconciliationService
 from app.workflows.script_generation import create_script_workflow
+from app.workflows.storyboard_planner import StoryboardPlanner
 from app.workflows.manifest import ProjectManifestManager
 
 
@@ -126,6 +127,28 @@ class ProjectOrchestrator:
                 state = workflow.invoke({"request": manifest.source_request})
                 final_script = state.get("final_script")
 
+                if not final_script and state.get("draft_script"):
+                    draft = state.get("draft_script")
+                    if draft and getattr(draft, "scenes", None):
+                        logger.warning(
+                            "[%s] Adopting draft script with %d scenes despite validation review flag: %s",
+                            project_id,
+                            len(draft.scenes),
+                            state.get("errors", []),
+                        )
+                        final_script = FinalScript(
+                            title=draft.title,
+                            language=draft.language,
+                            audience=draft.audience,
+                            target_duration_seconds=manifest.source_request.target_duration_seconds,
+                            total_estimated_duration_seconds=draft.total_estimated_duration_seconds,
+                            opening_hook=draft.opening_hook,
+                            closing_summary=draft.closing_summary,
+                            learning_objectives=draft.learning_objectives or [],
+                            scenes=draft.scenes,
+                            metadata={"adopted_from_draft": True},
+                        )
+
                 if not final_script:
                     workflow_status = state.get("workflow_status", "failed")
                     errors_list = state.get("errors", [])
@@ -151,8 +174,14 @@ class ProjectOrchestrator:
 
                 manifest.clear_stage_errors("script")
                 manifest.final_script = final_script
+                # Apply professional V2 Storyboard Planner
+                StoryboardPlanner.plan_storyboard(manifest.final_script, manifest.source_request)
                 manifest.script_status = "completed"
                 self.manifest_manager.save_manifest(manifest)
+
+            # Ensure V2 fields are planned even if loaded from older manifest
+            if manifest.final_script:
+                StoryboardPlanner.plan_storyboard(manifest.final_script, manifest.source_request)
 
             # Persist canonical script to scripts/ directory
             project_dir = self.manifest_manager.get_project_dir(project_id)
@@ -199,6 +228,21 @@ class ProjectOrchestrator:
                     manifest.clear_stage_errors("localization")
                     manifest.localization_status = "completed"
                 self.manifest_manager.save_manifest(manifest)
+
+            # Sync V2 storyboard attributes into localized scripts
+            if manifest.localization_bundle and manifest.localization_bundle.localized_scripts and manifest.final_script:
+                src_map = {s.scene_id: s for s in manifest.final_script.scenes}
+                for loc_sc in manifest.localization_bundle.localized_scripts.values():
+                    for lscene in loc_sc.scenes:
+                        src_s = src_map.get(lscene.scene_id)
+                        if src_s:
+                            lscene.media_type = src_s.media_type
+                            lscene.layout_type = src_s.layout_type
+                            lscene.avatar_enabled = src_s.avatar_enabled
+                            lscene.presenter_position = src_s.presenter_position
+                            lscene.transition = src_s.transition
+                            lscene.media_asset_path = src_s.media_asset_path
+                            lscene.quiz_data = src_s.quiz_data
 
             # Persist localized scripts to scripts/ directory
             if manifest.localization_bundle and manifest.localization_bundle.localized_scripts:
