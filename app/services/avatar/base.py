@@ -28,9 +28,20 @@ def is_avatar_eligible(scene: Union[SceneDraft, LocalizedScene]) -> bool:
     Determine if a scene is eligible for talking-head avatar synthesis.
     
     Returns:
-        True if scene_type is 'presenter', 'intro', 'outro', or 'recap'.
-        False for visual demos, slides, or explanations that rely purely on graphical assets.
+        True if avatar_enabled is True and media_type/scene_type indicates presenter representation.
+        False for visual demos, broll, slides, diagrams, quizzes, or when avatar_enabled is explicitly False.
     """
+    if getattr(scene, "avatar_enabled", True) is False:
+        return False
+        
+    media_type = getattr(scene, "media_type", None)
+    if media_type is not None:
+        mt = str(media_type.value if hasattr(media_type, "value") else media_type).strip().lower()
+        if mt in ("presenter", "outro"):
+            return True
+        if mt in ("broll", "motion_visual", "uploaded_video", "uploaded_image", "diagram", "quiz", "title"):
+            return False
+
     stype = (scene.scene_type or "presenter").strip().lower()
     return stype in AVATAR_ELIGIBLE_SCENE_TYPES
 

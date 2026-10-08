@@ -22,15 +22,19 @@ class MockCompositionProvider(CompositionProvider):
         scene_id: str,
         locale: str,
         audio_path: Path,
-        visual_image_path: Optional[Path],
-        avatar_video_path: Optional[Path],
-        subtitle_path: Optional[Path],
-        duration_seconds: float,
-        output_path: Path,
+        visual_image_path: Optional[Path] = None,
+        avatar_video_path: Optional[Path] = None,
+        subtitle_path: Optional[Path] = None,
+        duration_seconds: float = 0.0,
+        output_path: Optional[Path] = None,
         burn_subtitles: bool = True,
+        layout_type: str = "presenter_split",
+        presenter_position: str = "right",
+        motion_video_path: Optional[Path] = None,
     ) -> SceneCompositionAsset:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        generate_synthetic_mp4_file(output_path, duration_seconds=max(0.5, duration_seconds))
+        out_p = output_path or Path(f"mock_{scene_id}.mp4")
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        generate_synthetic_mp4_file(out_p, duration_seconds=max(0.5, duration_seconds))
 
         has_avatar = bool(avatar_video_path and avatar_video_path.exists())
         has_sub = bool(burn_subtitles and subtitle_path and subtitle_path.exists())

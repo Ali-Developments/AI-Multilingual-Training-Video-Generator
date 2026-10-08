@@ -28,6 +28,9 @@ class CompositionProvider(ABC):
         duration_seconds: float = 0.0,
         output_path: Optional[Path] = None,
         burn_subtitles: bool = True,
+        layout_type: str = "presenter_split",
+        presenter_position: str = "right",
+        motion_video_path: Optional[Path] = None,
     ) -> SceneCompositionAsset:
         """Compose individual scene audio, visuals, avatar, and subtitles into scene MP4."""
         pass

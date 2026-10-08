@@ -35,6 +35,9 @@ class FFmpegCompositionProvider(CompositionProvider):
         duration_seconds: float = 0.0,
         output_path: Optional[Path] = None,
         burn_subtitles: bool = True,
+        layout_type: str = "presenter_split",
+        presenter_position: str = "right",
+        motion_video_path: Optional[Path] = None,
     ) -> SceneCompositionAsset:
         if not check_ffmpeg_available():
             raise RuntimeError(
@@ -47,11 +50,13 @@ class FFmpegCompositionProvider(CompositionProvider):
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
         has_avatar = bool(avatar_video_path and avatar_video_path.exists() and avatar_video_path.stat().st_size > 0)
-        has_visual = bool(visual_image_path and visual_image_path.exists() and visual_image_path.stat().st_size > 0)
+        has_motion = bool(motion_video_path and motion_video_path.exists() and motion_video_path.stat().st_size > 0)
+        has_image = bool(visual_image_path and visual_image_path.exists() and visual_image_path.stat().st_size > 0)
+        has_visual = has_motion or has_image
 
         if not has_avatar and not has_visual:
             raise FileNotFoundError(
-                f"Scene '{scene_id}' requires either a visual image or avatar video segment."
+                f"Scene '{scene_id}' requires either a visual image, motion video, or avatar video segment."
             )
 
         sub_burned = False
@@ -72,7 +77,7 @@ class FFmpegCompositionProvider(CompositionProvider):
 
         def _execute_ffmpeg(cmd: List[str]) -> bool:
             try:
-                res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+                res = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
                 if res.returncode == 0:
                     return True
                 logger.warning("FFmpeg command failed with stderr: %s", res.stderr)
@@ -94,63 +99,36 @@ class FFmpegCompositionProvider(CompositionProvider):
             f"pad={settings.VIDEO_WIDTH}:{settings.VIDEO_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black,setsar=1"
         )
 
-        use_pip = (
-            has_avatar
-            and has_visual
-            and getattr(settings, "AVATAR_LAYOUT", "pip").lower() == "pip"
-        )
+        layout = (layout_type or "presenter_split").lower()
+        pos = (presenter_position or "right").lower()
 
-        if has_avatar and use_pip:
-            logger.info("Composing avatar scene '%s' with PiP presenter panel layout", scene_id)
-            pip_size = 540  # 540x540 panel on 1920x1080 background (~2x upscale of 256x256)
-            base_pip_filter = (
-                f"[1:v]scale={settings.VIDEO_WIDTH}:{settings.VIDEO_HEIGHT}:force_original_aspect_ratio=decrease,"
-                f"pad={settings.VIDEO_WIDTH}:{settings.VIDEO_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black,setsar=1[bg];"
-                f"[0:v]scale={pip_size}:{pip_size}:force_original_aspect_ratio=decrease,setsar=1[pip];"
-                f"[bg][pip]overlay=W-w-50:H-h-50"
-            )
-            final_pip_filter = f"{base_pip_filter},{sub_filter}" if sub_filter else base_pip_filter
+        # CASE 1: Presenter-Led Layouts
+        if has_avatar:
+            if layout in ("presenter_split", "presenter_overlay") and has_visual:
+                logger.info("Composing presenter_split scene '%s' (presenter_pos=%s)", scene_id, pos)
+                # Split proportions: Presenter = 42% (806px), Supporting Media = 58% (1114px)
+                # Base media input: motion video or image
+                media_input = str(motion_video_path.resolve()) if has_motion else str(visual_image_path.resolve())
+                media_is_loop = not has_motion
 
-            base_cmd = [
-                settings.FFMPEG_BINARY_PATH,
-                "-y",
-                "-i", str(avatar_video_path.resolve()),
-                "-loop", "1",
-                "-i", str(visual_image_path.resolve()),
-                "-i", str(audio_path.resolve()),
-            ]
+                # Input 0: avatar, Input 1: media, Input 2: audio
+                base_cmd = [settings.FFMPEG_BINARY_PATH, "-y", "-i", str(avatar_video_path.resolve())]
+                if media_is_loop:
+                    base_cmd.extend(["-loop", "1"])
+                base_cmd.extend(["-i", media_input, "-i", str(audio_path.resolve())])
 
-            cmd_with_sub = base_cmd + [
-                "-filter_complex", final_pip_filter,
-                "-map", "0:v" if not final_pip_filter else "[0:v]", # overridden below
-                "-map", "2:a:0",
-                "-c:v", settings.VIDEO_CODEC,
-                *audio_encoding_args,
-                "-pix_fmt", "yuv420p",
-                "-shortest",
-                "-t", str(duration_seconds),
-                str(output_path.resolve()),
-            ]
-            # When filter_complex is used without labeled output in overlay:
-            # The filter graph outputs the composite on the default output stream.
-            cmd_with_sub = base_cmd + [
-                "-filter_complex", final_pip_filter,
-                "-map", "2:a:0",
-                "-c:v", settings.VIDEO_CODEC,
-                *audio_encoding_args,
-                "-pix_fmt", "yuv420p",
-                "-shortest",
-                "-t", str(duration_seconds),
-                str(output_path.resolve()),
-            ]
+                # Build filter complex
+                av_filter = "[0:v]scale=806:806:force_original_aspect_ratio=decrease,pad=806:1080:(ow-iw)/2:(oh-ih)/2:color=0x090D1A,setsar=1[av];"
+                med_filter = "[1:v]scale=1114:1080:force_original_aspect_ratio=increase,crop=1114:1080,setsar=1[med];"
+                if pos == "left":
+                    stack_filter = f"{av_filter}{med_filter}[av][med]hstack=inputs=2[stacked];[stacked]drawbox=x=805:y=0:w=3:h=1080:color=0x00E5FF@0.6:t=fill[composed]"
+                else:  # right (default for RTL & modern studio)
+                    stack_filter = f"{av_filter}{med_filter}[med][av]hstack=inputs=2[stacked];[stacked]drawbox=x=1112:y=0:w=3:h=1080:color=0x00E5FF@0.6:t=fill[composed]"
 
-            if sub_filter and _execute_ffmpeg(cmd_with_sub):
-                sub_burned = True
-            else:
-                if sub_filter:
-                    logger.info("Subtitle burn-in failed on PiP scene '%s'; falling back to unburned", scene_id)
-                cmd_no_sub = base_cmd + [
-                    "-filter_complex", base_pip_filter,
+                final_split_filter = f"{stack_filter};[composed]{sub_filter}" if sub_filter else stack_filter
+
+                cmd_split = base_cmd + [
+                    "-filter_complex", final_split_filter,
                     "-map", "2:a:0",
                     "-c:v", settings.VIDEO_CODEC,
                     *audio_encoding_args,
@@ -159,21 +137,31 @@ class FFmpegCompositionProvider(CompositionProvider):
                     "-t", str(duration_seconds),
                     str(output_path.resolve()),
                 ]
-                if not _execute_ffmpeg(cmd_no_sub):
-                    logger.warning("PiP composition failed, falling back to centered avatar")
-                    use_pip = False
 
-        if has_avatar and not use_pip:
-            logger.info("Composing avatar scene '%s' for locale '%s' (centered layout)", scene_id, locale)
-            combined_filter = f"{norm_filter},{sub_filter}" if sub_filter else norm_filter
-            base_cmd = [
-                settings.FFMPEG_BINARY_PATH,
-                "-y",
-                "-i", str(avatar_video_path.resolve()),
-                "-i", str(audio_path.resolve()),
-            ]
-            if sub_filter:
-                cmd_with_sub = base_cmd + [
+                if _execute_ffmpeg(cmd_split):
+                    sub_burned = bool(sub_filter)
+                else:
+                    logger.warning("Presenter split composition failed, falling back to centered presenter")
+                    layout = "presenter_full"
+            else:
+                layout = "presenter_full"
+
+            if layout in ("presenter_full", "pip", "presenter_overlay") and not sub_burned:
+                # Presenter Full or Centered
+                logger.info("Composing presenter_full scene '%s' for locale '%s'", scene_id, locale)
+                # Frame presenter sharply at 960x960 centered on dark background (#090D1A) with bottom subtitle zone
+                full_av_filter = (
+                    f"scale=960:960:force_original_aspect_ratio=decrease,"
+                    f"pad={settings.VIDEO_WIDTH}:{settings.VIDEO_HEIGHT}:(ow-iw)/2:(oh-ih)/2-30:color=0x090D1A,setsar=1"
+                )
+                combined_filter = f"{full_av_filter},{sub_filter}" if sub_filter else full_av_filter
+                base_cmd = [
+                    settings.FFMPEG_BINARY_PATH,
+                    "-y",
+                    "-i", str(avatar_video_path.resolve()),
+                    "-i", str(audio_path.resolve()),
+                ]
+                cmd_full = base_cmd + [
                     "-vf", combined_filter,
                     "-map", "0:v:0",
                     "-map", "1:a:0",
@@ -183,58 +171,54 @@ class FFmpegCompositionProvider(CompositionProvider):
                     "-t", str(duration_seconds),
                     str(output_path.resolve()),
                 ]
-                if _execute_ffmpeg(cmd_with_sub):
-                    sub_burned = True
+                if _execute_ffmpeg(cmd_full):
+                    sub_burned = bool(sub_filter)
                 else:
-                    logger.info("Subtitle burn-in failed on scene '%s'; falling back to unburned render", scene_id)
-            if not sub_burned:
-                cmd_no_sub = base_cmd + [
-                    "-vf", norm_filter,
-                    "-map", "0:v:0",
-                    "-map", "1:a:0",
-                    "-c:v", settings.VIDEO_CODEC,
-                    *audio_encoding_args,
-                    "-pix_fmt", "yuv420p",
-                    "-t", str(duration_seconds),
-                    str(output_path.resolve()),
-                ]
-                if not _execute_ffmpeg(cmd_no_sub):
-                    raise RuntimeError(f"FFmpeg composition failed for avatar scene '{scene_id}'")
+                    # Fallback unburned
+                    cmd_no_sub = base_cmd + [
+                        "-vf", full_av_filter,
+                        "-map", "0:v:0",
+                        "-map", "1:a:0",
+                        "-c:v", settings.VIDEO_CODEC,
+                        *audio_encoding_args,
+                        "-pix_fmt", "yuv420p",
+                        "-t", str(duration_seconds),
+                        str(output_path.resolve()),
+                    ]
+                    if not _execute_ffmpeg(cmd_no_sub):
+                        raise RuntimeError(f"FFmpeg composition failed for avatar scene '{scene_id}'")
 
-        elif not has_avatar:
-            logger.info("Composing visual slide scene '%s' for locale '%s'", scene_id, locale)
+        # CASE 2: Non-Avatar Scenes (Media Full, Motion Visual, Quiz, Diagram)
+        else:
+            logger.info("Composing supporting media scene '%s' (has_motion=%s)", scene_id, has_motion)
+            media_src = str(motion_video_path.resolve()) if has_motion else str(visual_image_path.resolve())
             combined_filter = f"{norm_filter},{sub_filter}" if sub_filter else norm_filter
-            base_cmd = [
-                settings.FFMPEG_BINARY_PATH,
-                "-y",
-                "-loop", "1",
-                "-i", str(visual_image_path.resolve()),
-                "-i", str(audio_path.resolve()),
+
+            base_cmd = [settings.FFMPEG_BINARY_PATH, "-y"]
+            if not has_motion:
+                base_cmd.extend(["-loop", "1"])
+            base_cmd.extend(["-i", media_src, "-i", str(audio_path.resolve())])
+
+            cmd_media = base_cmd + [
+                "-vf", combined_filter,
+                "-map", "0:v:0",
+                "-map", "1:a:0",
+                "-c:v", settings.VIDEO_CODEC,
+                *audio_encoding_args,
+                "-pix_fmt", "yuv420p",
+                "-shortest",
+                "-t", str(duration_seconds),
+                str(output_path.resolve()),
             ]
-            if sub_filter:
-                cmd_with_sub = base_cmd + [
-                    "-vf", combined_filter,
-                    "-map", "0:v:0",
-                    "-map", "1:a:0",
-                    "-c:v", settings.VIDEO_CODEC,
-                    "-tune", "stillimage",
-                    *audio_encoding_args,
-                    "-pix_fmt", "yuv420p",
-                    "-shortest",
-                    "-t", str(duration_seconds),
-                    str(output_path.resolve()),
-                ]
-                if _execute_ffmpeg(cmd_with_sub):
-                    sub_burned = True
-                else:
-                    logger.info("Subtitle burn-in failed on scene '%s'; falling back to unburned render", scene_id)
-            if not sub_burned:
+            if _execute_ffmpeg(cmd_media):
+                sub_burned = bool(sub_filter)
+            else:
+                logger.info("Subtitle burn-in failed on media scene '%s'; rendering unburned", scene_id)
                 cmd_no_sub = base_cmd + [
                     "-vf", norm_filter,
                     "-map", "0:v:0",
                     "-map", "1:a:0",
                     "-c:v", settings.VIDEO_CODEC,
-                    "-tune", "stillimage",
                     *audio_encoding_args,
                     "-pix_fmt", "yuv420p",
                     "-shortest",
