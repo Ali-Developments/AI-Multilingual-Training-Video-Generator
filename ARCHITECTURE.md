@@ -1,11 +1,13 @@
 # System Architecture
 
 ## 1. Architectural Philosophy
-The **AI Training Video Generation Platform** is engineered following Clean Architecture and Domain-Driven Design principles:
+The **AI Multilingual Training Video Generation Platform** is engineered following Clean Architecture and Domain-Driven Design principles:
 - **Vendor Abstraction**: All external infrastructure and third-party APIs (LLM, TTS, Avatar, Subtitles, Visuals, FFmpeg) reside behind explicit abstract base classes. Business logic depends solely on these interfaces.
 - **Timing Synchronization Ground Truth**: Audio waveform measurement (`ffprobe` and `wave`) serves as the immutable ground-truth timing source for all downstream video segments, avatar lip-sync, visual displays, and subtitle cues.
+- **Post-TTS Duration Reconciliation**: After real speech is synthesized, the dedicated `DurationReconciliationService` dynamically budgets, condenses, and re-synthesizes audio if measured durations overrun target video limits (e.g., target 30s).
+- **Free Local Neural Avatar Generation**: The isolated `SadTalkerProvider` synthesizes audio-driven talking-head presenter videos on consumer NVIDIA GPUs without any external API calls or wallet costs.
 - **Multi-Locale Fault Isolation**: Pipeline failures on a specific target locale never abort or invalidate sibling locales that succeeded.
-- **Idempotency & Partial Resume**: Every generated artifact is recorded in an atomic `project.json` manifest. Re-running a completed or interrupted project reuses valid existing assets on disk.
+- **Content-Aware Caching & Idempotency**: Sidecar `.meta.json` files track text, voice, image, audio, and parameter hashes. Modifying script narration automatically invalidates downstream TTS, avatars, subtitles, and composed videos without requiring manual cache flushing.
 
 ```text
                +-----------------------------+
@@ -28,10 +30,16 @@ The **AI Training Video Generation Platform** is engineered following Clean Arch
  | Provider | | Provider| |Provider| |Provider| |Provider |
  +----------+ +---------+ +--------+ +--------+ +---------+
         |          |          |          |          |
-        +---------------------+---------------------+
+        |          v          |          |          |
+        |     Post-TTS Dur.   |          |          |
+        |    Reconciliation   |          |          |
+        +----------+----------+          |          |
+                   |                     |          |
+                   +---------------------+----------+
                               |
                +--------------v--------------+
                | Composition Provider (FFmpeg)|
+               | (Normalized 48kHz Stereo AAC)|
                +--------------+--------------+
                               |
                +--------------v--------------+
@@ -43,14 +51,15 @@ The **AI Training Video Generation Platform** is engineered following Clean Arch
 
 ## 2. Core Service Provider Matrix
 
-| Interface | Default Provider | Alternate / Fallback | Key Responsibilities |
+| Interface | Default / Local Provider | Alternate / External Provider | Key Responsibilities |
 | :--- | :--- | :--- | :--- |
-| `LLMProvider` | `GroqProvider` | `MockLLMProvider` | Text generation, script drafting, cultural localization via configuration-driven model ID. |
-| `TTSProvider` | `EdgeTTSProvider` | `MockTTSProvider`, `AzureTTSProvider` | Speech synthesis with multi-locale voice mapping and duration measurement. |
-| `AvatarProvider` | `MockAvatarProvider` | `HeyGenProvider` | Talking-head video segments for presenter scenes (`requires_avatar` logic). |
-| `VisualAssetProvider` | `LocalVisualProvider` | `MockVisualProvider` | 1920x1080 slide graphics with Unicode font rendering (Arabic & Bengali). |
-| `SubtitleProvider` | `DeterministicSubtitleProvider` | Future `WhisperProvider` | Monotonic proportional cue generation and `.srt`/`.vtt` serialization. |
-| `CompositionProvider`| `FFmpegCompositionProvider` | `MockCompositionProvider` | Per-scene video composition and lossless concatenation into final MP4. |
+| `LLMProvider` | `GroqProvider` (`openai/gpt-oss-20b`) | `MockLLMProvider` | Pedagogical analysis, scene drafting, cultural adaptation, and script condensation. |
+| `TTSProvider` | `EdgeTTSProvider` (`ar-SA-HamedNeural`) | `MockTTSProvider`, `AzureTTSProvider` | Free native speech synthesis with accurate locale voices and exact waveform measurement. |
+| `DurationService` | `DurationReconciliationService` | N/A | Post-TTS waveform verification, proportional scene budgeting, and multi-round condensation. |
+| `AvatarProvider` | `SadTalkerProvider` (Local Free) | `MockAvatarProvider`, `HeyGenProvider` (Paid API) | Isolated audio-driven talking-head presenter synthesis on CUDA or cloud APIs. |
+| `VisualAssetProvider`| `LocalVisualProvider` | `MockVisualProvider` | 1920x1080 slide graphics with Unicode font rendering (Arabic & Bengali). |
+| `SubtitleProvider` | `DeterministicSubtitleProvider` | Extensible to Whisper | Substation Alpha (`.ass`) with complex RTL HarfBuzz shaping, `.srt`, and `.vtt`. |
+| `CompositionProvider`| `FFmpegCompositionProvider` | `MockCompositionProvider` | Multi-track composition, PiP presenter paneling, audio normalization (48k stereo AAC), and concatenation. |
 
 ---
 
@@ -59,50 +68,39 @@ The **AI Training Video Generation Platform** is engineered following Clean Arch
 Projects are encapsulated under `storage/projects/<project_id>/`:
 ```text
 storage/projects/<project_id>/
-├── project.json                 # Atomic ProjectManifest tracking lifecycle and file paths
+├── project.json                      # Atomic authoritative pipeline state
+├── project.json.lock                 # Concurrency write lock
+├── acceptance_report.json            # Automated timeline audit & performance report
 ├── scripts/
-│   ├── source.json              # Canonical English/Base FinalScript
-│   ├── ar-SA.json               # Localized Arabic script (RTL)
-│   └── bn-BD.json               # Localized Bengali script (LTR)
+│   ├── canonical.json                # Master pedagogical English script
+│   └── <locale>.json                 # Culturally adapted localized script (e.g. ar-SA.json)
 ├── audio/
-│   ├── ar-SA/
-│   │   ├── scene_1.mp3          # Synthesized scene voiceover
-│   │   └── scene_2.mp3
-│   └── bn-BD/
+│   └── <locale>/
+│       ├── scene_<id>.mp3            # Measured scene speech waveforms
+│       └── scene_<id>.mp3.meta.json  # Audio provenance & narration hash
 ├── avatars/
-│   ├── ar-SA/
-│   │   └── scene_1.mp4          # HeyGen or Mock talking-head video
-│   └── bn-BD/
+│   └── <locale>/
+│       ├── scene_<id>.mp4            # Presenter talking-head video
+│       ├── scene_<id>.job.json       # Inference timing and job metadata
+│       └── scene_<id>.mp4.meta.json  # Input audio & portrait provenance
 ├── visuals/
-│   ├── ar-SA/
-│   │   └── scene_1.png          # 1920x1080 Full HD slide graphics
-│   └── bn-BD/
+│   └── <locale>/
+│       └── scene_<id>.png            # Full HD 1920x1080 supporting slide card
 ├── subtitles/
-│   ├── ar-SA/
-│   │   ├── subtitles.srt        # SubRip text format
-│   │   └── subtitles.vtt        # WebVTT format
-│   └── bn-BD/
+│   └── <locale>/
+│       ├── scene_<id>.srt            # SubRip Subtitle file
+│       ├── scene_<id>.vtt            # WebVTT cue file
+│       └── scene_<id>.ass            # Advanced SubStation Alpha with RTL styling
 ├── rendered/
-│   ├── ar-SA/
-│   │   ├── scene_1.mp4          # Composite scene video (avatar/visual + audio + subtitles)
-│   │   └── scene_2.mp4
-│   └── bn-BD/
+│   └── <locale>/
+│       └── scene_<id>.mp4            # Pre-composed scene video (48kHz stereo AAC)
 └── final/
-    ├── training_ar-SA.mp4       # Final concatenated training video
-    └── training_bn-BD.mp4
+    └── training_<locale>.mp4         # Master composed multilingual training video
 ```
 
 ---
 
-## 4. Pipeline State Machine & Execution Flow
-
-1. **`pending`**: Project manifest initialized (`POST /api/v1/projects`).
-2. **`running (script)`**: LangGraph canonical workflow (`normalize_input` -> `analyze_content` -> `generate_script` -> `validate_script` -> `finalize_script`).
-3. **`running (localization)`**: `LocalizationService` translates and adapts scripts per target locale (`ar-SA`, `bn-BD`), recording cultural guidance.
-4. **`running (audio)`**: `TTSService` synthesizes speech for every scene and updates script scenes with ground-truth measured duration via `get_audio_duration()`.
-5. **`running (avatar)`**: `AvatarService` evaluates `is_avatar_eligible(scene)` and generates talking-head video segments for eligible scenes.
-6. **`running (visuals)`**: `VisualService` renders 1920x1080 Pillow graphic cards with accent bars, badges, and Unicode typography.
-7. **`running (subtitles)`**: `SubtitleService` chunks narration text proportionally against the exact audio duration to produce monotonic subtitle cues.
-8. **`running (composition)`**: `CompositionService` renders per-scene MP4 files using FFmpeg (with subtitle burn-in) and performs ordered concatenation.
-9. **`completed`**: All target locales rendered successfully; manifest updated with output file paths.
-10. **`needs_review` / `failed`**: If validation or non-recoverable errors occur, errors are isolated in manifest without deleting prior valid stages.
+## 4. SadTalker Runtime Isolation
+- **Application Environment (`.venv`):** Python 3.13+ containing backend services and orchestrator.
+- **SadTalker Environment (`.sadtalker-venv`):** Python 3.10 with CUDA 11.8 PyTorch.
+- **Invocation:** Subprocess adapter with non-shell execution (`app/services/avatar/sadtalker_provider.py`), deterministic canonical output resolution, and strict timeout protection.

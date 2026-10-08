@@ -3,67 +3,78 @@
 ## 1. Development Principles
 - **Clean Architecture**: Services depend strictly on abstract base classes (`LLMProvider`, `TTSProvider`, `AvatarProvider`, `SubtitleProvider`, `VisualAssetProvider`, `CompositionProvider`).
 - **Timing Ground Truth**: Audio waveform duration measured from generated speech files is the single ground truth for scene timing across the pipeline.
-- **Cost Safety Policy**: All test runs and local continuous integrations enforce `ENABLE_LIVE_API_TESTS=False`. Paid external credits are never consumed automatically.
+- **Dedicated Post-TTS Duration Reconciliation**: When spoken audio drifts beyond configured tolerances, `DurationReconciliationService` deterministically condenses narration without losing pedagogical content.
+- **Cost Safety Policy**: All automated test runs enforce `ENABLE_LIVE_API_TESTS=False`. Paid external avatar credits (HeyGen) are never consumed automatically.
+- **SadTalker Environment Isolation**: The local talking avatar engine runs in an isolated Python 3.10 virtualenv (`.sadtalker-venv/`) to prevent polluting the main Python 3.13 production runtime.
 - **Cross-Platform Compatibility**: All file paths use `pathlib.Path` with safe Windows path and filter escaping.
 
 ---
 
 ## 2. Environment Setup & Execution
 
-### Python Virtual Environment
-Use the dedicated virtual environment in `.venv/`:
+### Main Application Environment (`.venv`)
 ```bash
 # Windows
-.venv\Scripts\python.exe -m pip install -r requirements.txt
-
-# Linux / macOS
-.venv/bin/python -m pip install -r requirements.txt
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
 ```
 
-### Running Test Suite
-Run the complete regression suite:
+### Free Local SadTalker Avatar Setup (`.sadtalker-venv`)
+To set up the free GPU-accelerated local talking-head avatar engine:
+```powershell
+# Run the automated SadTalker bootstrap script
+powershell -ExecutionPolicy Bypass -File scripts\setup_sadtalker.ps1
+```
+This script automatically:
+1. Clones the SadTalker repository into `tools/sadtalker/`.
+2. Creates an isolated Python 3.10 virtual environment in `.sadtalker-venv/`.
+3. Installs CUDA-enabled PyTorch (`torch 2.1+cu118`) and pinned dependencies (`numpy==1.23.5`).
+4. Verifies model checkpoints (`SadTalker_V0.0.2_256.safetensors`, `mapping_00229-model.pth.tar`, `mapping_00109-model.pth.tar`) in `tools/sadtalker/checkpoints/`.
+5. Confirms source presenter portrait in `assets/avatars/local_presenter.png`.
+
+---
+
+## 3. Running the Test Suite
+
+Run the full regression test suite (255 tests):
 ```bash
-.venv\Scripts\python.exe -m pytest -v
+.\.venv\Scripts\python.exe -m pytest -v
 ```
 
-Run targeted tests for specific modules:
+Run targeted test modules:
 ```bash
-.venv\Scripts\python.exe -m pytest tests/test_orchestrator.py -v
-.venv\Scripts\python.exe -m pytest tests/test_api_projects.py -v
-.venv\Scripts\python.exe -m pytest tests/test_frontend.py -v
-.venv\Scripts\python.exe -m pytest tests/test_hardening_failures.py -v
-```
+# Master Local Video Generation Pipeline tests (36 comprehensive tests)
+.\.venv\Scripts\python.exe -m pytest tests/test_master_local_pipeline.py -v
 
-### Launching the Backend API
-```bash
-.venv\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-```
+# Post-TTS Duration Reconciliation tests
+.\.venv\Scripts\python.exe -m pytest tests/test_duration_reconciliation.py -v
 
-### Launching the Streamlit Studio Frontend
-```bash
-.venv\Scripts\python.exe -m streamlit run frontend/streamlit_app.py
+# Orchestrator & End-to-end orchestration tests
+.\.venv\Scripts\python.exe -m pytest tests/test_orchestrator.py -v
 ```
 
 ---
 
-## 3. Adding New Service Providers
+## 4. Running the Real Local E2E Acceptance Test
 
-To introduce a new provider (e.g., ElevenLabs for TTS, Anthropic for LLM, or D-ID for Avatars):
-1. Add configuration parameters to `app/core/config.py` and `.env.example`.
-2. Implement the interface in `app/services/<service_type>/`:
-   - Subclass the base interface (e.g. `TTSProvider` in `app/services/tts/base.py`).
-   - Implement all abstract methods.
-3. Register the new provider key in the corresponding factory:
-   - e.g., `app/services/tts/factory.py`.
-4. Add isolated unit tests using mocks in `tests/test_<service_type>.py`.
+To execute a complete live local video generation run (Groq -> Localization -> Edge-TTS -> Duration Reconciliation -> SadTalker CUDA -> Local Visuals -> ASS Subtitles -> FFmpeg):
+```bash
+.\.venv\Scripts\python.exe scripts\run_master_acceptance.py
+```
+This generates `training_ar-SA.mp4` under `storage/projects/proj_local_video_generation_acceptance/final/` and saves an automated validation report to `acceptance_report.json`.
 
 ---
 
-## 4. Troubleshooting & Gotchas
+## 5. Launching Applications
 
-- **FFmpeg Subtitle Filter Escaping on Windows**:
-  FFmpeg's `subtitles` filter treats colons (`:`) and backslashes (`\`) as special delimiter characters. Use `escape_ffmpeg_filter_path()` from `app.services.composition.ffmpeg_utils` to ensure Windows drive letters (`C\:...`) do not break subtitle rendering.
-- **Unicode Support (Arabic & Bengali)**:
-  `LocalVisualProvider` utilizes Unicode fonts with fallback support to ensure Arabic RTL glyphs and Bengali complex ligatures render cleanly on Full HD slide cards without box replacement characters.
-- **Circular Imports**:
-  Never import `ProjectOrchestrator` directly inside `app/workflows/__init__.py` at module initialization time, as downstream validators in `app/services/localization` depend on `estimate_narration_duration_seconds` from `app.workflows.script_generation`.
+### FastAPI REST Backend
+```bash
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+### Streamlit Studio Frontend
+```bash
+.\.venv\Scripts\python.exe -m streamlit run frontend/streamlit_app.py
+```
+The Streamlit interface allows selecting **SadTalker Local (Free)**, custom presenter portrait uploads, target durations, and provides a real-time Duration Reconciliation monitor with revision attempt metrics.

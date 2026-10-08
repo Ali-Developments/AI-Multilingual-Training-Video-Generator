@@ -1,11 +1,11 @@
 # AI Multilingual Training Video Generation Platform
 
-> **Project Classification:** Autonomous Multi-Modal Educational Pipeline Prototype  
-> **Status:** AUDIT COMPLETE — DEVELOPMENT FREEZE (October 2026)  
+> **Project Classification:** Autonomous Multi-Modal Educational Video Pipeline  
+> **Status:** LOCAL VIDEO GENERATION COMPLETE — PRODUCTION HARDENED (October 2026)  
 > **Maintainer:** Ali Mostafa ([Ali-Developments](https://github.com/Ali-Developments))  
-> **Technical Audit Report:** [PROJECT_AUDIT_AND_TECHNICAL_REPORT.md](PROJECT_AUDIT_AND_TECHNICAL_REPORT.md) | [PROJECT_AUDIT_AND_TECHNICAL_REPORT.pdf](PROJECT_AUDIT_AND_TECHNICAL_REPORT.pdf)
+> **Key Reports:** [LOCAL_VIDEO_GENERATION_FINAL_REPORT.md](LOCAL_VIDEO_GENERATION_FINAL_REPORT.md) | [POST_TTS_DURATION_TARGETING_REPORT.md](POST_TTS_DURATION_TARGETING_REPORT.md) | [LOCAL_FREE_AVATAR_PROVIDER_REPORT.md](LOCAL_FREE_AVATAR_PROVIDER_REPORT.md) | [LOCAL_TIMING_AND_COMPOSITION_REMEDIATION.md](LOCAL_TIMING_AND_COMPOSITION_REMEDIATION.md)
 
-An enterprise-grade autonomous platform designed to transform curriculum texts and educational outlines into composed, localized training video packages.
+An enterprise-grade autonomous platform designed to transform curriculum texts and educational outlines into composed, localized training video packages with talking-head presenters, supporting graphics, and subtitles.
 
 ---
 
@@ -16,49 +16,57 @@ The platform converts training topics or raw curriculum materials into localized
 1. **Deterministic Canonical Scripting:** LangGraph StateGraph workflow with structured pedagogical analysis, scene structuring, and quality validation.
 2. **Linguistic & Cultural Localization:** Multilingual adaptation for Saudi Arabic (`ar-SA` with Right-to-Left RTL metadata) and Bengali (`bn-BD` with Left-to-Right LTR metadata), preserving learning objectives and domain terminology.
 3. **Voiceover Synthesis & Timing Synchronization:** Multi-provider TTS (Edge-TTS free WebSocket tier) with measured waveform durations serving as timing ground truth.
-4. **Talking-Head Presenter Avatar:** Video presenter generation abstraction supporting HeyGen API alongside a cost-free local Mock Avatar generator.
-5. **Full HD Supporting Visual Slides:** Local Pillow (PIL) 1920x1080 graphic card rendering adapted to scene instructional roles (intro, visual demo, explanation, recap, outro).
-6. **Deterministic Subtitle Generation:** Subtitle cue alignment (.SRT and .VTT) calculated from measured speech timings.
-7. **Native FFmpeg Video Composition:** Automated multi-track composition layering presenter video, visual slides, audio, and burned subtitles into standard H.264/AAC MP4 files.
-8. **Project Manifest & Resume Engine:** Persistent `project.json` manifest with stage idempotency and partial pipeline resume capabilities.
-9. **Dual Access Interface:** FastAPI REST API (`/api/v1/projects`) and an interactive Streamlit Studio dashboard.
+4. **Post-TTS Duration Reconciliation:** Dedicated `DurationReconciliationService` reconciling real audio duration with target limits via proportional scene budgeting and LLM condensation.
+5. **Free Local Talking-Head Avatar:** Subprocess-isolated SadTalker engine running locally on CUDA GPU without API credits, animating a high-resolution presenter portrait in PiP format.
+6. **Full HD Supporting Visual Slides:** Local Pillow 1920x1080 graphic card rendering adapted to scene instructional roles (intro, visual demo, explanation, recap, outro).
+7. **Complex RTL Subtitle Generation:** Advanced SubStation Alpha (`.ass`) with libass and HarfBuzz complex shaping, alongside `.srt` and `.vtt`.
+8. **Native FFmpeg Video Composition:** Automated multi-track composition layering presenter video in Picture-in-Picture (PiP), visual slides, audio normalized to 48,000 Hz stereo AAC, and subtitles into standard 1920x1080 MP4 files.
+9. **Project Manifest & Resume Engine:** Persistent `project.json` manifest with stage idempotency and partial pipeline resume capabilities.
+10. **Dual Access Interface:** FastAPI REST API (`/api/v1/projects`) and an interactive Streamlit Studio dashboard.
 
 ---
 
 ## 🏗️ Architecture & Pipeline Flow
 
-```text
-Training Video Request (Topic / Source Notes / Locales / Target Duration)
-                               │
-                               ▼
-                LangGraph Canonical Script Workflow
-          (normalize -> analyze -> generate -> validate -> finalize)
-                               │
-                               ▼
-             Multilingual Localization Service
-        (ar-SA [RTL], bn-BD [LTR], cultural adaptation notes)
-                               │
-                               ▼
-                  Speech Synthesis (Edge-TTS)
-           (probes exact waveform duration via ffprobe)
-                               │
-              ┌─────────────────┴─────────────────┐
-              ▼                                   ▼
-    Talking-Head Avatars               Full HD Supporting Visuals
-  (HeyGen presenter scenes)           (Pillow 1920x1080 slide cards)
-              └─────────────────┬─────────────────┘
-                                ▼
-                   Subtitle Engine (SRT & VTT)
-          (monotonic cumulative cue timestamps from audio)
-                               │
-                               ▼
-                FFmpeg Composition Engine
-        (per-scene rendering + ordered video concatenation)
-                               │
-                               ▼
-          Final Composed Training Videos (MP4) per Locale
-              (e.g., training_ar-SA.mp4, training_bn-BD.mp4)
-```
+`	ext
+Training Video Request (Topic / Locales / Target Duration)
+                           │
+                           ▼
+            LangGraph Canonical Script Workflow
+      (normalize -> analyze -> generate -> validate -> finalize)
+                           │
+                           ▼
+         Multilingual Localization Service
+    (ar-SA [RTL], cultural & terminology adaptation)
+                           │
+                           ▼
+              Speech Synthesis (Edge-TTS)
+       (authoritative waveform duration via ffprobe)
+                           │
+                           ▼
+         Post-TTS Duration Reconciliation Service
+     (overrun detection -> scene budgets -> condensation)
+                           │
+                           ▼
+                 Duration Approval Gate
+                           │
+          ┌────────────────┴────────────────┐
+          ▼                                 ▼
+SadTalker Local Avatar Engine      Full HD Supporting Visuals
+(CUDA-accelerated presenter PiP)  (Pillow 1920x1080 slide cards)
+          └────────────────┬────────────────┘
+                           ▼
+          Deterministic Subtitle Engine (.ass / .srt / .vtt)
+              (complex HarfBuzz RTL Arabic shaping)
+                           │
+                           ▼
+             FFmpeg Composition Engine
+   (48kHz stereo AAC normalization + scene concatenation)
+                           │
+                           ▼
+      Final Composed Training Videos (1920x1080 MP4)
+               (e.g., training_ar-SA.mp4)
+`
 
 ---
 
@@ -97,7 +105,7 @@ Video-Automation/
 │   └── streamlit_app.py             # Streamlit Studio interactive dashboard
 ├── storage/
 │   └── projects/                    # File-based project storage (<project_id>/)
-├── tests/                           # 162 automated regression and integration tests
+├── tests/                           # 255 automated regression and integration tests
 ├── .env.example                     # Environment configuration template
 ├── requirements.txt                 # Python dependencies
 ├── ARCHITECTURE.md                  # Detailed technical architecture specification
@@ -144,7 +152,7 @@ Default configuration runs in **Mock Mode** for avatars (`DEFAULT_AVATAR_PROVIDE
 To configure live Groq LLM:
 ```env
 DEFAULT_LLM_PROVIDER=groq
-GROQ_API_KEY=gsk_your_groq_api_key_here
+GROQ_API_KEY=your_groq_api_key_here
 GROQ_MODEL=openai/gpt-oss-20b
 ```
 
