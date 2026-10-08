@@ -18,6 +18,10 @@ import {
   RefreshCw,
   Wand2,
   Save,
+  X,
+  AlertCircle,
+  CheckCircle2,
+  Layers,
 } from 'lucide-react';
 import {
   fetchProject,
@@ -25,7 +29,7 @@ import {
   updateScene,
   reorderScenes,
   planStoryboard,
-  runPipeline,
+  renderProject,
   getStorageUrl,
   fetchProjectMedia,
   uploadMedia,
@@ -50,6 +54,8 @@ export default function SceneStudioPage() {
   const [loading, setLoading] = useState(true);
   const [savingScene, setSavingScene] = useState(false);
   const [rendering, setRendering] = useState(false);
+  const [renderStage, setRenderStage] = useState<string>('');
+  const [renderError, setRenderError] = useState<string | null>(null);
 
   // Inspector form state
   const [activeScene, setActiveScene] = useState<SceneDraft | null>(null);
@@ -60,6 +66,20 @@ export default function SceneStudioPage() {
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [previewMode, setPreviewMode] = useState<'scene' | 'full'>('scene');
+
+  // Toast state
+  const [toast, setToast] = useState<{
+    type: 'success' | 'error' | 'info';
+    title: string;
+    message: string;
+  } | null>(null);
+
+  const showToast = useCallback((type: 'success' | 'error' | 'info', title: string, message: string) => {
+    setToast({ type, title, message });
+    setTimeout(() => {
+      setToast((cur) => (cur?.message === message ? null : cur));
+    }, 6000);
+  }, []);
 
   const loadProjectData = useCallback(async () => {
     try {
@@ -121,9 +141,9 @@ export default function SceneStudioPage() {
       // Reload scenes
       const updated = await fetchScenes(projectId, selectedLocale);
       setScenes(updated);
-      alert('Scene updated successfully. Downstream assets invalidated if narration changed.');
+      showToast('success', 'Scene Saved', 'Scene updated successfully. Downstream assets invalidated if narration changed.');
     } catch (err: any) {
-      alert(`Save scene failed: ${err.message || err}`);
+      showToast('error', 'Save Failed', err.message || String(err));
     } finally {
       setSavingScene(false);
     }
@@ -144,36 +164,107 @@ export default function SceneStudioPage() {
 
     try {
       await reorderScenes(projectId, ids);
-    } catch (err) {
+    } catch (err: any) {
       console.error('Reorder error:', err);
+      showToast('error', 'Reorder Failed', err.message || String(err));
     }
   };
 
   const handleRunRender = async () => {
+    let pollInterval: NodeJS.Timeout | null = null;
     try {
       setRendering(true);
-      await runPipeline(projectId, false);
+      setRenderError(null);
+      setRenderStage('Preparing render pipeline...');
+
+      const stageLabels = [
+        'Preparing audio & narration tracks...',
+        `Localizing narration for ${selectedLocale}...`,
+        'Synthesizing speech with Edge-TTS...',
+        'Measuring exact audio waveform durations...',
+        'Reconciling narration duration with target...',
+        'Generating presenter avatars (SadTalker Local GPU)...',
+        'Generating motion visuals and B-roll slides...',
+        'Rendering and composing individual scenes...',
+        'Composing final multilingual video with FFmpeg...',
+      ];
+      let stageIdx = 0;
+
+      pollInterval = setInterval(async () => {
+        try {
+          const pollManifest = await fetchProject(projectId);
+          if (pollManifest) {
+            if (pollManifest.audio_status === 'running') {
+              setRenderStage('Synthesizing speech & measuring waveforms...');
+            } else if (pollManifest.avatar_status === 'running') {
+              setRenderStage('Generating presenter avatars (SadTalker)...');
+            } else if (pollManifest.visual_status === 'running') {
+              setRenderStage('Generating motion visuals and B-roll slides...');
+            } else if (pollManifest.composition_status === 'running') {
+              setRenderStage('Composing scenes & concatenating with FFmpeg...');
+            } else {
+              stageIdx = (stageIdx + 1) % stageLabels.length;
+              setRenderStage(stageLabels[stageIdx]);
+            }
+          }
+        } catch {
+          // ignore poller errors
+        }
+      }, 2500);
+
+      // Call conceptual POST /api/v1/projects/{project_id}/render
+      await renderProject(projectId, false);
+
+      if (pollInterval) clearInterval(pollInterval);
+      setRenderStage('Loading rendered video assets...');
+
       const updated = await fetchProject(projectId);
       setManifest(updated);
-      alert('Rendering complete!');
-      setPreviewMode('full');
+
+      const updatedScenes = await fetchScenes(projectId, selectedLocale);
+      setScenes(updatedScenes);
+
+      if (updated.status === 'completed' || updated.composition_status === 'completed') {
+        showToast('success', 'Rendering Complete', 'Video generated successfully. Preview ready.');
+        setPreviewMode('full');
+      } else if (updated.status === 'failed' || (updated.errors && updated.errors.length > 0)) {
+        const errMsg = updated.errors?.[updated.errors.length - 1] || 'Rendering failed';
+        setRenderError(errMsg);
+        showToast('error', 'Rendering Incomplete', errMsg);
+      } else {
+        showToast('info', 'Render Finished', `Status: ${updated.status}`);
+      }
     } catch (err: any) {
-      alert(`Rendering error: ${err.message || err}`);
+      if (pollInterval) clearInterval(pollInterval);
+      const msg = err?.message || String(err) || 'Rendering Failed';
+      setRenderError(msg);
+      showToast('error', 'Rendering Failed', msg);
     } finally {
+      if (pollInterval) clearInterval(pollInterval);
       setRendering(false);
+      setRenderStage('');
     }
   };
 
   const handleReplanStoryboard = async () => {
-    if (!confirm('Re-run AI Storyboard Planner? This will refresh scene layouts and visual prompts based on video style.')) return;
+    if (scenes.length > 0) {
+      if (!confirm('Re-planning will refresh scene layouts and visual prompts based on video style. Continue?')) return;
+    }
     try {
       setLoading(true);
       await planStoryboard(projectId);
       const scList = await fetchScenes(projectId, selectedLocale);
       setScenes(scList);
       if (scList.length > 0) setActiveScene({ ...scList[0] });
+      const updated = await fetchProject(projectId);
+      setManifest(updated);
+      showToast(
+        'success',
+        'Storyboard Ready',
+        scenes.length > 0 ? 'Storyboard replanned successfully.' : 'Initial storyboard generated successfully.'
+      );
     } catch (err: any) {
-      alert(`Replan failed: ${err.message || err}`);
+      showToast('error', 'Storyboard Generation Failed', err.message || String(err));
     } finally {
       setLoading(false);
     }
@@ -186,22 +277,38 @@ export default function SceneStudioPage() {
       const item = await uploadMedia(projectId, file);
       setMediaList((prev) => [...prev, item]);
       setActiveScene({ ...activeScene, media_asset_path: item.filename });
+      showToast('success', 'Media Uploaded', `Uploaded ${item.filename} successfully.`);
     } catch (err: any) {
-      alert(`Upload failed: ${err.message || err}`);
+      showToast('error', 'Upload Failed', err.message || String(err));
     }
   };
 
   // Video Preview calculation
   const totalDuration = scenes.reduce((sum, s) => sum + (s.estimated_duration_seconds || s.target_duration || 5), 0);
   const currentScene = scenes[selectedSceneIndex];
-  const renderedSceneUrl = currentScene
-    ? getStorageUrl(`storage/${projectId}/rendered/${selectedLocale}/${currentScene.scene_id}.mp4`)
-    : '';
-  const finalVideoUrl = manifest?.final_videos?.[selectedLocale]?.video_path
-    ? getStorageUrl(manifest.final_videos[selectedLocale].video_path)
-    : '';
 
-  const activeVideoUrl = previewMode === 'full' && finalVideoUrl ? finalVideoUrl : renderedSceneUrl;
+  // Only consider rendered scene URL if scene is marked completed and has valid asset
+  const isSceneRendered = Boolean(
+    currentScene?.has_rendered_asset ||
+    (currentScene?.render_status === 'completed' && currentScene?.rendered_video_url)
+  );
+
+  const renderedSceneUrl = isSceneRendered && currentScene?.rendered_video_url
+    ? getStorageUrl(currentScene.rendered_video_url)
+    : null;
+
+  const finalVideoAsset = manifest?.final_videos?.[selectedLocale];
+  const isFinalVideoRendered = Boolean(
+    (manifest?.composition_status === 'completed' || manifest?.status === 'completed') &&
+    finalVideoAsset?.status === 'completed' &&
+    finalVideoAsset?.video_path
+  );
+
+  const finalVideoUrl = isFinalVideoRendered && finalVideoAsset?.video_path
+    ? getStorageUrl(finalVideoAsset.video_path)
+    : null;
+
+  const activeVideoUrl = previewMode === 'full' ? finalVideoUrl : renderedSceneUrl;
 
   const togglePlay = () => {
     if (!videoRef.current) return;
@@ -268,20 +375,28 @@ export default function SceneStudioPage() {
 
           <button
             onClick={handleReplanStoryboard}
+            disabled={loading}
             className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold border border-slate-700 transition-colors"
           >
             <Wand2 className="w-3.5 h-3.5 text-cyan-400" />
-            <span>AI Storyboard</span>
+            <span>{scenes.length === 0 ? 'Generate AI Storyboard' : 'Re-plan Storyboard'}</span>
           </button>
 
-          <button
-            onClick={handleRunRender}
-            disabled={rendering}
-            className="flex items-center gap-2 px-4 py-2 rounded-lg bg-gradient-to-r from-cyan-500 to-sky-500 hover:from-cyan-400 hover:to-sky-400 text-slate-950 text-xs font-bold shadow-md shadow-cyan-500/20 transition-all disabled:opacity-50"
-          >
-            <Sparkles className="w-3.5 h-3.5" />
-            <span>{rendering ? 'Rendering...' : 'Render Video'}</span>
-          </button>
+          <div className="relative group">
+            <button
+              onClick={handleRunRender}
+              disabled={rendering || !manifest?.final_script || scenes.length === 0}
+              className="flex items-center gap-2 px-4 py-2 rounded-lg bg-gradient-to-r from-cyan-500 to-sky-500 hover:from-cyan-400 hover:to-sky-400 text-slate-950 text-xs font-bold shadow-md shadow-cyan-500/20 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              <Sparkles className="w-3.5 h-3.5" />
+              <span>{rendering ? 'Rendering...' : 'Render Video'}</span>
+            </button>
+            {(!manifest?.final_script || scenes.length === 0) && (
+              <div className="absolute right-0 top-full mt-1.5 hidden group-hover:block z-50 whitespace-nowrap px-2.5 py-1 text-[11px] bg-slate-950 text-amber-300 border border-amber-900/60 rounded-md shadow-lg pointer-events-none">
+                Generate the storyboard before rendering.
+              </div>
+            )}
+          </div>
 
           <Link
             href={`/studio/${projectId}/export`}
@@ -306,6 +421,18 @@ export default function SceneStudioPage() {
           </div>
 
           <div className="space-y-2 max-h-[600px] overflow-y-auto pr-1">
+            {scenes.length === 0 && (
+              <div className="py-8 text-center space-y-2.5">
+                <p className="text-xs text-slate-400">No scenes planned</p>
+                <button
+                  onClick={handleReplanStoryboard}
+                  disabled={loading}
+                  className="px-2.5 py-1 text-[11px] rounded bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold transition-all"
+                >
+                  Generate Storyboard
+                </button>
+              </div>
+            )}
             {scenes.map((sc, idx) => {
               const isSelected = idx === selectedSceneIndex;
               const isPresenter = sc.media_type === 'presenter' || sc.avatar_enabled;
@@ -343,8 +470,16 @@ export default function SceneStudioPage() {
                       >
                         {sc.media_type || 'presenter'}
                       </span>
-                      <span className="text-slate-400 font-mono">
-                        {(sc.estimated_duration_seconds || sc.target_duration || 5)}s
+                      <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded ${
+                        sc.render_status === 'completed' || sc.has_rendered_asset
+                          ? 'bg-emerald-950 text-emerald-400 border border-emerald-800/80 font-bold'
+                          : sc.render_status === 'rendering'
+                          ? 'bg-cyan-950 text-cyan-400 border border-cyan-800/80 animate-pulse'
+                          : 'bg-slate-800 text-slate-400'
+                      }`}>
+                        {sc.render_status === 'completed' || sc.has_rendered_asset
+                          ? 'Rendered'
+                          : `${(sc.estimated_duration_seconds || sc.target_duration || 5)}s`}
                       </span>
                     </div>
                   </div>
@@ -374,13 +509,30 @@ export default function SceneStudioPage() {
 
         {/* CENTER: 16:9 Video Preview (6 cols) */}
         <div className="lg:col-span-6 space-y-4">
+          {renderError && (
+            <div className="p-3.5 rounded-xl bg-rose-950/80 border border-rose-800 text-rose-200 text-xs flex items-center justify-between gap-3 shadow-lg">
+              <div className="flex items-center gap-2 min-w-0">
+                <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
+                <span className="font-mono truncate">{renderError}</span>
+              </div>
+              <button
+                onClick={() => setRenderError(null)}
+                className="px-2 py-0.5 rounded bg-rose-900/50 hover:bg-rose-900 text-[11px] text-rose-300 shrink-0"
+              >
+                Dismiss
+              </button>
+            </div>
+          )}
+
           <div className="rounded-2xl bg-slate-900 border border-slate-800 overflow-hidden shadow-xl">
             {/* 16:9 Video Container */}
             <div className="relative aspect-video w-full bg-black flex items-center justify-center overflow-hidden">
               {activeVideoUrl ? (
                 <video
                   ref={videoRef}
+                  key={activeVideoUrl}
                   src={activeVideoUrl}
+                  controls
                   className="w-full h-full object-contain"
                   onTimeUpdate={() => {
                     if (videoRef.current) {
@@ -390,31 +542,75 @@ export default function SceneStudioPage() {
                   }}
                   onEnded={() => setIsPlaying(false)}
                 />
-              ) : (
-                /* Composition Canvas Placeholder */
+              ) : rendering ? (
+                /* Active Rendering Progress Overlay */
+                <div className="w-full h-full bg-[#070b14] flex flex-col items-center justify-center p-8 text-center space-y-4 relative">
+                  <div className="w-16 h-16 rounded-2xl bg-cyan-950/60 border border-cyan-500/50 flex items-center justify-center text-cyan-400 relative">
+                    <Sparkles className="w-8 h-8 animate-pulse text-cyan-300" />
+                    <div className="absolute inset-0 rounded-2xl border border-cyan-400 animate-ping opacity-25" />
+                  </div>
+                  <div className="space-y-1.5 max-w-md">
+                    <h3 className="text-sm font-bold text-white tracking-wide uppercase">
+                      Rendering in Progress
+                    </h3>
+                    <p className="text-xs font-mono text-cyan-400 animate-pulse">
+                      {renderStage || 'Processing training video pipeline...'}
+                    </p>
+                    <p className="text-[11px] text-slate-400 mt-2">
+                      Executing approved storyboard: Edge-TTS narration, SadTalker presenter avatar, B-roll visuals, and final composition.
+                    </p>
+                  </div>
+                </div>
+              ) : previewMode === 'full' ? (
+                /* Full Video Placeholder */
                 <div className="w-full h-full bg-[#090D1A] flex flex-col items-center justify-center p-6 text-center space-y-3 relative">
-                  <div className="w-16 h-16 rounded-2xl bg-cyan-950/40 border border-cyan-800/60 flex items-center justify-center text-cyan-400">
-                    <User className="w-8 h-8" />
+                  <div className="w-16 h-16 rounded-2xl bg-slate-900 border border-slate-800 flex items-center justify-center text-slate-400">
+                    <Film className="w-8 h-8" />
                   </div>
                   <div>
+                    <h3 className="text-sm font-bold text-white">Full Video Not Rendered Yet</h3>
+                    <p className="text-xs text-slate-400 mt-1 max-w-sm">
+                      Locale: <span className="text-cyan-400 font-mono">{selectedLocale}</span> • {scenes.length} Scenes Approved
+                    </p>
+                  </div>
+                  <p className="text-xs text-slate-500 max-w-xs">
+                    Click <span className="text-cyan-400 font-semibold">&quot;Render Video&quot;</span> in the header to run TTS, generate avatars, and compose the full training video.
+                  </p>
+                </div>
+              ) : (
+                /* Scene Placeholder (NOT RENDERED YET) */
+                <div className="w-full h-full bg-[#090D1A] flex flex-col items-center justify-center p-6 text-center space-y-3 relative">
+                  <div className="w-16 h-16 rounded-2xl bg-cyan-950/40 border border-cyan-800/60 flex items-center justify-center text-cyan-400">
+                    {currentScene?.avatar_enabled ? <User className="w-8 h-8" /> : <Layers className="w-8 h-8" />}
+                  </div>
+                  <div>
+                    <div className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-slate-800 text-[11px] font-semibold text-slate-300 border border-slate-700 mb-1.5">
+                      <span>Scene not rendered yet</span>
+                    </div>
                     <h3 className="text-sm font-bold text-white">
-                      {currentScene?.title || 'Scene Ready for Composition'}
+                      Scene #{selectedSceneIndex + 1}: {currentScene?.title || 'Draft Scene'}
                     </h3>
                     <p className="text-xs text-slate-400 mt-1 max-w-sm">
                       Layout: <span className="text-cyan-400 font-mono">{currentScene?.layout_type || 'presenter_split'}</span> ({currentScene?.media_type || 'presenter'})
+                      {currentScene?.avatar_enabled ? ' • Presenter Avatar' : ' • B-roll / Motion Visual'}
                     </p>
                   </div>
 
-                  {/* Subtitle Safe Zone Mock */}
-                  <div className="absolute bottom-6 left-8 right-8 py-2 px-4 rounded bg-black/75 border border-slate-800 text-xs text-cyan-300 font-medium text-center">
-                    {currentScene?.narration || 'Subtitle preview safe zone (Arabic RTL / ASS enabled)'}
+                  {/* Subtitle / Narration Safe Zone Box */}
+                  <div className="w-full max-w-lg py-2 px-4 rounded-lg bg-black/80 border border-slate-800 text-xs text-cyan-300 font-medium text-center">
+                    <div className="text-[10px] uppercase font-bold text-slate-500 mb-0.5">Approved Narration Script</div>
+                    <div className="line-clamp-2" dir="auto">{currentScene?.narration || 'No narration script provided'}</div>
                   </div>
+
+                  <p className="text-[11px] text-slate-500">
+                    Click <span className="text-cyan-400 font-semibold">&quot;Render Video&quot;</span> to generate speech and render this scene clip.
+                  </p>
                 </div>
               )}
 
               {/* Mode Pill overlay */}
               <div className="absolute top-3 right-3 flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-black/70 backdrop-blur-md text-[11px] font-mono text-slate-300 border border-slate-800">
-                <span className="w-2 h-2 rounded-full bg-cyan-400 inline-block"></span>
+                <span className={`w-2 h-2 rounded-full inline-block ${activeVideoUrl ? 'bg-emerald-400' : 'bg-amber-400'}`}></span>
                 <span>{previewMode === 'full' ? 'Full Video' : `Scene #${selectedSceneIndex + 1}`}</span>
               </div>
             </div>
@@ -424,7 +620,8 @@ export default function SceneStudioPage() {
               <div className="flex items-center gap-3">
                 <button
                   onClick={togglePlay}
-                  className="p-2 rounded-lg bg-cyan-500 hover:bg-cyan-400 text-slate-950 transition-colors"
+                  disabled={!activeVideoUrl}
+                  className="p-2 rounded-lg bg-cyan-500 hover:bg-cyan-400 text-slate-950 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                 >
                   {isPlaying ? <Pause className="w-4 h-4 fill-current" /> : <Play className="w-4 h-4 fill-current ml-0.5" />}
                 </button>
@@ -448,10 +645,40 @@ export default function SceneStudioPage() {
                     previewMode === 'full' ? 'bg-slate-800 text-cyan-400' : 'text-slate-400 hover:text-white'
                   }`}
                 >
-                  Full Multilingual
+                  Full Video
                 </button>
               </div>
             </div>
+
+            {/* Final Video Metadata & Download Strip (Requirement 7) */}
+            {previewMode === 'full' && isFinalVideoRendered && finalVideoAsset && (
+              <div className="p-3 bg-slate-900/90 border-t border-slate-800 flex flex-wrap items-center justify-between gap-3 text-xs">
+                <div className="flex items-center gap-4">
+                  <div>
+                    <span className="text-slate-400">Duration: </span>
+                    <span className="font-mono font-bold text-white">{((finalVideoAsset.total_duration_seconds ?? finalVideoAsset.duration_seconds ?? 0)).toFixed(1)}s</span>
+                  </div>
+                  <div>
+                    <span className="text-slate-400">Resolution: </span>
+                    <span className="font-mono font-bold text-cyan-400">1920x1080 (16:9)</span>
+                  </div>
+                  <div>
+                    <span className="text-slate-400">Status: </span>
+                    <span className="px-2 py-0.5 rounded-full bg-emerald-950 text-emerald-400 font-bold border border-emerald-800">Completed</span>
+                  </div>
+                </div>
+                {finalVideoUrl && (
+                  <a
+                    href={finalVideoUrl}
+                    download={`training_${selectedLocale}.mp4`}
+                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold shadow-md transition-all"
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                    <span>Download MP4</span>
+                  </a>
+                )}
+              </div>
+            )}
           </div>
 
           {/* Interactive Timeline Strip */}
@@ -649,7 +876,59 @@ export default function SceneStudioPage() {
             </div>
           </div>
         )}
+
+        {!activeScene && scenes.length === 0 && (
+          <div className="lg:col-span-3 rounded-xl bg-slate-900 border border-dashed border-slate-800 p-6 text-center space-y-3 text-xs">
+            <Wand2 className="w-8 h-8 text-cyan-400/60 mx-auto" />
+            <div className="font-bold text-white">No Scenes Generated</div>
+            <p className="text-slate-400">
+              The canonical training script and visual storyboard have not been generated for this project yet.
+            </p>
+            <button
+              onClick={handleReplanStoryboard}
+              disabled={loading}
+              className="px-3.5 py-2 rounded-lg bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold transition-all shadow-md shadow-cyan-500/20"
+            >
+              Generate AI Storyboard
+            </button>
+          </div>
+        )}
       </div>
+
+      {/* Floating Toast Notification Panel */}
+      {toast && (
+        <div
+          className={`fixed bottom-6 right-6 z-50 max-w-md p-4 rounded-xl border shadow-2xl backdrop-blur-md transition-all animate-in fade-in slide-in-from-bottom-2 ${
+            toast.type === 'error'
+              ? 'bg-rose-950/95 border-rose-800 text-rose-200'
+              : toast.type === 'success'
+              ? 'bg-emerald-950/95 border-emerald-800 text-emerald-200'
+              : 'bg-slate-900/95 border-slate-700 text-slate-200'
+          }`}
+        >
+          <div className="flex items-start justify-between gap-3">
+            <div className="flex items-start gap-2.5">
+              {toast.type === 'error' ? (
+                <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+              ) : toast.type === 'success' ? (
+                <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
+              ) : (
+                <Wand2 className="w-4 h-4 text-cyan-400 shrink-0 mt-0.5" />
+              )}
+              <div className="space-y-1">
+                <p className="text-xs font-bold text-white">{toast.title}</p>
+                <p className="text-xs opacity-90 whitespace-pre-line">{toast.message}</p>
+              </div>
+            </div>
+            <button
+              onClick={() => setToast(null)}
+              className="text-slate-400 hover:text-white p-1 rounded-md transition-colors"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

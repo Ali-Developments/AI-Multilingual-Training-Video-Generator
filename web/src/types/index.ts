@@ -65,6 +65,9 @@ export interface SceneDraft {
   target_duration?: number;
   media_asset_path?: string;
   quiz_data?: QuizData;
+  render_status?: 'completed' | 'rendering' | 'failed' | 'unrendered' | 'pending' | null;
+  rendered_video_url?: string | null;
+  has_rendered_asset?: boolean;
 }
 
 export interface LocalizedScene extends SceneDraft {
@@ -234,7 +237,8 @@ export function serializeCreateProjectRequest(input: {
 export interface FinalVideoAsset {
   locale: string;
   video_path: string;
-  duration_seconds: number;
+  duration_seconds?: number;
+  total_duration_seconds?: number;
   status: string;
 }
 

@@ -62,6 +62,7 @@ storage/sadtalker_temp/
 *.swo
 .DS_Store
 Thumbs.db
+*.png
 
 # Isolated Avatar Runtimes & Weights
 tools/

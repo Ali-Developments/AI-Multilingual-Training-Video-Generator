@@ -34,6 +34,8 @@ class CompositionService:
     ) -> None:
         self.provider = provider or get_composition_provider()
         self.output_base_dir = output_base_dir or settings.STORAGE_PATH
+        from app.services.media.service import SceneMediaService
+        self.media_service = SceneMediaService()
 
     def compose_locale_scenes(
         self,
@@ -72,9 +74,6 @@ class CompositionService:
             for av in (avatar_track.scene_avatars if avatar_track else [])
             if av.status == "completed"
         }
-
-        from app.services.media.service import SceneMediaService
-        media_service = SceneMediaService()
 
         scene_results: List[SceneCompositionAsset] = []
         for scene in script.scenes:
@@ -147,7 +146,7 @@ class CompositionService:
             motion_path: Optional[Path] = None
             try:
                 media_out_dir = self.output_base_dir / project_id / "media" / locale
-                motion_path = media_service.generate_scene_media(
+                motion_path = self.media_service.generate_scene_media(
                     scene=scene,
                     locale=locale,
                     output_dir=media_out_dir,

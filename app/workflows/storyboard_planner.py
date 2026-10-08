@@ -129,12 +129,17 @@ class StoryboardPlanner:
                 scene.visual_prompt = f"Cinematic explainer visual highlighting {scene.title}"
 
             elif style == VideoStyle.DEMONSTRATION_TUTORIAL.value:
-                # Emphasize demonstration B-roll
-                if "recipe" in topic_clean.lower() or "prep" in text_lower or "cook" in text_lower or "action" in text_lower or "step" in text_lower:
+                # Emphasize cinematic step-by-step demonstration B-roll
+                demo_keywords = (
+                    "recipe", "prep", "cook", "action", "step", "chicken", "rice",
+                    "spice", "broth", "ingredient", "dish", "food", "demonstrat",
+                    "pot", "pan", "saute", "simmer", "tomato", "onion", "season"
+                )
+                if any(k in text_lower or k in topic_clean.lower() for k in demo_keywords):
                     scene.media_type = SceneMediaType.BROLL.value
                     scene.layout_type = SceneLayoutType.MEDIA_FULL.value
                     scene.avatar_enabled = False
-                    scene.visual_prompt = f"Step-by-step demonstration B-roll showing {scene.title}"
+                    scene.visual_prompt = f"Step-by-step demonstration B-roll showing {scene.title} for {topic_clean}"
                 else:
                     scene.media_type = SceneMediaType.PRESENTER.value
                     scene.layout_type = SceneLayoutType.PRESENTER_SPLIT.value

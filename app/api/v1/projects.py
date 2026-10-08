@@ -351,13 +351,61 @@ async def get_project_scenes(
             detail=f"Project '{project_id}' not found.",
         )
 
+    target_loc = locale or (
+        manifest.source_request.target_languages[0]
+        if manifest.source_request and manifest.source_request.target_languages
+        else (manifest.source_request.base_language if manifest.source_request else "en-US")
+    )
+
+    raw_scenes = []
     if locale and manifest.localization_bundle and locale in manifest.localization_bundle.localized_scripts:
-        return manifest.localization_bundle.localized_scripts[locale].scenes
+        raw_scenes = manifest.localization_bundle.localized_scripts[locale].scenes
+    elif manifest.final_script:
+        raw_scenes = manifest.final_script.scenes
 
-    if manifest.final_script:
-        return manifest.final_script.scenes
+    if not raw_scenes:
+        return []
 
-    return []
+    # Map composition assets for target_loc if available
+    scene_comp_map = {}
+    if manifest.final_videos and target_loc in manifest.final_videos:
+        fv = manifest.final_videos[target_loc]
+        for sc_asset in getattr(fv, "scene_videos", []):
+            scene_comp_map[sc_asset.scene_id] = sc_asset
+
+    rendered_dir = manifest_manager.get_project_dir(project_id) / "rendered" / target_loc
+
+    enriched_scenes = []
+    for sc in raw_scenes:
+        sc_copy = sc.model_copy()
+        comp_asset = scene_comp_map.get(sc.scene_id)
+        mp4_file = rendered_dir / f"{sc.scene_id}.mp4"
+
+        is_completed = (
+            (comp_asset and comp_asset.status == "completed" and Path(comp_asset.video_path).exists() and Path(comp_asset.video_path).stat().st_size > 0)
+            or (mp4_file.exists() and mp4_file.stat().st_size > 0)
+        )
+
+        if is_completed:
+            sc_copy.render_status = "completed"
+            sc_copy.has_rendered_asset = True
+            sc_copy.rendered_video_url = f"/storage/{project_id}/rendered/{target_loc}/{sc.scene_id}.mp4"
+        elif manifest.composition_status == "running":
+            sc_copy.render_status = "rendering"
+            sc_copy.has_rendered_asset = False
+            sc_copy.rendered_video_url = None
+        elif comp_asset and comp_asset.status == "failed":
+            sc_copy.render_status = "failed"
+            sc_copy.has_rendered_asset = False
+            sc_copy.rendered_video_url = None
+        else:
+            sc_copy.render_status = "unrendered"
+            sc_copy.has_rendered_asset = False
+            sc_copy.rendered_video_url = None
+
+        enriched_scenes.append(sc_copy)
+
+    return enriched_scenes
 
 
 @router.patch(
@@ -541,6 +589,88 @@ async def reorder_scenes(
 
 
 @router.post(
+    "/projects/{project_id}/generate-script",
+    response_model=ProjectManifest,
+    status_code=status.HTTP_200_OK,
+    summary="Generate Canonical Script",
+    description="Generate and validate the canonical script for the project without proceeding to media rendering stages.",
+)
+async def generate_script(
+    project_id: str,
+    force_regenerate: bool = Query(False, description="Force regeneration of script even if already completed"),
+) -> ProjectManifest:
+    manifest = manifest_manager.load_manifest(project_id)
+    if not manifest:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "code": "PROJECT_NOT_FOUND",
+                "message": f"Project '{project_id}' not found.",
+            },
+        )
+
+    manifest = orchestrator.generate_canonical_script(project_id, force_regenerate=force_regenerate)
+    if manifest.script_status == "failed" or not manifest.final_script:
+        err_msg = f"Failed to generate canonical script for project '{project_id}'."
+        if manifest.errors:
+            err_msg = str(manifest.errors[-1])
+        err_list = [e.model_dump() for e in manifest.error_details] if manifest.error_details else manifest.errors
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "SCRIPT_GENERATION_FAILED",
+                "message": err_msg,
+                "errors": err_list,
+            },
+        )
+    return manifest
+
+
+@router.post(
+    "/projects/{project_id}/prepare-studio",
+    response_model=ProjectManifest,
+    status_code=status.HTTP_200_OK,
+    summary="Prepare Studio Project",
+    description="Bootstrap the studio project by generating canonical script and planning initial storyboard.",
+)
+async def prepare_studio(
+    project_id: str,
+    video_style: Optional[VideoStyle] = Query(None, description="Optional style override"),
+    force_regenerate: bool = Query(False, description="Force regeneration of script and storyboard"),
+) -> ProjectManifest:
+    manifest = manifest_manager.load_manifest(project_id)
+    if not manifest:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "code": "PROJECT_NOT_FOUND",
+                "message": f"Project '{project_id}' not found.",
+            },
+        )
+
+    manifest = orchestrator.prepare_studio_project(
+        project_id,
+        video_style=video_style,
+        force_regenerate_script=force_regenerate,
+        force_regenerate_storyboard=force_regenerate,
+    )
+    if manifest.script_status == "failed" or not manifest.final_script:
+        err_msg = f"Failed to bootstrap script during studio preparation for project '{project_id}'."
+        if manifest.errors:
+            err_msg = str(manifest.errors[-1])
+        err_list = [e.model_dump() for e in manifest.error_details] if manifest.error_details else manifest.errors
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "FINAL_SCRIPT_MISSING",
+                "message": err_msg,
+                "errors": err_list,
+            },
+        )
+    return manifest
+
+
+@router.post(
     "/projects/{project_id}/plan-storyboard",
     response_model=ProjectManifest,
     status_code=status.HTTP_200_OK,
@@ -550,13 +680,43 @@ async def reorder_scenes(
 async def plan_storyboard(
     project_id: str,
     video_style: Optional[VideoStyle] = Query(None, description="Optional style override"),
+    auto_generate_script: bool = Query(True, description="Auto-generate canonical script if missing"),
 ) -> ProjectManifest:
     manifest = manifest_manager.load_manifest(project_id)
-    if not manifest or not manifest.final_script:
+    if not manifest:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Project '{project_id}' or final script not found.",
+            detail={
+                "code": "PROJECT_NOT_FOUND",
+                "message": f"Project '{project_id}' not found.",
+            },
         )
+
+    if not manifest.final_script:
+        if not auto_generate_script:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "code": "FINAL_SCRIPT_MISSING",
+                    "message": f"Project '{project_id}' does not have a canonical script. Generate script before planning storyboard.",
+                },
+            )
+
+        logger.info("[%s] final_script missing during plan_storyboard. Auto-generating canonical script first...", project_id)
+        manifest = orchestrator.generate_canonical_script(project_id)
+        if manifest.script_status == "failed" or not manifest.final_script:
+            err_msg = f"Failed to generate canonical script for project '{project_id}'."
+            if manifest.errors:
+                err_msg = str(manifest.errors[-1])
+            err_list = [e.model_dump() for e in manifest.error_details] if manifest.error_details else manifest.errors
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "code": "FINAL_SCRIPT_MISSING",
+                    "message": err_msg,
+                    "errors": err_list,
+                },
+            )
 
     if video_style:
         manifest.source_request.video_style = video_style
@@ -717,6 +877,40 @@ async def get_providers_status() -> Dict[str, Any]:
             "ready": True,
         },
     }
+
+
+@router.post(
+    "/projects/{project_id}/render",
+    response_model=ProjectManifest,
+    status_code=status.HTTP_200_OK,
+    summary="Render Project Video",
+    description="Execute the complete rendering pipeline (TTS, avatars, visuals, subtitles, composition) for an approved storyboard.",
+)
+async def render_project(
+    project_id: str,
+    payload: Optional[RunProjectRequest] = None,
+) -> ProjectManifest:
+    manifest = manifest_manager.load_manifest(project_id)
+    if not manifest:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Project '{project_id}' not found.",
+        )
+
+    force_regen = payload.force_regenerate if payload else False
+    try:
+        updated = orchestrator.run_project(
+            project_id=project_id,
+            request=manifest.source_request,
+            force_regenerate=force_regen,
+        )
+        return updated
+    except Exception as e:
+        logger.error("Error rendering project '%s': %s", project_id, e)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Project rendering error: {str(e)}",
+        )
 
 
 @router.post(

@@ -42,6 +42,15 @@ export function formatApiError(errData: any, fallback = 'Operation failed'): str
     }
   }
 
+  if (errData.detail && typeof errData.detail === 'object' && !Array.isArray(errData.detail)) {
+    if (typeof errData.detail.message === 'string' && errData.detail.message.trim()) {
+      return errData.detail.message;
+    }
+    if (typeof errData.detail.msg === 'string' && errData.detail.msg.trim()) {
+      return errData.detail.msg;
+    }
+  }
+
   if (typeof errData.message === 'string' && errData.message.trim()) {
     return errData.message;
   }
@@ -205,6 +214,37 @@ export async function reorderScenes(
   return res.json();
 }
 
+export async function generateScript(
+  projectId: string,
+  forceRegenerate: boolean = false
+): Promise<ProjectManifest> {
+  const url = `${API_BASE}/projects/${projectId}/generate-script?force_regenerate=${forceRegenerate}`;
+  const res = await fetch(url, { method: 'POST' });
+  if (!res.ok) {
+    const errData = await res.json().catch(() => null);
+    throw new Error(formatApiError(errData, 'Failed to generate script'));
+  }
+  return res.json();
+}
+
+export async function prepareStudio(
+  projectId: string,
+  videoStyle?: VideoStyle,
+  forceRegenerate: boolean = false
+): Promise<ProjectManifest> {
+  const params = new URLSearchParams();
+  if (videoStyle) params.append('video_style', videoStyle);
+  if (forceRegenerate) params.append('force_regenerate', 'true');
+  const query = params.toString();
+  const url = query ? `${API_BASE}/projects/${projectId}/prepare-studio?${query}` : `${API_BASE}/projects/${projectId}/prepare-studio`;
+  const res = await fetch(url, { method: 'POST' });
+  if (!res.ok) {
+    const errData = await res.json().catch(() => null);
+    throw new Error(formatApiError(errData, 'Failed to prepare studio project'));
+  }
+  return res.json();
+}
+
 export async function planStoryboard(
   projectId: string,
   videoStyle?: VideoStyle
@@ -232,6 +272,22 @@ export async function runPipeline(
   if (!res.ok) {
     const errData = await res.json().catch(() => null);
     throw new Error(formatApiError(errData, 'Pipeline execution failed'));
+  }
+  return res.json();
+}
+
+export async function renderProject(
+  projectId: string,
+  forceRegenerate: boolean = false
+): Promise<ProjectManifest> {
+  const res = await fetch(`${API_BASE}/projects/${projectId}/render`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ force_regenerate: forceRegenerate }),
+  });
+  if (!res.ok) {
+    const errData = await res.json().catch(() => null);
+    throw new Error(formatApiError(errData, 'Rendering execution failed'));
   }
   return res.json();
 }
@@ -281,6 +337,18 @@ export function getStorageUrl(filePath?: string | null): string {
   if (!filePath) return '';
   if (filePath.startsWith('http://') || filePath.startsWith('https://')) return filePath;
   const normalized = filePath.replace(/\\/g, '/');
+
+  // Strip storage/projects/ prefix because FastAPI mounts storage/projects directly at /storage
+  if (normalized.includes('/storage/projects/')) {
+    return '/storage/' + normalized.split('/storage/projects/')[1];
+  }
+  if (normalized.startsWith('storage/projects/')) {
+    return '/storage/' + normalized.substring('storage/projects/'.length);
+  }
+  if (normalized.startsWith('/storage/projects/')) {
+    return '/storage/' + normalized.substring('/storage/projects/'.length);
+  }
+
   const storageIndex = normalized.indexOf('/storage/');
   if (storageIndex !== -1) {
     return normalized.substring(storageIndex);

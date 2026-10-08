@@ -7,6 +7,7 @@ from app.models.schemas import (
     TrainingVideoRequest,
     ProjectManifest,
     FinalScript,
+    VideoStyle,
 )
 from app.services.llm.base import LLMProvider
 from app.services.localization.service import LocalizationService
@@ -56,6 +57,150 @@ class ProjectOrchestrator:
         self.subtitle_service = subtitle_service or SubtitleService()
         self.composition_service = composition_service or CompositionService()
         self.duration_service = duration_service or DurationReconciliationService(llm_provider=self.llm_provider)
+
+    def generate_canonical_script(
+        self,
+        project_id: str,
+        force_regenerate: bool = False,
+    ) -> ProjectManifest:
+        """
+        Execute canonical script workflow for a project without proceeding to media stages.
+        Validates, finalizes, and persists final_script and scripts/source.json.
+        Does NOT execute TTS, avatar generation, visual generation, or final composition.
+        """
+        manifest = self.manifest_manager.load_manifest(project_id)
+        if not manifest:
+            raise ValueError(f"Project '{project_id}' does not exist.")
+
+        if not force_regenerate and manifest.script_status == "completed" and manifest.final_script:
+            logger.info("[%s] Reusing existing finalized canonical script", project_id)
+            return manifest
+
+        logger.info("[%s] Executing canonical script workflow", project_id)
+        manifest.script_status = "running"
+        self.manifest_manager.save_manifest(manifest)
+
+        workflow = create_script_workflow(llm_provider=self.llm_provider)
+        state = workflow.invoke({"request": manifest.source_request})
+        final_script = state.get("final_script")
+
+        if not final_script and state.get("workflow_status") == "completed" and state.get("draft_script"):
+            draft = state.get("draft_script")
+            if draft and getattr(draft, "scenes", None):
+                logger.warning(
+                    "[%s] Adopting draft script with %d scenes despite validation review flag: %s",
+                    project_id,
+                    len(draft.scenes),
+                    state.get("errors", []),
+                )
+                final_script = FinalScript(
+                    title=draft.title,
+                    language=draft.language,
+                    audience=draft.audience,
+                    target_duration_seconds=manifest.source_request.target_duration_seconds,
+                    total_estimated_duration_seconds=draft.total_estimated_duration_seconds,
+                    opening_hook=draft.opening_hook,
+                    closing_summary=draft.closing_summary,
+                    learning_objectives=draft.learning_objectives or [],
+                    scenes=draft.scenes,
+                    metadata={"adopted_from_draft": True},
+                )
+
+        if not final_script:
+            workflow_status = state.get("workflow_status", "failed")
+            errors_list = state.get("errors", [])
+            validation = state.get("validation")
+
+            err_details = []
+            if errors_list:
+                err_details.extend(errors_list)
+            elif validation and validation.issues:
+                err_details.extend([f"[{i.code}] {i.message}" for i in validation.issues])
+            elif state.get("error_message"):
+                err_details.append(state.get("error_message"))
+            else:
+                err_details.append("No final script produced")
+
+            err_msg = f"Script generation failed ({workflow_status}): {'; '.join(err_details)}"
+            logger.error("[%s] %s", project_id, err_msg)
+            manifest.script_status = "failed"
+            manifest.status = "failed"
+            manifest.record_error(stage="script", message=err_msg, code=f"SCRIPT_{workflow_status.upper()}")
+            self.manifest_manager.save_manifest(manifest)
+            return manifest
+
+        manifest.clear_stage_errors("script")
+        manifest.final_script = final_script
+        manifest.script_status = "completed"
+
+        # Persist canonical script to scripts/ directory
+        project_dir = self.manifest_manager.get_project_dir(project_id)
+        scripts_dir = project_dir / "scripts"
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        (scripts_dir / "source.json").write_text(manifest.final_script.model_dump_json(indent=2), encoding="utf-8")
+
+        self.manifest_manager.save_manifest(manifest)
+        return manifest
+
+    def prepare_studio_project(
+        self,
+        project_id: str,
+        video_style: Optional[VideoStyle] = None,
+        force_regenerate_script: bool = False,
+        force_regenerate_storyboard: bool = False,
+    ) -> ProjectManifest:
+        """
+        Lightweight Studio bootstrap operation:
+        1. Load manifest.
+        2. If final_script missing (or force_regenerate_script): generate canonical script.
+        3. Persist final_script.
+        4. If storyboard missing (or force_regenerate_storyboard/style override): run StoryboardPlanner.
+        5. Persist scene plans.
+        6. Return project manifest with populated scenes.
+
+        Strictly does NOT invoke TTS, duration reconciliation, avatar generation, or final FFmpeg render.
+        """
+        manifest = self.manifest_manager.load_manifest(project_id)
+        if not manifest:
+            raise ValueError(f"Project '{project_id}' does not exist.")
+
+        if video_style:
+            manifest.source_request.video_style = video_style
+
+        # Ensure canonical script exists
+        if not manifest.final_script or force_regenerate_script or manifest.script_status != "completed":
+            manifest = self.generate_canonical_script(project_id, force_regenerate=force_regenerate_script)
+            if manifest.script_status == "failed" or not manifest.final_script:
+                return manifest
+
+        # Plan / Re-plan storyboard
+        StoryboardPlanner.plan_storyboard(manifest.final_script, manifest.source_request)
+
+        # Propagate to localized scripts if any exist
+        if manifest.localization_bundle and manifest.localization_bundle.localized_scripts:
+            src_map = {s.scene_id: s for s in manifest.final_script.scenes}
+            for loc_sc in manifest.localization_bundle.localized_scripts.values():
+                for lscene in loc_sc.scenes:
+                    src_s = src_map.get(lscene.scene_id)
+                    if src_s:
+                        lscene.media_type = src_s.media_type
+                        lscene.layout_type = src_s.layout_type
+                        lscene.avatar_enabled = src_s.avatar_enabled
+                        lscene.presenter_position = src_s.presenter_position
+                        lscene.transition = src_s.transition
+                        lscene.media_asset_path = src_s.media_asset_path
+                        lscene.quiz_data = src_s.quiz_data
+
+        manifest.composition_status = "pending"
+        manifest.final_videos.clear()
+        self.manifest_manager.save_manifest(manifest)
+        logger.info(
+            "[%s] Studio project prepared successfully with %d scenes (video_style=%s)",
+            project_id,
+            len(manifest.final_script.scenes),
+            manifest.source_request.video_style,
+        )
+        return manifest
 
     def run_project(
         self,
@@ -119,69 +264,21 @@ class ProjectOrchestrator:
             if not force_regenerate and manifest.script_status == "completed" and manifest.final_script:
                 logger.info("[%s] Reusing existing finalized canonical script", project_id)
             else:
-                logger.info("[%s] Executing canonical script workflow", project_id)
-                manifest.script_status = "running"
-                self.manifest_manager.save_manifest(manifest)
-
-                workflow = create_script_workflow(llm_provider=self.llm_provider)
-                state = workflow.invoke({"request": manifest.source_request})
-                final_script = state.get("final_script")
-
-                if not final_script and state.get("workflow_status") == "completed" and state.get("draft_script"):
-                    draft = state.get("draft_script")
-                    if draft and getattr(draft, "scenes", None):
-                        logger.warning(
-                            "[%s] Adopting draft script with %d scenes despite validation review flag: %s",
-                            project_id,
-                            len(draft.scenes),
-                            state.get("errors", []),
-                        )
-                        final_script = FinalScript(
-                            title=draft.title,
-                            language=draft.language,
-                            audience=draft.audience,
-                            target_duration_seconds=manifest.source_request.target_duration_seconds,
-                            total_estimated_duration_seconds=draft.total_estimated_duration_seconds,
-                            opening_hook=draft.opening_hook,
-                            closing_summary=draft.closing_summary,
-                            learning_objectives=draft.learning_objectives or [],
-                            scenes=draft.scenes,
-                            metadata={"adopted_from_draft": True},
-                        )
-
-                if not final_script:
-                    workflow_status = state.get("workflow_status", "failed")
-                    errors_list = state.get("errors", [])
-                    validation = state.get("validation")
-
-                    err_details = []
-                    if errors_list:
-                        err_details.extend(errors_list)
-                    elif validation and validation.issues:
-                        err_details.extend([f"[{i.code}] {i.message}" for i in validation.issues])
-                    elif state.get("error_message"):
-                        err_details.append(state.get("error_message"))
-                    else:
-                        err_details.append("No final script produced")
-
-                    err_msg = f"Script generation failed ({workflow_status}): {'; '.join(err_details)}"
-                    logger.error("[%s] %s", project_id, err_msg)
-                    manifest.script_status = "failed"
-                    manifest.status = "failed"
-                    manifest.record_error(stage="script", message=err_msg, code=f"SCRIPT_{workflow_status.upper()}")
-                    self.manifest_manager.save_manifest(manifest)
+                manifest = self.generate_canonical_script(project_id, force_regenerate=force_regenerate)
+                if manifest.script_status == "failed" or not manifest.final_script:
                     return manifest
 
-                manifest.clear_stage_errors("script")
-                manifest.final_script = final_script
-                # Apply professional V2 Storyboard Planner
-                StoryboardPlanner.plan_storyboard(manifest.final_script, manifest.source_request)
-                manifest.script_status = "completed"
-                self.manifest_manager.save_manifest(manifest)
-
-            # Ensure V2 fields are planned even if loaded from older manifest
+            # Ensure V2 fields are planned if not already present or explicitly requested
             if manifest.final_script:
-                StoryboardPlanner.plan_storyboard(manifest.final_script, manifest.source_request)
+                has_existing_storyboard = all(
+                    getattr(s, "layout_type", None) and getattr(s, "media_type", None)
+                    for s in manifest.final_script.scenes
+                )
+                if force_regenerate or not has_existing_storyboard:
+                    logger.info("[%s] Planning storyboard layouts and presentation types", project_id)
+                    StoryboardPlanner.plan_storyboard(manifest.final_script, manifest.source_request)
+                else:
+                    logger.info("[%s] Reusing approved existing storyboard with %d scenes", project_id, len(manifest.final_script.scenes))
 
             # Persist canonical script to scripts/ directory
             project_dir = self.manifest_manager.get_project_dir(project_id)

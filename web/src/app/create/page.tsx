@@ -17,7 +17,7 @@ import {
   BookOpen,
   AlertCircle,
 } from 'lucide-react';
-import { createProject, runPipeline } from '@/lib/api';
+import { createProject, runPipeline, generateScript, planStoryboard } from '@/lib/api';
 import { VideoStyle, serializeCreateProjectRequest } from '@/types';
 
 export default function CreateVideoWizard() {
@@ -124,6 +124,13 @@ export default function CreateVideoWizard() {
         runPipeline(projectId, false).catch((e) => console.error(e));
         router.push(`/studio/${projectId}/export`);
       } else {
+        setStatusMessage('Generating training script...');
+        await generateScript(projectId);
+
+        setStatusMessage('Planning storyboard layouts & scenes...');
+        await planStoryboard(projectId);
+
+        setStatusMessage('Opening Studio...');
         router.push(`/studio/${projectId}`);
       }
     } catch (err: any) {

@@ -175,6 +175,9 @@ class SceneDraft(BaseModel):
     transition: str = Field(default="fade", description="Scene transition: fade, cut, slide, crossfade")
     media_asset_path: Optional[str] = Field(default=None, description="Custom assigned media video or image path")
     quiz_data: Optional[QuizData] = Field(default=None, description="Structured quiz question and options if quiz scene")
+    render_status: Optional[str] = Field(default=None, description="Render status for scene: completed, rendering, failed, or unrendered")
+    rendered_video_url: Optional[str] = Field(default=None, description="Static storage URL to rendered scene MP4 if completed")
+    has_rendered_asset: bool = Field(default=False, description="True if rendered video asset exists on disk and is completed")
 
     # Backwards-compatibility fields
     scene_number: Optional[int] = Field(default=None, description="Legacy alias for order")
@@ -348,6 +351,9 @@ class LocalizedScene(BaseModel):
     transition: str = Field(default="fade", description="Scene transition: fade, cut, slide, crossfade")
     media_asset_path: Optional[str] = Field(default=None, description="Custom assigned media path")
     quiz_data: Optional[QuizData] = Field(default=None, description="Localized quiz question and options")
+    render_status: Optional[str] = Field(default=None, description="Render status for scene: completed, rendering, failed, or unrendered")
+    rendered_video_url: Optional[str] = Field(default=None, description="Static storage URL to rendered scene MP4 if completed")
+    has_rendered_asset: bool = Field(default=False, description="True if rendered video asset exists on disk and is completed")
 
     @model_validator(mode="after")
     def sync_localized_scene_fields(self) -> "LocalizedScene":
@@ -376,8 +382,9 @@ class LocalizedScene(BaseModel):
             self.layout_type = "quiz_card"
             self.avatar_enabled = False
         elif stype in ("presenter", "recap", "summary"):
-            self.avatar_enabled = True
-            self.media_type = "presenter"
+            if self.media_type == "presenter":
+                self.avatar_enabled = True
+                self.media_type = "presenter"
 
         return self
 
