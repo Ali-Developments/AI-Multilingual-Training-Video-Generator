@@ -54,7 +54,8 @@ def allocate_scene_duration_budgets(
         # Combine instructional weight with current duration footprint
         weighted_scores[s.scene_id] = w * max(curr_dur, 1.0)
 
-    total_weighted = sum(weighted_scores.values()) or 1.0
+    total_weighted = sum(weighted_scores.values())
+    total_weighted = total_weighted if total_weighted > 0 else 1.0
 
     budgets: List[SceneDurationBudget] = []
     accumulated = 0.0
@@ -66,7 +67,7 @@ def allocate_scene_duration_budgets(
             # Allocate remainder to last scene to guarantee exact mathematical sum
             budget = max(1.5, round(target_total_seconds - accumulated, 2))
         else:
-            proportion = weighted_scores[s.scene_id] / total_weighted
+            proportion = (weighted_scores[s.scene_id] / total_weighted) if total_weighted > 0 else (1.0 / max(len(scenes), 1))
             budget = max(2.0, round(target_total_seconds * proportion, 2))
             accumulated += budget
 
@@ -97,7 +98,8 @@ def build_duration_condensation_prompt(
     for s in current_script.scenes:
         b = budget_map.get(s.scene_id)
         current_dur = b.measured_duration_seconds if b else s.estimated_duration_seconds
-        budget_dur = b.allocated_budget_seconds if b else (target_duration_seconds / len(current_script.scenes))
+        scene_count = max(len(current_script.scenes), 1)
+        budget_dur = b.allocated_budget_seconds if b else (target_duration_seconds / scene_count)
         word_count = len(s.narration.split()) if s.narration else 0
         target_words = max(4, int(word_count * compression_ratio))
 
@@ -201,7 +203,29 @@ class DurationReconciliationService:
             tol_sec,
         )
 
-        # Baseline check: already within tolerance?
+        # Baseline check 1: Zero or invalid duration cannot be reconciled
+        if measured_total <= 0.0 or target_duration_seconds <= 0.0:
+            logger.warning(
+                "Post-TTS duration reconciliation skipped for locale '%s': measured audio duration (%.2fs) or target duration (%.1fs) is non-positive.",
+                current_script.locale,
+                measured_total,
+                target_duration_seconds,
+            )
+            result = DurationReconciliationResult(
+                locale=current_script.locale,
+                target_duration_seconds=target_duration_seconds,
+                tolerance_seconds=tol_sec,
+                initial_duration_seconds=measured_total,
+                final_duration_seconds=measured_total,
+                revisions_attempted=0,
+                max_revisions=max_rev,
+                is_approved=False,
+                status="needs_review",
+                message=f"Audio synthesis failed or has zero duration (measured={measured_total:.2f}s, target={target_duration_seconds:.1f}s) for locale '{current_script.locale}'. Cannot reconcile duration.",
+            )
+            return current_script, measured_audio_track, result
+
+        # Baseline check 2: already within tolerance?
         if diff <= tol_sec:
             result = DurationReconciliationResult(
                 locale=current_script.locale,
@@ -241,8 +265,18 @@ class DurationReconciliationService:
 
         while revision_count < max_rev:
             revision_count += 1
+            if current_measured <= 0.0 or target_duration_seconds <= 0.0:
+                logger.warning(
+                    "Post-TTS duration revision %d aborted for '%s': non-positive duration (measured=%.2fs, target=%.1fs)",
+                    revision_count,
+                    working_script.locale,
+                    current_measured,
+                    target_duration_seconds,
+                )
+                break
+
             current_diff = abs(current_measured - target_duration_seconds)
-            compression_ratio = max(0.5, min(1.0, target_duration_seconds / current_measured))
+            compression_ratio = max(0.5, min(1.0, (target_duration_seconds / current_measured) if current_measured > 0 else 1.0))
 
             logger.warning(
                 "Post-TTS duration revision %d/%d for '%s': measured=%.2fs vs target=%.1fs (compression_ratio=%.3f)",

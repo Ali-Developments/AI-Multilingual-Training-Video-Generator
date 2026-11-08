@@ -131,6 +131,10 @@ class AvatarService:
                     destination_path=dest_file,
                     avatar_id=avatar_id,
                     force_regenerate=force_regenerate,
+                    script_text=scene.narration,
+                    voice_id=getattr(scene, "voice_id", None),
+                    mode=getattr(settings, "HEYGEN_MODE", "audio"),
+                    project_id=project_id,
                 )
                 if dest_file.exists() and dest_file.stat().st_size > 0:
                     save_asset_metadata(

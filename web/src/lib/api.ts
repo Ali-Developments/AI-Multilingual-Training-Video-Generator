@@ -9,7 +9,10 @@ import {
   VideoStyle,
 } from '@/types';
 
-const API_BASE = '/api/v1';
+const API_BASE =
+  typeof process !== 'undefined' && process.env?.NEXT_PUBLIC_API_URL
+    ? `${process.env.NEXT_PUBLIC_API_URL.replace(/\/$/, '')}/api/v1`
+    : '/api/v1';
 
 /**
  * Formats API errors (including FastAPI 422 validation detail arrays) into human-readable messages.
@@ -66,11 +69,41 @@ export function formatApiError(errData: any, fallback = 'Operation failed'): str
   }
 }
 
+/**
+ * Safely extracts error details from an HTTP response, supporting both JSON error envelopes
+ * and non-JSON plaintext / HTML proxy or server error messages.
+ */
+export async function parseResponseError(res: Response, fallback = 'Operation failed'): Promise<string> {
+  let errData: any = null;
+  try {
+    const text = await res.text();
+    if (text && text.trim().length > 0) {
+      try {
+        errData = JSON.parse(text);
+      } catch {
+        errData = text.trim();
+      }
+    }
+  } catch {
+    errData = null;
+  }
+
+  const formatted = formatApiError(errData, fallback);
+  const statusPrefix = `HTTP ${res.status}${res.statusText ? ` (${res.statusText})` : ''}`;
+
+  if (formatted && formatted !== fallback) {
+    if (formatted.includes(`HTTP ${res.status}`)) {
+      return formatted;
+    }
+    return `${statusPrefix}: ${formatted}`;
+  }
+  return `${statusPrefix}: ${fallback}`;
+}
+
 export async function fetchProjects(): Promise<ProjectManifest[]> {
   const res = await fetch(`${API_BASE}/projects`);
   if (!res.ok) {
-    const errData = await res.json().catch(() => null);
-    throw new Error(formatApiError(errData, 'Failed to fetch projects'));
+    throw new Error(await parseResponseError(res, 'Failed to fetch projects'));
   }
   return res.json();
 }
@@ -78,8 +111,7 @@ export async function fetchProjects(): Promise<ProjectManifest[]> {
 export async function fetchProjectSummaries(): Promise<ProjectSummary[]> {
   const res = await fetch(`${API_BASE}/projects/summaries`);
   if (!res.ok) {
-    const errData = await res.json().catch(() => null);
-    throw new Error(formatApiError(errData, 'Failed to fetch project summaries'));
+    throw new Error(await parseResponseError(res, 'Failed to fetch project summaries'));
   }
   return res.json();
 }
@@ -87,8 +119,7 @@ export async function fetchProjectSummaries(): Promise<ProjectSummary[]> {
 export async function fetchProject(projectId: string): Promise<ProjectManifest> {
   const res = await fetch(`${API_BASE}/projects/${projectId}`);
   if (!res.ok) {
-    const errData = await res.json().catch(() => null);
-    throw new Error(formatApiError(errData, `Project ${projectId} not found`));
+    throw new Error(await parseResponseError(res, `Project ${projectId} not found`));
   }
   return res.json();
 }
@@ -117,9 +148,7 @@ export async function createProject(
   });
 
   if (!res.ok) {
-    const errData = await res.json().catch(() => null);
-    const msg = formatApiError(errData, `Project creation failed (HTTP ${res.status})`);
-    throw new Error(msg);
+    throw new Error(await parseResponseError(res, `Project creation failed`));
   }
 
   return res.json();
@@ -135,8 +164,7 @@ export async function updateProject(
     body: JSON.stringify(payload),
   });
   if (!res.ok) {
-    const errData = await res.json().catch(() => null);
-    throw new Error(formatApiError(errData, 'Failed to update project'));
+    throw new Error(await parseResponseError(res, 'Failed to update project'));
   }
   return res.json();
 }
@@ -146,8 +174,7 @@ export async function deleteProject(projectId: string): Promise<void> {
     method: 'DELETE',
   });
   if (!res.ok) {
-    const errData = await res.json().catch(() => null);
-    throw new Error(formatApiError(errData, 'Failed to delete project'));
+    throw new Error(await parseResponseError(res, 'Failed to delete project'));
   }
 }
 
@@ -156,8 +183,7 @@ export async function duplicateProject(projectId: string): Promise<ProjectManife
     method: 'POST',
   });
   if (!res.ok) {
-    const errData = await res.json().catch(() => null);
-    throw new Error(formatApiError(errData, 'Failed to duplicate project'));
+    throw new Error(await parseResponseError(res, 'Failed to duplicate project'));
   }
   return res.json();
 }
@@ -171,8 +197,7 @@ export async function fetchScenes(
     : `${API_BASE}/projects/${projectId}/scenes`;
   const res = await fetch(url);
   if (!res.ok) {
-    const errData = await res.json().catch(() => null);
-    throw new Error(formatApiError(errData, 'Failed to fetch scenes'));
+    throw new Error(await parseResponseError(res, 'Failed to fetch scenes'));
   }
   return res.json();
 }
@@ -192,8 +217,7 @@ export async function updateScene(
     body: JSON.stringify(payload),
   });
   if (!res.ok) {
-    const errData = await res.json().catch(() => null);
-    throw new Error(formatApiError(errData, 'Failed to update scene'));
+    throw new Error(await parseResponseError(res, 'Failed to update scene'));
   }
   return res.json();
 }
@@ -208,8 +232,7 @@ export async function reorderScenes(
     body: JSON.stringify({ scene_ids: sceneIds, scene_order: sceneIds }),
   });
   if (!res.ok) {
-    const errData = await res.json().catch(() => null);
-    throw new Error(formatApiError(errData, 'Failed to reorder scenes'));
+    throw new Error(await parseResponseError(res, 'Failed to reorder scenes'));
   }
   return res.json();
 }
@@ -221,8 +244,7 @@ export async function generateScript(
   const url = `${API_BASE}/projects/${projectId}/generate-script?force_regenerate=${forceRegenerate}`;
   const res = await fetch(url, { method: 'POST' });
   if (!res.ok) {
-    const errData = await res.json().catch(() => null);
-    throw new Error(formatApiError(errData, 'Failed to generate script'));
+    throw new Error(await parseResponseError(res, 'Failed to generate script'));
   }
   return res.json();
 }
@@ -239,8 +261,7 @@ export async function prepareStudio(
   const url = query ? `${API_BASE}/projects/${projectId}/prepare-studio?${query}` : `${API_BASE}/projects/${projectId}/prepare-studio`;
   const res = await fetch(url, { method: 'POST' });
   if (!res.ok) {
-    const errData = await res.json().catch(() => null);
-    throw new Error(formatApiError(errData, 'Failed to prepare studio project'));
+    throw new Error(await parseResponseError(res, 'Failed to prepare studio project'));
   }
   return res.json();
 }
@@ -254,8 +275,7 @@ export async function planStoryboard(
     : `${API_BASE}/projects/${projectId}/plan-storyboard`;
   const res = await fetch(url, { method: 'POST' });
   if (!res.ok) {
-    const errData = await res.json().catch(() => null);
-    throw new Error(formatApiError(errData, 'Failed to plan storyboard'));
+    throw new Error(await parseResponseError(res, 'Failed to plan storyboard'));
   }
   return res.json();
 }
@@ -270,8 +290,7 @@ export async function runPipeline(
     body: JSON.stringify({ force_regenerate: forceRegenerate }),
   });
   if (!res.ok) {
-    const errData = await res.json().catch(() => null);
-    throw new Error(formatApiError(errData, 'Pipeline execution failed'));
+    throw new Error(await parseResponseError(res, 'Pipeline execution failed'));
   }
   return res.json();
 }
@@ -286,8 +305,7 @@ export async function renderProject(
     body: JSON.stringify({ force_regenerate: forceRegenerate }),
   });
   if (!res.ok) {
-    const errData = await res.json().catch(() => null);
-    throw new Error(formatApiError(errData, 'Rendering execution failed'));
+    throw new Error(await parseResponseError(res, 'Rendering execution failed'));
   }
   return res.json();
 }
@@ -303,8 +321,7 @@ export async function uploadMedia(
     body: formData,
   });
   if (!res.ok) {
-    const errData = await res.json().catch(() => null);
-    throw new Error(formatApiError(errData, 'Failed to upload media file'));
+    throw new Error(await parseResponseError(res, 'Failed to upload media file'));
   }
   return res.json();
 }
@@ -314,8 +331,7 @@ export async function fetchProjectMedia(
 ): Promise<UploadedMediaItem[]> {
   const res = await fetch(`${API_BASE}/projects/${projectId}/media`);
   if (!res.ok) {
-    const errData = await res.json().catch(() => null);
-    throw new Error(formatApiError(errData, 'Failed to fetch project media'));
+    throw new Error(await parseResponseError(res, 'Failed to fetch project media'));
   }
   return res.json();
 }
@@ -323,8 +339,7 @@ export async function fetchProjectMedia(
 export async function fetchProvidersStatus(): Promise<ProviderStatus> {
   const res = await fetch(`${API_BASE}/providers/status`);
   if (!res.ok) {
-    const errData = await res.json().catch(() => null);
-    throw new Error(formatApiError(errData, 'Failed to fetch provider readiness'));
+    throw new Error(await parseResponseError(res, 'Failed to fetch provider readiness'));
   }
   return res.json();
 }

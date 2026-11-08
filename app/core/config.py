@@ -51,14 +51,50 @@ class Settings(BaseSettings):
     AZURE_SPEECH_KEY: Optional[str] = Field(default=None, description="Azure Speech API Key")
     AZURE_SPEECH_REGION: str = Field(default="eastus", description="Azure Speech Region")
 
-    # Avatar Settings (HeyGen)
-    DEFAULT_AVATAR_PROVIDER: str = Field(default="mock", description="Default avatar provider: heygen, mock")
+    # Avatar Settings (HeyGen & Local Alternatives)
+    DEFAULT_AVATAR_PROVIDER: str = Field(default="heygen", description="Default avatar provider: heygen, mock, sadtalker")
     HEYGEN_API_KEY: Optional[str] = Field(default=None, description="HeyGen API Key")
     HEYGEN_DEFAULT_AVATAR_ID: str = Field(default="469ba809c9f6441ba74a580058d41c4b", description="Default HeyGen avatar ID (Brody - Office)")
-    HEYGEN_POLL_INTERVAL_SECONDS: float = Field(default=2.0, description="Polling interval in seconds for HeyGen video rendering")
-    HEYGEN_JOB_TIMEOUT_SECONDS: int = Field(default=300, description="Timeout in seconds for HeyGen video generation")
+    HEYGEN_MODE: str = Field(default="audio", description="HeyGen synthesis mode: 'audio' (audio-driven lip-sync) or 'script' (script-driven TTS)")
+    HEYGEN_DEFAULT_VOICE_ID: str = Field(default="1bd001e7e50f421d891986aad5158bc8", description="Default HeyGen voice ID for script-based mode")
+    HEYGEN_WEBHOOK_URL: Optional[str] = Field(default=None, description="Webhook URL for HeyGen video rendering notifications")
+    HEYGEN_POLL_INTERVAL_SECONDS: float = Field(default=3.0, description="Polling interval in seconds for HeyGen video rendering")
+    HEYGEN_JOB_TIMEOUT_SECONDS: int = Field(default=600, description="Timeout in seconds for HeyGen video generation")
     ENABLE_LIVE_API_TESTS: bool = Field(default=False, description="Guard ensuring zero live paid API calls during testing")
     ENABLE_LIVE_HEYGEN: bool = Field(default=False, description="Separate live safety gate permitting paid HeyGen API generation at runtime")
+
+    # Google Cloud / Vertex AI Veo Settings (AI Video B-Roll Provider)
+    DEFAULT_MEDIA_PROVIDER: str = Field(default="motion_visual", description="Default media provider: motion_visual, veo, uploaded")
+    ENABLE_LIVE_VEO: bool = Field(default=False, description="Safety gate permitting paid Google Veo API generation at runtime")
+    GOOGLE_CLOUD_PROJECT: Optional[str] = Field(default=None, description="Google Cloud Project ID for Vertex AI / Veo")
+    GOOGLE_CLOUD_LOCATION: str = Field(default="us-central1", description="Google Cloud Vertex AI region for Veo")
+    GOOGLE_APPLICATION_CREDENTIALS: Optional[str] = Field(default=None, description="Path to Service Account JSON credentials file")
+    GOOGLE_CLOUD_STORAGE_BUCKET: Optional[str] = Field(default=None, description="Google Cloud Storage bucket for Veo video retrieval")
+    VEO_MODEL: str = Field(default="veo-3.1-fast-generate-001", description="Default Veo model (veo-3.1-fast-generate-001, veo-3.1-generate-001)")
+    VEO_POLL_INTERVAL_SECONDS: float = Field(default=5.0, description="Polling interval in seconds for Veo operation completion")
+    VEO_JOB_TIMEOUT_SECONDS: int = Field(default=600, description="Timeout in seconds for Veo video generation operations")
+    
+    # Backwards-compatible aliases
+    @property
+    def GCP_PROJECT_ID(self) -> Optional[str]:
+        return self.GOOGLE_CLOUD_PROJECT
+    
+    @property
+    def GCP_LOCATION(self) -> str:
+        return self.GOOGLE_CLOUD_LOCATION
+
+    @property
+    def VEO_DEFAULT_MODEL(self) -> str:
+        return self.VEO_MODEL
+
+    @property
+    def VEO_GCS_OUTPUT_BUCKET(self) -> Optional[str]:
+        return self.GOOGLE_CLOUD_STORAGE_BUCKET
+
+    # Pricing & Budget Approval Configuration
+    HEYGEN_PRICE_PER_CREDIT: float = Field(default=0.08, description="Estimated USD cost per credit for HeyGen")
+    VEO_PRICE_PER_SECOND_FAST: float = Field(default=0.15, description="Estimated USD cost per second for Veo 3.1 fast")
+    VEO_PRICE_PER_SECOND_STANDARD: float = Field(default=0.40, description="Estimated USD cost per second for Veo 3.1 standard")
 
     # SadTalker Settings (Free Local Avatar Provider)
     SADTALKER_ENABLED: bool = Field(default=False, description="Flag indicating if SadTalker local provider is enabled")
@@ -87,7 +123,7 @@ class Settings(BaseSettings):
         description="Maximum seconds before SadTalker local inference times out"
     )
     SADTALKER_PREPROCESS: str = Field(
-        default="crop",
+        default="full",
         description="SadTalker image preprocessing mode: crop, extcrop, resize, full, extfull"
     )
     SADTALKER_STILL: bool = Field(
@@ -137,7 +173,7 @@ class Settings(BaseSettings):
     # Script Generation & Validation Settings
     SCRIPT_WORDS_PER_MINUTE: int = Field(default=140, description="Estimated spoken words per minute for narration timing")
     SCRIPT_DURATION_TOLERANCE_PERCENT: int = Field(default=20, description="Allowed deviation percentage from target duration")
-    SCRIPT_DEFAULT_MAX_REVISIONS: int = Field(default=1, description="Maximum revision iterations in LangGraph workflow")
+    SCRIPT_DEFAULT_MAX_REVISIONS: int = Field(default=2, description="Maximum revision iterations in LangGraph workflow")
 
     # Localization Settings (Step 4)
     LOCALIZATION_MAX_REVISIONS: int = Field(default=1, description="Maximum revision attempts for invalid localized scripts")

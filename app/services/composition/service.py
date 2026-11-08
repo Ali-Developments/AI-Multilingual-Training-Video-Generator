@@ -94,6 +94,23 @@ class CompositionService:
                 continue
 
             duration = audio_asset.duration_seconds
+            if duration <= 0.0:
+                logger.warning(
+                    "Audio asset for scene '%s' reports duration <= 0 (%.2fs). Probing audio file directly.",
+                    scene.scene_id,
+                    duration,
+                )
+                try:
+                    from app.services.tts.audio_probe import get_audio_duration
+                    probed = get_audio_duration(Path(audio_asset.audio_path))
+                    if probed > 0.0:
+                        duration = probed
+                except Exception:
+                    pass
+                if duration <= 0.0:
+                    duration = float(scene.estimated_duration_seconds or 5.0)
+                if duration <= 0.0:
+                    duration = 5.0
 
             expected_has_av = scene.scene_id in avatar_map
             curr_layout = getattr(scene, "layout_type", "presenter_split")

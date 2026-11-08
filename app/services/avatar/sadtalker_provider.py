@@ -166,13 +166,16 @@ class SadTalkerProvider(AvatarProvider):
         self,
         scene_id: str,
         locale: str,
-        audio_path: Path,
+        audio_path: Optional[Path] = None,
         avatar_id: Optional[str] = None,
+        **kwargs: Any,
     ) -> str:
         """
         Execute local SadTalker synthesis for scene audio and cache result.
         Conforms to AvatarProvider contract.
         """
+        if not audio_path:
+            raise SadTalkerConfigurationError("SadTalker requires audio_path for audio-driven animation.")
         audio_file = Path(audio_path).resolve()
         if not audio_file.exists() or audio_file.stat().st_size == 0:
             raise SadTalkerConfigurationError(f"Audio file missing or empty: {audio_file}")
@@ -219,19 +222,22 @@ class SadTalkerProvider(AvatarProvider):
             )
 
         # Locate generated MP4
-        # SadTalker prints 'The generated video is named: <path>'
+        # SadTalker prints 'The generated video is named: <path>' or 'The generated video is named <path>'
         produced_mp4 = None
+        potential_paths: List[Path] = []
         for line in res.stdout.splitlines():
-            if "The generated video is named:" in line:
-                raw_path = line.split("The generated video is named:")[-1].strip()
+            if "The generated video is named" in line:
+                raw_path = line.split("The generated video is named")[-1].lstrip(": ").strip()
                 p1 = Path(raw_path)
                 p2 = self.sadtalker_root / raw_path
                 if p1.exists() and p1.is_file():
-                    produced_mp4 = p1
-                    break
+                    potential_paths.append(p1)
                 elif p2.exists() and p2.is_file():
-                    produced_mp4 = p2
-                    break
+                    potential_paths.append(p2)
+
+        if potential_paths:
+            full_candidates = [p for p in potential_paths if "_full" in p.name or p.name == f"{temp_dir.name}.mp4"]
+            produced_mp4 = full_candidates[-1] if full_candidates else potential_paths[-1]
 
         if not produced_mp4:
             candidates = list(temp_dir.rglob("*.mp4")) or list(temp_dir.parent.glob(f"{temp_dir.name}*.mp4"))
@@ -240,7 +246,8 @@ class SadTalkerProvider(AvatarProvider):
                 if root_temp.exists():
                     candidates = list(root_temp.rglob("*.mp4"))
             if candidates:
-                produced_mp4 = candidates[-1]
+                full_cand = [c for c in candidates if "_full" in c.name or c.name == f"{temp_dir.name}.mp4"]
+                produced_mp4 = full_cand[-1] if full_cand else candidates[-1]
 
         if not produced_mp4 or not produced_mp4.exists():
             shutil.rmtree(temp_dir, ignore_errors=True)

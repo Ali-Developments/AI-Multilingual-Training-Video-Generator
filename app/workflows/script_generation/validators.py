@@ -4,7 +4,7 @@ Performs rule-based checks on duration, structure, scene data, and learning obje
 without consuming LLM tokens.
 """
 
-from typing import List, Optional
+from typing import List, Optional, Dict, Any, Set
 import math
 
 from app.core.config import settings
@@ -100,6 +100,74 @@ def normalize_script_durations(
         )
     script.total_estimated_duration_seconds = sum(s.estimated_duration_seconds for s in script.scenes)
     return script
+
+
+def assess_learning_objective_coverage(
+    script: ScriptDraft,
+    analysis: Optional[ContentAnalysis] = None,
+) -> Dict[str, Any]:
+    """
+    Produce a reusable deterministic coverage report of learning objectives against script scenes.
+
+    Returns a structured dictionary matching:
+    {
+        "total_objectives": int,
+        "covered_objectives": int,
+        "uncovered_objectives": [
+            {
+                "id": str,
+                "description": str,
+                "covered_scene_ids": List[str]
+            }
+        ]
+    }
+    """
+    if not analysis or not analysis.learning_objectives:
+        return {
+            "total_objectives": 0,
+            "covered_objectives": 0,
+            "uncovered_objectives": [],
+        }
+
+    total_objectives = len(analysis.learning_objectives)
+    uncovered = []
+    covered_count = 0
+
+    for lo in analysis.learning_objectives:
+        matching_scene_ids = [
+            scene.scene_id
+            for scene in script.scenes
+            if lo.id in scene.learning_objective_ids
+        ]
+        if matching_scene_ids:
+            covered_count += 1
+        else:
+            uncovered.append({
+                "id": lo.id,
+                "description": lo.description,
+                "covered_scene_ids": [],
+            })
+
+    return {
+        "total_objectives": total_objectives,
+        "covered_objectives": covered_count,
+        "uncovered_objectives": uncovered,
+    }
+
+
+def get_scene_objective_map(script: ScriptDraft) -> List[Dict[str, Any]]:
+    """Return a mapping of scenes to their assigned learning objectives."""
+    return [
+        {
+            "scene_id": scene.scene_id,
+            "order": scene.order,
+            "title": scene.title,
+            "scene_type": scene.scene_type,
+            "estimated_duration_seconds": scene.estimated_duration_seconds,
+            "learning_objective_ids": list(scene.learning_objective_ids),
+        }
+        for scene in script.scenes
+    ]
 
 
 def validate_script_draft(
@@ -261,9 +329,9 @@ def validate_script_draft(
         )
 
     # 7. Learning Objectives Coverage Checks
+    coverage_report = assess_learning_objective_coverage(script, analysis)
     if analysis and analysis.learning_objectives:
         valid_objective_ids = {lo.id for lo in analysis.learning_objectives}
-        covered_objective_ids = set()
 
         for scene in script.scenes:
             for obj_id in scene.learning_objective_ids:
@@ -276,17 +344,14 @@ def validate_script_draft(
                             scene_id=scene.scene_id
                         )
                     )
-                else:
-                    covered_objective_ids.add(obj_id)
 
-        # Check for unrepresented required objectives
-        uncovered = valid_objective_ids - covered_objective_ids
-        for missing_id in sorted(uncovered):
+        # Check for unrepresented required objectives via coverage report
+        for uncov in coverage_report["uncovered_objectives"]:
             issues.append(
                 ValidationIssue(
                     code="UNCOVERED_LEARNING_OBJECTIVE",
                     severity="error",
-                    message=f"Required learning objective '{missing_id}' is not addressed in any scene."
+                    message=f"Required learning objective '{uncov['id']}' is not addressed in any scene."
                 )
             )
 
@@ -310,5 +375,6 @@ def validate_script_draft(
         issues=issues,
         estimated_total_duration_seconds=estimated_total,
         duration_difference_seconds=diff_seconds,
-        duration_difference_percent=round(diff_percent, 2)
+        duration_difference_percent=round(diff_percent, 2),
+        coverage_report=coverage_report
     )

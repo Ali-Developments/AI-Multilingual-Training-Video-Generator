@@ -3,7 +3,7 @@ import re
 from pathlib import Path
 
 secrets_found = []
-ignore_dirs = {'.venv', '.sadtalker-venv', '.git', 'storage', '__pycache__', 'tools', '.pytest_cache', 'AI-Multilingual-Training-Video-Generator'}
+ignore_dirs = {'.venv', '.sadtalker-venv', '.git', 'storage', '__pycache__', 'tools', '.pytest_cache', 'AI-Multilingual-Training-Video-Generator', 'node_modules', '.next'}
 
 pattern = re.compile(r'(gsk_[a-zA-Z0-9_-]{20,}|HEYGEN_API_KEY\s*=\s*[\'"][a-zA-Z0-9_-]{20,}[\'"])')
 
@@ -16,7 +16,7 @@ for root, dirs, files in os.walk('.'):
                 content = fp.read_text(encoding='utf-8', errors='ignore')
                 matches = pattern.findall(content)
                 for m in matches:
-                    if '1234567890abcdef' in m or 'abc1234567890' in m or '[REDACTED]' in m:
+                    if '1234567890abcdef' in m or 'abc1234567890' in m or '[REDACTED]' in m or 'gsk_your' in m:
                         continue
                     secrets_found.append((str(fp), m[:8] + '...'))
             except Exception:

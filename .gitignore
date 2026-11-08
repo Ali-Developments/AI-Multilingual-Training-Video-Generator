@@ -48,6 +48,8 @@ temp/
 # Storage / Artifacts generated at runtime
 storage/projects/*
 !storage/projects/.gitkeep
+storage/demonstrations/*
+!storage/demonstrations/.gitkeep
 storage/sadtalker_temp/
 *.mp4
 *.wav

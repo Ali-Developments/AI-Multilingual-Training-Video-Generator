@@ -24,6 +24,7 @@ export default function CreateVideoWizard() {
   const router = useRouter();
   const [step, setStep] = useState(1);
   const [submitting, setSubmitting] = useState(false);
+  const isSubmittingRef = React.useRef(false);
   const [statusMessage, setStatusMessage] = useState('');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
@@ -98,6 +99,8 @@ export default function CreateVideoWizard() {
   };
 
   const handleCreate = async (mode: 'studio' | 'quick') => {
+    if (submitting || isSubmittingRef.current) return;
+    isSubmittingRef.current = true;
     try {
       setSubmitting(true);
       setErrorMessage(null);
@@ -138,6 +141,7 @@ export default function CreateVideoWizard() {
       setErrorMessage(msg);
       setStatusMessage('');
       setSubmitting(false);
+      isSubmittingRef.current = false;
     }
   };
 

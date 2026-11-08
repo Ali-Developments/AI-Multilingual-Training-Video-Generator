@@ -52,6 +52,21 @@ class QuizData(BaseModel):
     explanation: Optional[str] = Field(default=None, description="Brief educational rationale for the answer")
 
 
+class SceneMediaPlan(BaseModel):
+    """Structured media production plan for video, avatar, and b-roll generation."""
+
+    scene_id: str = Field(..., description="Unique scene identifier (e.g. scene_1)")
+    purpose: str = Field(default="Content delivery", description="Instructional role or objective of this scene")
+    narration: str = Field(default="", description="Spoken narration text")
+    visual_description: str = Field(default="", description="Visual scene environment, subject, and content guidance")
+    motion_description: Optional[str] = Field(default=None, description="Detailed cinematic motion, subject dynamics, or animation")
+    camera_movement: Optional[str] = Field(default="static", description="Camera movement: static, slow zoom-in, pan right, pan left, orbital, tracking")
+    reference_image_requirements: Optional[str] = Field(default=None, description="Stylistic requirements for reference image conditioning")
+    preferred_provider: Optional[str] = Field(default=None, description="Target provider: heygen, veo, local_motion, mock, sadtalker, quiz")
+    target_duration: float = Field(default=5.0, ge=0.1, description="Target duration in seconds")
+    aspect_ratio: str = Field(default="16:9", description="Aspect ratio (16:9, 9:16, 1:1)")
+
+
 class BrandingConfig(BaseModel):
     """Project brand identity and custom styling configuration."""
 
@@ -179,6 +194,14 @@ class SceneDraft(BaseModel):
     rendered_video_url: Optional[str] = Field(default=None, description="Static storage URL to rendered scene MP4 if completed")
     has_rendered_asset: bool = Field(default=False, description="True if rendered video asset exists on disk and is completed")
 
+    # Structured Media Planning & Motion Engine fields
+    motion_description: Optional[str] = Field(default=None, description="Cinematic motion or animation description")
+    camera_movement: Optional[str] = Field(default="static", description="Camera movement: static, slow zoom-in, pan right, pan left, orbital, tracking")
+    reference_image_requirements: Optional[str] = Field(default=None, description="Stylistic requirements for reference image conditioning")
+    preferred_provider: Optional[str] = Field(default=None, description="Preferred provider: heygen, sadtalker, veo, local_motion, mock, quiz")
+    aspect_ratio: str = Field(default="16:9", description="Video aspect ratio: 16:9")
+    media_plan: Optional[SceneMediaPlan] = Field(default=None, description="Structured media production plan")
+
     # Backwards-compatibility fields
     scene_number: Optional[int] = Field(default=None, description="Legacy alias for order")
     visual_description: Optional[str] = Field(default=None, description="Legacy alias for visual_direction")
@@ -234,6 +257,30 @@ class SceneDraft(BaseModel):
             if self.media_type == "presenter":
                 self.media_type = "presenter"
 
+        # Synchronize structured SceneMediaPlan
+        if not self.media_plan and self.scene_id:
+            self.media_plan = SceneMediaPlan(
+                scene_id=self.scene_id,
+                purpose=self.purpose or "Content delivery",
+                narration=self.narration or "",
+                visual_description=self.visual_direction or self.visual_description or self.title or "",
+                motion_description=self.motion_description,
+                camera_movement=self.camera_movement or "static",
+                reference_image_requirements=self.reference_image_requirements,
+                preferred_provider=self.preferred_provider,
+                target_duration=float(self.estimated_duration_seconds or 5.0),
+                aspect_ratio=self.aspect_ratio or "16:9",
+            )
+        elif self.media_plan:
+            if not self.motion_description and self.media_plan.motion_description:
+                self.motion_description = self.media_plan.motion_description
+            if not self.camera_movement and self.media_plan.camera_movement:
+                self.camera_movement = self.media_plan.camera_movement
+            if not self.preferred_provider and self.media_plan.preferred_provider:
+                self.preferred_provider = self.media_plan.preferred_provider
+            if not self.reference_image_requirements and self.media_plan.reference_image_requirements:
+                self.reference_image_requirements = self.media_plan.reference_image_requirements
+
         return self
 
 
@@ -283,6 +330,7 @@ class ScriptValidationResult(BaseModel):
     estimated_total_duration_seconds: int = Field(default=0, description="Sum of scene durations")
     duration_difference_seconds: int = Field(default=0, description="Difference between estimate and target duration")
     duration_difference_percent: float = Field(default=0.0, description="Percentage deviation from target duration")
+    coverage_report: Optional[Dict[str, Any]] = Field(default=None, description="Deterministic learning objective coverage report")
 
 
 class FinalScript(BaseModel):
@@ -355,6 +403,17 @@ class LocalizedScene(BaseModel):
     rendered_video_url: Optional[str] = Field(default=None, description="Static storage URL to rendered scene MP4 if completed")
     has_rendered_asset: bool = Field(default=False, description="True if rendered video asset exists on disk and is completed")
 
+    # Structured Media Planning & Motion Engine fields
+    motion_description: Optional[str] = Field(default=None, description="Culturally adapted motion guidance")
+    camera_movement: Optional[str] = Field(default="static", description="Camera movement: static, slow zoom-in, pan right, orbital")
+    reference_image_requirements: Optional[str] = Field(default=None, description="Reference image or background style requirements")
+    preferred_provider: Optional[str] = Field(default=None, description="Preferred provider matching source scene")
+    aspect_ratio: str = Field(default="16:9", description="Video aspect ratio: 16:9")
+    media_plan: Optional[SceneMediaPlan] = Field(default=None, description="Structured media production plan")
+
+    # Backwards-compatibility fields
+    visual_description: Optional[str] = Field(default=None, description="Legacy alias for visual_direction")
+
     @model_validator(mode="after")
     def sync_localized_scene_fields(self) -> "LocalizedScene":
         """Synchronize V2 defaults for localized scene based on scene_type."""
@@ -385,6 +444,35 @@ class LocalizedScene(BaseModel):
             if self.media_type == "presenter":
                 self.avatar_enabled = True
                 self.media_type = "presenter"
+
+        if not self.visual_direction and self.visual_description:
+            self.visual_direction = self.visual_description
+        elif not self.visual_description and self.visual_direction:
+            self.visual_description = self.visual_direction
+
+        # Synchronize structured SceneMediaPlan
+        if not self.media_plan and self.scene_id:
+            self.media_plan = SceneMediaPlan(
+                scene_id=self.scene_id,
+                purpose=self.purpose or "Content delivery",
+                narration=self.narration or "",
+                visual_description=self.visual_direction or self.visual_description or self.title or "",
+                motion_description=self.motion_description,
+                camera_movement=self.camera_movement or "static",
+                reference_image_requirements=self.reference_image_requirements,
+                preferred_provider=self.preferred_provider,
+                target_duration=float(self.estimated_duration_seconds or 5.0),
+                aspect_ratio=self.aspect_ratio or "16:9",
+            )
+        elif self.media_plan:
+            if not self.motion_description and self.media_plan.motion_description:
+                self.motion_description = self.media_plan.motion_description
+            if not self.camera_movement and self.media_plan.camera_movement:
+                self.camera_movement = self.media_plan.camera_movement
+            if not self.preferred_provider and self.media_plan.preferred_provider:
+                self.preferred_provider = self.media_plan.preferred_provider
+            if not self.reference_image_requirements and self.media_plan.reference_image_requirements:
+                self.reference_image_requirements = self.media_plan.reference_image_requirements
 
         return self
 
@@ -642,13 +730,49 @@ def sanitize_diagnostic_message(msg: str) -> str:
     return clean
 
 
+class ProviderCostItem(BaseModel):
+    """Estimated cost component for an external or local generation provider."""
+
+    provider: str = Field(..., description="Provider name: heygen, veo, local_motion, mock, sadtalker")
+    usage_unit: str = Field(..., description="Unit of measurement: credits, seconds, scenes")
+    quantity: float = Field(default=0.0, ge=0, description="Usage amount")
+    rate_per_unit: float = Field(default=0.0, ge=0, description="Rate per unit in USD")
+    estimated_cost_usd: float = Field(default=0.0, ge=0, description="Estimated total USD cost")
+    details: str = Field(default="", description="Descriptive rationale or pricing SKU note")
+
+
+class ProjectBudgetEstimate(BaseModel):
+    """Complete structured cost breakdown and authorization state for a project."""
+
+    project_id: str = Field(..., description="Project ID")
+    status: str = Field(default="not_required", description="Approval status: not_required, pending_approval, approved, rejected")
+    total_estimated_cost_usd: float = Field(default=0.0, ge=0, description="Total estimated USD generation cost")
+    requires_approval: bool = Field(default=False, description="True if any paid live generation API is requested")
+    currency: str = Field(default="USD", description="Currency identifier")
+    items: List[ProviderCostItem] = Field(default_factory=list, description="Per-provider cost line items")
+    calculated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat(), description="ISO calculation timestamp")
+    approved_at: Optional[str] = Field(default=None, description="ISO approval timestamp")
+    approved_by: Optional[str] = Field(default=None, description="User or service identity that approved budget")
+    notes: Optional[str] = Field(default=None, description="Approval notes or rationale")
+
+
+class ApproveBudgetRequest(BaseModel):
+    """Payload to authorize or reject project generation budget."""
+
+    approved: bool = Field(default=True, description="Whether the budget is approved")
+    user_email: Optional[str] = Field(default="admin@workspace.local", description="Approving user email")
+    notes: Optional[str] = Field(default=None, description="Optional notes or budget cap remarks")
+
+
 class ProjectManifest(BaseModel):
     """Persistent project manifest tracking end-to-end lifecycle and artifacts."""
 
     project_id: str = Field(..., description="Unique project identifier")
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat(), description="ISO 8601 creation timestamp")
     updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat(), description="ISO 8601 last update timestamp")
-    status: str = Field(default="pending", description="Pipeline status: pending, running, completed, needs_review, failed")
+    status: str = Field(default="pending", description="Pipeline status: pending, running, completed, needs_review, failed, pending_approval")
+    budget_status: str = Field(default="not_required", description="Budget status: not_required, pending_approval, approved, rejected")
+    budget: Optional[ProjectBudgetEstimate] = Field(default=None, description="Structured budget estimate breakdown")
     avatar_provider: str = Field(default="mock", description="Selected avatar provider for this project: 'mock', 'sadtalker', 'heygen'")
     source_request: TrainingVideoRequest = Field(..., description="Original input request parameters")
 

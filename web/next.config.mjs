@@ -1,6 +1,9 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: true,
+  experimental: {
+    proxyTimeout: 300000, // 5 minutes (300,000 ms) to support long-running AI script generation, storyboard planning, and video rendering
+  },
   async rewrites() {
     return [
       {

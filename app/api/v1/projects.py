@@ -1,9 +1,11 @@
 import os
 import shutil
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 from fastapi import APIRouter, HTTPException, status, Query, UploadFile, File
+from starlette.concurrency import run_in_threadpool
 
 from app.core.config import settings
 from app.core.logging import logger
@@ -21,7 +23,10 @@ from app.models.schemas import (
     VideoStyle,
     SceneDraft,
     LocalizedScene,
+    ProjectBudgetEstimate,
+    ApproveBudgetRequest,
 )
+from app.services.budget.service import BudgetService
 from app.workflows.manifest import ProjectManifestManager
 from app.workflows.orchestrator import ProjectOrchestrator
 from app.workflows.storyboard_planner import StoryboardPlanner
@@ -609,7 +614,11 @@ async def generate_script(
             },
         )
 
-    manifest = orchestrator.generate_canonical_script(project_id, force_regenerate=force_regenerate)
+    manifest = await run_in_threadpool(
+        orchestrator.generate_canonical_script,
+        project_id,
+        force_regenerate=force_regenerate,
+    )
     if manifest.script_status == "failed" or not manifest.final_script:
         err_msg = f"Failed to generate canonical script for project '{project_id}'."
         if manifest.errors:
@@ -648,7 +657,8 @@ async def prepare_studio(
             },
         )
 
-    manifest = orchestrator.prepare_studio_project(
+    manifest = await run_in_threadpool(
+        orchestrator.prepare_studio_project,
         project_id,
         video_style=video_style,
         force_regenerate_script=force_regenerate,
@@ -703,7 +713,7 @@ async def plan_storyboard(
             )
 
         logger.info("[%s] final_script missing during plan_storyboard. Auto-generating canonical script first...", project_id)
-        manifest = orchestrator.generate_canonical_script(project_id)
+        manifest = await run_in_threadpool(orchestrator.generate_canonical_script, project_id)
         if manifest.script_status == "failed" or not manifest.final_script:
             err_msg = f"Failed to generate canonical script for project '{project_id}'."
             if manifest.errors:
@@ -821,10 +831,16 @@ async def list_project_media(project_id: str) -> List[UploadedMediaItem]:
 
 
 @router.get(
+    "/providers",
+    status_code=status.HTTP_200_OK,
+    summary="Get Provider Readiness",
+    description="Retrieve safe status of avatar, video, TTS, LLM, and GPU hardware without exposing secrets.",
+)
+@router.get(
     "/providers/status",
     status_code=status.HTTP_200_OK,
     summary="Get Provider Readiness",
-    description="Retrieve safe status of avatar, TTS, LLM, and GPU hardware without exposing secrets.",
+    description="Retrieve safe status of avatar, video, TTS, LLM, and GPU hardware without exposing secrets.",
 )
 async def get_providers_status() -> Dict[str, Any]:
     # Check GPU availability safely
@@ -875,6 +891,12 @@ async def get_providers_status() -> Dict[str, Any]:
             "name": "FFmpeg Scene Composer",
             "available": True,
             "ready": True,
+        },
+        "veo": {
+            "name": "Google Veo (Vertex AI)",
+            "available": bool(getattr(settings, "GOOGLE_CLOUD_PROJECT", None) or getattr(settings, "GCP_PROJECT_ID", None) or getattr(settings, "GOOGLE_APPLICATION_CREDENTIALS", None)),
+            "model": getattr(settings, "VEO_MODEL", "veo-3.1-fast-generate-001"),
+            "ready": bool(getattr(settings, "GOOGLE_CLOUD_PROJECT", None) or getattr(settings, "GCP_PROJECT_ID", None) or getattr(settings, "GOOGLE_APPLICATION_CREDENTIALS", None)),
         },
     }
 
@@ -1018,3 +1040,134 @@ async def get_project_outputs(project_id: str) -> ProjectOutputsResponse:
         subtitle_tracks={loc: t.status for loc, t in manifest.subtitle_tracks.items()},
         final_videos=final_vids,
     )
+
+
+@router.get(
+    "/projects/{project_id}/budget",
+    response_model=ProjectBudgetEstimate,
+    status_code=status.HTTP_200_OK,
+    summary="Get Project Budget Estimate",
+    description="Calculate and retrieve granular estimated generation costs across external providers.",
+)
+async def get_project_budget(project_id: str) -> ProjectBudgetEstimate:
+    manifest = manifest_manager.load_manifest(project_id)
+    if not manifest:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Project '{project_id}' not found.",
+        )
+    est = BudgetService.calculate_project_budget(manifest)
+    manifest.budget = est
+    manifest.budget_status = est.status
+    manifest_manager.save_manifest(manifest)
+    return est
+
+
+@router.post(
+    "/projects/{project_id}/approve-budget",
+    response_model=ProjectBudgetEstimate,
+    status_code=status.HTTP_200_OK,
+    summary="Approve or Reject Project Budget",
+    description="Authorize external generation costs, unlocking the budget gate for live API rendering.",
+)
+async def approve_project_budget(
+    project_id: str,
+    payload: ApproveBudgetRequest,
+) -> ProjectBudgetEstimate:
+    manifest = manifest_manager.load_manifest(project_id)
+    if not manifest:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Project '{project_id}' not found.",
+        )
+
+    est = BudgetService.calculate_project_budget(manifest)
+    if payload.approved:
+        est.status = "approved"
+        est.approved_at = datetime.now(timezone.utc).isoformat()
+        est.approved_by = payload.user_email or "admin"
+        est.notes = payload.notes
+        manifest.budget_status = "approved"
+        manifest.clear_stage_errors("budget_gate")
+        if manifest.status == "pending_approval":
+            manifest.status = "pending"
+    else:
+        est.status = "rejected"
+        est.notes = payload.notes
+        manifest.budget_status = "rejected"
+        manifest.status = "needs_review"
+        manifest.record_error(
+            stage="budget_gate",
+            message=f"Budget authorization rejected by {payload.user_email or 'user'}.",
+            code="BUDGET_REJECTED",
+        )
+
+    manifest.budget = est
+    manifest_manager.save_manifest(manifest)
+    return est
+
+
+@router.get(
+    "/projects/{project_id}/status",
+    status_code=status.HTTP_200_OK,
+    summary="Get Detailed Project Status & Active Jobs",
+    description="Track lifecycle progression, active jobs, budget state, and error logs.",
+)
+async def get_project_status(project_id: str) -> Dict[str, Any]:
+    manifest = manifest_manager.load_manifest(project_id)
+    if not manifest:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Project '{project_id}' not found.",
+        )
+
+    stages = {
+        "script": manifest.script_status,
+        "localization": manifest.localization_status,
+        "audio": manifest.audio_status,
+        "avatar": manifest.avatar_status,
+        "visuals": manifest.visual_status,
+        "subtitles": manifest.subtitle_status,
+        "composition": manifest.composition_status,
+    }
+    completed_stages = sum(1 for s in stages.values() if s == "completed")
+    progress_percent = round((completed_stages / len(stages)) * 100)
+
+    return {
+        "project_id": manifest.project_id,
+        "status": manifest.status,
+        "progress_percent": progress_percent,
+        "stages": stages,
+        "budget_status": getattr(manifest, "budget_status", "not_required"),
+        "budget": manifest.budget.model_dump() if getattr(manifest, "budget", None) else None,
+        "errors": manifest.errors,
+        "error_details": [e.model_dump() for e in manifest.error_details],
+        "created_at": manifest.created_at,
+        "updated_at": manifest.updated_at,
+    }
+
+
+@router.post(
+    "/projects/{project_id}/retry",
+    response_model=ProjectManifest,
+    status_code=status.HTTP_200_OK,
+    summary="Retry Project Execution",
+    description="Resume pipeline execution, clearing transient errors and resuming uncompleted stages.",
+)
+async def retry_project_execution(project_id: str) -> ProjectManifest:
+    manifest = manifest_manager.load_manifest(project_id)
+    if not manifest:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Project '{project_id}' not found.",
+        )
+
+    try:
+        updated = orchestrator.resume_project(project_id=project_id, force_regenerate=False)
+        return updated
+    except Exception as e:
+        logger.error("Error retrying project '%s': %s", project_id, e)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Retry error: {str(e)}",
+        )

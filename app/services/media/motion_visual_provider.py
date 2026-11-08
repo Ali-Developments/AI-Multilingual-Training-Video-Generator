@@ -1,8 +1,8 @@
-"""Local Motion Visual Provider using FFmpeg.
+"""Local Motion Visual Provider using FFmpeg and Motion Animator.
 
-Transforms static graphics and images into cinematic motion video segments
-using slow Ken Burns zooms, gentle pans, and professional crossfades.
-Zero API cost, fully local, fast execution.
+Generates dynamic, rich instructional animated video clips with smooth easing,
+progressive highlighting, interactive cursors, and structured cards
+matching scene narration. Zero API cost, fully local, fast execution.
 """
 
 from pathlib import Path
@@ -15,10 +15,11 @@ from app.core.logging import logger
 from app.core.caching import hash_text, save_asset_metadata, load_asset_metadata
 from app.models.schemas import LocalizedScene
 from app.services.media.base import SceneMediaProvider
+from app.services.media.motion_animator import generate_animated_motion_video
 
 
 class LocalMotionVisualProvider(SceneMediaProvider):
-    """Generates dynamic motion video clips from static visuals using FFmpeg."""
+    """Generates dynamic motion video clips from instructional scenes using FFmpeg."""
 
     @property
     def provider_name(self) -> str:
@@ -30,17 +31,17 @@ class LocalMotionVisualProvider(SceneMediaProvider):
     def _generate_ambient_background(self, output_path: Path, title: str = "", width: int = 1920, height: int = 1080) -> Path:
         """Create a modern cinematic ambient dark gradient canvas if no image exists."""
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        img = Image.new("RGB", (width, height), color=(10, 15, 30))
+        img = Image.new("RGB", (width, height), color=(9, 13, 26))
         draw = ImageDraw.Draw(img)
 
         # Draw subtle ambient circular glows
-        draw.ellipse([width * 0.1, height * 0.1, width * 0.6, height * 0.8], fill=(15, 25, 55))
-        draw.ellipse([width * 0.5, height * 0.2, width * 0.95, height * 0.9], fill=(12, 35, 60))
-        draw.ellipse([width * 0.3, height * 0.4, width * 0.8, height * 1.1], fill=(18, 20, 45))
+        draw.ellipse([int(width * 0.1), int(height * 0.1), int(width * 0.65), int(height * 0.8)], fill=(15, 24, 48))
+        draw.ellipse([int(width * 0.5), int(height * 0.2), int(width * 0.95), int(height * 0.9)], fill=(13, 34, 58))
+        draw.ellipse([int(width * 0.3), int(height * 0.4), int(width * 0.8), int(height * 1.1)], fill=(18, 20, 45))
 
         # Modern top/bottom accent line
-        draw.rectangle([0, 0, width, 6], fill=(0, 229, 255))
-        draw.rectangle([0, height - 6, width, height], fill=(79, 70, 229))
+        draw.rectangle([0, 0, width, 5], fill=(0, 229, 255))
+        draw.rectangle([0, height - 5, width, height], fill=(79, 70, 229))
 
         img.save(output_path, quality=95)
         return output_path
@@ -55,14 +56,13 @@ class LocalMotionVisualProvider(SceneMediaProvider):
         custom_media_path: Optional[Path] = None,
     ) -> Path:
         """
-        Generate a 1920x1080 motion MP4 for the scene using Ken Burns motion.
+        Generate a 1920x1080 motion MP4 for the scene with true animated elements.
         """
         output_dir.mkdir(parents=True, exist_ok=True)
         out_video = output_dir / f"{scene.scene_id}_motion.mp4"
 
-        # Check existing valid cache
         dur = max(duration_seconds, 1.0)
-        cache_key = f"{scene.scene_id}:{locale}:{dur:.2f}:{scene.media_type}:{scene.layout_type}"
+        cache_key = f"{scene.scene_id}:{locale}:{dur:.2f}:{scene.media_type}:{scene.layout_type}:v3_motion"
         cache_hash = hash_text(cache_key)
 
         if out_video.exists() and out_video.stat().st_size > 1024:
@@ -71,48 +71,56 @@ class LocalMotionVisualProvider(SceneMediaProvider):
                 logger.info("Reusing cached motion visual for scene '%s' (locale='%s')", scene.scene_id, locale)
                 return out_video
 
-        # Determine source image
-        src_img: Path
+        fps = max(int(getattr(settings, "VIDEO_FPS", 25) or 25), 1)
+
+        # If custom media file provided by user (e.g. uploaded video/photo), use Ken Burns motion
         if custom_media_path and custom_media_path.exists():
-            src_img = custom_media_path
-        elif background_image_path and background_image_path.exists():
-            src_img = background_image_path
-        else:
-            ambient_path = output_dir / f"{scene.scene_id}_ambient.png"
-            src_img = self._generate_ambient_background(ambient_path, title=scene.title)
+            logger.info("Rendering custom media Ken Burns motion for scene '%s' from '%s'", scene.scene_id, custom_media_path.name)
+            total_frames = max(int(dur * fps) + 5, 1)
+            zoom_filter = (
+                f"zoompan=z='min(zoom+0.0008,1.15)':d={total_frames}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1920x1080:fps={fps},"
+                f"format=yuv420p"
+            )
+            cmd = [
+                settings.FFMPEG_BINARY_PATH,
+                "-y",
+                "-loop", "1",
+                "-i", str(custom_media_path.resolve()),
+                "-vf", zoom_filter,
+                "-c:v", settings.VIDEO_CODEC,
+                "-pix_fmt", "yuv420p",
+                "-t", str(dur),
+                str(out_video.resolve()),
+            ]
+            try:
+                res = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+                if res.returncode == 0 and out_video.exists() and out_video.stat().st_size > 0:
+                    save_asset_metadata(out_video, {"motion_hash": cache_hash, "duration": dur, "scene_id": scene.scene_id})
+                    return out_video
+            except Exception as e:
+                logger.warning("Error running FFmpeg zoompan on custom media: %s", e)
 
-        logger.info("Rendering local motion visual for scene '%s' (duration=%.2fs) from '%s'", scene.scene_id, dur, src_img.name)
-
-        fps = 25
-        total_frames = int(dur * fps) + 5
-        # Ken Burns zoom-pan filter: subtle zoom in from 1.0 to 1.12 with centered framing
-        zoom_filter = (
-            f"zoompan=z='min(zoom+0.0008,1.15)':d={total_frames}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1920x1080:fps={fps},"
-            f"format=yuv420p"
-        )
-
-        cmd = [
-            settings.FFMPEG_BINARY_PATH,
-            "-y",
-            "-loop", "1",
-            "-i", str(src_img.resolve()),
-            "-vf", zoom_filter,
-            "-c:v", settings.VIDEO_CODEC,
-            "-pix_fmt", "yuv420p",
-            "-t", str(dur),
-            str(out_video.resolve()),
-        ]
-
+        # Primary: Generate rich programmatic animated instructional motion graphic
         try:
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
-            if res.returncode == 0 and out_video.exists() and out_video.stat().st_size > 0:
-                save_asset_metadata(out_video, {"motion_hash": cache_hash, "duration": dur, "scene_id": scene.scene_id})
+            logger.info("Rendering high-impact animated instructional motion visual for scene '%s' (%.2fs)", scene.scene_id, dur)
+            generate_animated_motion_video(
+                scene=scene,
+                duration_seconds=dur,
+                output_path=out_video,
+                width=1920,
+                height=1080,
+                fps=fps,
+                custom_background_path=background_image_path,
+            )
+            if out_video.exists() and out_video.stat().st_size > 0:
+                save_asset_metadata(out_video, {"motion_hash": cache_hash, "duration": dur, "scene_id": scene.scene_id, "animated": True})
                 return out_video
-            logger.warning("FFmpeg zoompan failed, falling back to simple loop: %s", res.stderr)
-        except Exception as e:
-            logger.warning("Error running FFmpeg zoompan: %s", e)
+        except Exception as ex:
+            logger.warning("Animated motion video generation failed for scene '%s' (%s); attempting fallback", scene.scene_id, ex)
 
-        # Fallback simple scale video
+        # Fallback: ambient Ken Burns loop
+        ambient_path = output_dir / f"{scene.scene_id}_ambient.png"
+        src_img = self._generate_ambient_background(ambient_path, title=scene.title)
         fallback_filter = "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p"
         fb_cmd = [
             settings.FFMPEG_BINARY_PATH,

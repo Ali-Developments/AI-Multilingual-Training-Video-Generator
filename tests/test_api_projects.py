@@ -286,3 +286,70 @@ def test_create_project_rejects_unwrapped_flat_payload_with_422(client):
     errors = response.json()["detail"]
     assert any("request" in err["loc"] and err["type"] == "missing" for err in errors)
 
+
+def test_generate_script_endpoint_success(client):
+    """Verify POST /api/v1/projects/{id}/generate-script succeeds and returns HTTP 200 with final script."""
+    # Create project first
+    payload = {
+        "project_id": "proj_gen_script_test",
+        "request": {
+            "topic": "Workplace Phishing Defense Essentials",
+            "source_content": "Identify phishing emails, verify sender domains, and report attacks.",
+            "audience": "Employees",
+            "base_language": "en-US",
+            "target_languages": ["ar-SA"],
+            "target_duration_seconds": 60,
+            "learning_objectives": [
+                "Identify spoofed domains",
+                "Report suspicious emails",
+            ],
+        },
+    }
+    c_res = client.post("/api/v1/projects", json=payload)
+    assert c_res.status_code == 201
+
+    # Call generate-script endpoint
+    gen_res = client.post("/api/v1/projects/proj_gen_script_test/generate-script?force_regenerate=false")
+    assert gen_res.status_code == 200
+    manifest = gen_res.json()
+    assert manifest["project_id"] == "proj_gen_script_test"
+    assert manifest["script_status"] == "completed"
+    assert manifest["final_script"] is not None
+    assert len(manifest["final_script"]["scenes"]) > 0
+
+
+def test_generate_script_404_on_unknown_project(client):
+    """Verify POST /api/v1/projects/{id}/generate-script returns 404 for unknown project."""
+    res = client.post("/api/v1/projects/proj_nonexistent_999/generate-script")
+    assert res.status_code == 404
+    data = res.json()
+    assert data["detail"]["code"] == "PROJECT_NOT_FOUND"
+
+
+def test_prepare_studio_endpoint_success(client):
+    """Verify POST /api/v1/projects/{id}/prepare-studio bootstraps script and storyboard."""
+    payload = {
+        "project_id": "proj_studio_prep_test",
+        "request": {
+            "topic": "Workplace Phishing Defense Essentials",
+            "source_content": "Identify phishing emails, verify sender domains, and report attacks.",
+            "audience": "Facility Personnel",
+            "base_language": "en-US",
+            "target_languages": ["ar-SA"],
+            "target_duration_seconds": 60,
+            "learning_objectives": [
+                "Identify spoofed domains",
+                "Report suspicious emails",
+            ],
+        },
+    }
+    client.post("/api/v1/projects", json=payload)
+
+    prep_res = client.post("/api/v1/projects/proj_studio_prep_test/prepare-studio")
+    assert prep_res.status_code == 200
+    manifest = prep_res.json()
+    assert manifest["script_status"] == "completed"
+    assert manifest["final_script"] is not None
+    assert len(manifest["final_script"]["scenes"]) == 2
+
+

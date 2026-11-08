@@ -6,7 +6,7 @@ from app.core.config import Settings
 
 def test_default_settings():
     """Verify default configuration parameters."""
-    settings = Settings()
+    settings = Settings(_env_file=None)
     assert settings.APP_NAME == "AI Training Video Generation Platform"
     assert settings.DEFAULT_LLM_PROVIDER == "groq"
     assert settings.GROQ_MODEL == "openai/gpt-oss-20b"

@@ -63,16 +63,24 @@ class MockAvatarProvider(AvatarProvider):
         self,
         scene_id: str,
         locale: str,
-        audio_path: Path,
+        audio_path: Optional[Path] = None,
         avatar_id: Optional[str] = None,
+        script_text: Optional[str] = None,
+        voice_id: Optional[str] = None,
+        mode: Optional[str] = None,
+        project_id: Optional[str] = None,
+        **kwargs: Any,
     ) -> str:
         self.submit_call_count += 1
         job_id = f"mock_job_{uuid.uuid4().hex[:8]}"
 
         # Measure audio duration for video alignment
-        try:
-            audio_duration = get_audio_duration(audio_path)
-        except Exception:
+        audio_duration = 2.0
+        if audio_path and Path(audio_path).exists():
+            try:
+                audio_duration = get_audio_duration(Path(audio_path))
+            except Exception:
+                audio_duration = 2.0
             audio_duration = 2.0
 
         should_fail = (scene_id in self.fail_scene_ids) or (locale in self.fail_locales)

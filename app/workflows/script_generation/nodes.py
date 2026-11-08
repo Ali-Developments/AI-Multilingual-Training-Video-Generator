@@ -149,6 +149,9 @@ class ScriptWorkflowNodes:
                 system_prompt=SYSTEM_PROMPT_SCRIPT_WRITER,
                 temperature=0.3
             )
+            # ContentAnalysis is the canonical source of truth for learning objectives
+            if analysis and analysis.learning_objectives:
+                script_draft.learning_objectives = list(analysis.learning_objectives)
             normalize_script_durations(script_draft, language=req.base_language)
             return {"draft_script": script_draft}
         except Exception as e:
@@ -179,13 +182,27 @@ class ScriptWorkflowNodes:
             language=req.base_language or draft.language
         )
 
+        cov_rep = validation_result.coverage_report
+        cov_summary = ""
+        if cov_rep:
+            cov_summary = f", Objective coverage: {cov_rep.get('covered_objectives', 0)}/{cov_rep.get('total_objectives', 0)}"
+
         logger.info(
-            "Validation completed: is_valid=%s, issues=%d (Duration: %ds / Target: %ds)",
+            "Validation completed: is_valid=%s, issues=%d (Duration: %ds / Target: %ds%s)",
             validation_result.is_valid,
             len(validation_result.issues),
             validation_result.estimated_total_duration_seconds,
-            req.target_duration_seconds
+            req.target_duration_seconds,
+            cov_summary
         )
+
+        if cov_rep and cov_rep.get("uncovered_objectives"):
+            uncovered_ids = [u["id"] for u in cov_rep["uncovered_objectives"]]
+            logger.warning(
+                "Uncovered learning objectives detected (%d): %s",
+                len(uncovered_ids),
+                uncovered_ids
+            )
 
         return {"validation": validation_result}
 
@@ -215,6 +232,9 @@ class ScriptWorkflowNodes:
                 system_prompt=SYSTEM_PROMPT_SCRIPT_REVISER,
                 temperature=0.2
             )
+            # ContentAnalysis is the canonical source of truth for learning objectives
+            if analysis and analysis.learning_objectives:
+                revised_script.learning_objectives = list(analysis.learning_objectives)
             normalize_script_durations(revised_script, language=req.base_language)
             return {
                 "draft_script": revised_script,
@@ -242,6 +262,13 @@ class ScriptWorkflowNodes:
                 "errors": ["Cannot finalize script: missing draft_script or request."]
             }
 
+        # ContentAnalysis.learning_objectives is the canonical source of truth
+        canonical_objectives = (
+            list(state.analysis.learning_objectives)
+            if state.analysis and state.analysis.learning_objectives
+            else list(draft.learning_objectives or [])
+        )
+
         final = FinalScript(
             title=draft.title,
             language=draft.language,
@@ -250,7 +277,7 @@ class ScriptWorkflowNodes:
             total_estimated_duration_seconds=draft.total_estimated_duration_seconds,
             opening_hook=draft.opening_hook,
             closing_summary=draft.closing_summary,
-            learning_objectives=draft.learning_objectives or (state.analysis.learning_objectives if state.analysis else []),
+            learning_objectives=canonical_objectives,
             scenes=draft.scenes,
             metadata={
                 "revision_count": state.revision_count,

@@ -46,7 +46,14 @@ from app.workflows.script_generation.validators import (
     validate_script_draft,
     estimate_narration_duration_seconds,
     normalize_script_durations,
+    assess_learning_objective_coverage,
+    get_scene_objective_map,
 )
+from app.workflows.script_generation.prompts import (
+    build_script_revision_prompt,
+    build_workflow_script_prompt,
+)
+from app.workflows.script_generation.nodes import ScriptWorkflowNodes
 from app.workflows.script_generation.state import VideoScriptState
 from app.workflows.script_generation.graph import create_script_workflow
 
@@ -78,12 +85,14 @@ class MockLLMProvider(LLMProvider):
         analysis_fixture: Optional[ContentAnalysis] = None,
         script_draft_fixture: Optional[ScriptDraft] = None,
         revised_script_fixture: Optional[ScriptDraft] = None,
+        revision_fixtures: Optional[List[ScriptDraft]] = None,
         model_name_str: str = "mock-llm-v1"
     ):
         self._model_name = model_name_str
         self.analysis_fixture = analysis_fixture
         self.script_draft_fixture = script_draft_fixture
         self.revised_script_fixture = revised_script_fixture
+        self.revision_fixtures = list(revision_fixtures) if revision_fixtures else []
         self.call_history = []
         self.generate_script_call_count = 0
         self.revise_script_call_count = 0
@@ -121,6 +130,9 @@ class MockLLMProvider(LLMProvider):
             # If revision fixture provided and this is a subsequent revision call
             if self.generate_script_call_count > 1:
                 self.revise_script_call_count += 1
+                if self.revision_fixtures:
+                    idx = min(self.revise_script_call_count - 1, len(self.revision_fixtures) - 1)
+                    return self.revision_fixtures[idx]
                 if self.revised_script_fixture:
                     return self.revised_script_fixture
 
@@ -586,3 +598,680 @@ def test_workflow_nodes_never_call_groq_directly():
     assert "import groq" not in nodes_source
     assert "from groq" not in nodes_source
     assert "Groq(" not in nodes_source
+
+
+# ---------------------------------------------------------------------------
+# Learning Objective Coverage & Targeted Revision Regression Tests
+# ---------------------------------------------------------------------------
+
+SAMPLE_LO1_SHORT_NARRATION = (
+    "Examine the sender address with extreme care whenever receiving an email with unexpected attachments. "
+    "Deceptive characters, spoofed subdomains, and misplaced letters often indicate an unauthorized external "
+    "attempt to compromise internal enterprise authentication systems."
+)  # 35 words ~ 15s
+
+SAMPLE_LO2_SHORT_NARRATION = (
+    "When you detect a suspicious message, immediately click the organizational report button in your email client. "
+    "Never forward the email directly to your coworkers, as doing so spreads the active malicious payload "
+    "across company systems."
+)  # 35 words ~ 15s
+
+SAMPLE_LO3_SHORT_NARRATION = (
+    "To understand why spoofed messages reach inboxes, security teams inspect SPF, DKIM, and DMARC verification headers. "
+    "These cryptographic protocols confirm whether the originating server had authorized rights to transmit "
+    "messages for that company domain."
+)  # 35 words ~ 15s
+
+SAMPLE_LO4_SHORT_NARRATION = (
+    "Finally, evaluate the remediation outcome after reporting. The security operations team analyzes telemetry, "
+    "quarantines matched threats company-wide, and updates mail filtering rules to permanently prevent "
+    "identical phishing vectors from reaching any employee."
+)  # 35 words ~ 15s
+
+
+def _create_four_objective_analysis() -> ContentAnalysis:
+    """Helper creating a canonical ContentAnalysis fixture with four distinct learning objectives."""
+    return ContentAnalysis(
+        topic_summary="Comprehensive Phishing Defense and Verification Protocol",
+        key_concepts=["Domain inspection", "Incident reporting", "Header analysis", "Quarantine evaluation"],
+        learning_objectives=[
+            LearningObjective(id="LO1", description="Identify deceptive phishing indicators in email domains"),
+            LearningObjective(id="LO2", description="Apply organizational incident reporting protocols"),
+            LearningObjective(id="LO3", description="Explain technical headers and SPF verification"),
+            LearningObjective(id="LO4", description="Evaluate post-incident quarantine outcomes"),
+        ],
+        audience_notes="All enterprise staff members",
+        recommended_scene_count=4,
+        recommended_structure=["Intro", "Detection", "Reporting", "Verification", "Resolution", "Outro"],
+        important_terms=["SPF", "DKIM", "DMARC", "Spoofing"],
+        factual_constraints=["Always report via official toolbar"]
+    )
+
+
+def test_four_learning_objectives_missing_lo3_and_lo4_detected():
+    """Verify that an initial script covering only LO1 and LO2 triggers UNCOVERED_LEARNING_OBJECTIVE for LO3 and LO4."""
+    analysis = _create_four_objective_analysis()
+
+    # Draft covering only LO1 and LO2
+    script = ScriptDraft(
+        title="Phishing Fundamentals",
+        audience="Enterprise Staff",
+        opening_hook="Can you reliably identify and report modern email threats?",
+        scenes=[
+            SceneDraft(
+                scene_id="scene_1",
+                order=1,
+                title="Domain Inspection",
+                purpose="Teach domain inspection",
+                scene_type="presenter",
+                narration=SAMPLE_SCENE_1_NARRATION,  # 71 words ~ 30s
+                visual_direction="Presenter reviewing spoofed email header.",
+                on_screen_text="Inspect the Domain",
+                learning_objective_ids=["LO1"],
+                estimated_duration_seconds=30
+            ),
+            SceneDraft(
+                scene_id="scene_2",
+                order=2,
+                title="Incident Reporting",
+                purpose="Teach reporting protocol",
+                scene_type="explanation",
+                narration=SAMPLE_SCENE_2_NARRATION,  # 68 words ~ 29s
+                visual_direction="Screen recording of clicking Report button.",
+                on_screen_text="Report Immediately",
+                learning_objective_ids=["LO2"],
+                estimated_duration_seconds=30
+            ),
+        ],
+        total_estimated_duration_seconds=60
+    )
+
+    result = validate_script_draft(script, target_duration_seconds=60, analysis=analysis)
+
+    assert not result.is_valid
+    uncovered_issues = [i for i in result.issues if i.code == "UNCOVERED_LEARNING_OBJECTIVE"]
+    assert len(uncovered_issues) == 2
+
+    uncovered_messages = [i.message for i in uncovered_issues]
+    assert any("LO3" in msg for msg in uncovered_messages)
+    assert any("LO4" in msg for msg in uncovered_messages)
+    assert not any("LO1" in msg for msg in uncovered_messages)
+    assert not any("LO2" in msg for msg in uncovered_messages)
+
+    # Deterministic coverage report verification
+    rep = result.coverage_report
+    assert rep is not None
+    assert rep["total_objectives"] == 4
+    assert rep["covered_objectives"] == 2
+    uncovered_entries = rep["uncovered_objectives"]
+    assert len(uncovered_entries) == 2
+    assert {u["id"] for u in uncovered_entries} == {"LO3", "LO4"}
+    assert all(u["covered_scene_ids"] == [] for u in uncovered_entries)
+
+
+def test_revision_prompt_contains_exact_missing_ids_and_descriptions():
+    """Verify revision prompt includes exact missing objective IDs, full descriptions, and existing scene breakdown."""
+    analysis = _create_four_objective_analysis()
+    req = TrainingVideoRequest(topic="Phishing Defense", target_duration_seconds=60)
+
+    # Draft covering only LO1 and LO2
+    script = ScriptDraft(
+        title="Phishing Fundamentals",
+        audience="Enterprise Staff",
+        opening_hook="Can you reliably identify and report modern email threats?",
+        scenes=[
+            SceneDraft(
+                scene_id="scene_1",
+                order=1,
+                title="Domain Inspection",
+                purpose="Teach domain inspection",
+                scene_type="presenter",
+                narration=SAMPLE_SCENE_1_NARRATION,
+                visual_direction="Presenter reviewing spoofed email header.",
+                learning_objective_ids=["LO1"],
+                estimated_duration_seconds=30
+            ),
+            SceneDraft(
+                scene_id="scene_2",
+                order=2,
+                title="Incident Reporting",
+                purpose="Teach reporting protocol",
+                scene_type="explanation",
+                narration=SAMPLE_SCENE_2_NARRATION,
+                visual_direction="Screen recording of clicking Report button.",
+                learning_objective_ids=["LO2"],
+                estimated_duration_seconds=30
+            ),
+        ]
+    )
+
+    result = validate_script_draft(script, target_duration_seconds=60, analysis=analysis)
+    prompt = build_script_revision_prompt(req, analysis, script, result)
+
+    # 1. Exact missing IDs
+    assert "LO3" in prompt
+    assert "LO4" in prompt
+
+    # 2. Exact full descriptions
+    assert "Explain technical headers and SPF verification" in prompt
+    assert "Evaluate post-incident quarantine outcomes" in prompt
+
+    # 3. Existing scene breakdown and assigned objectives
+    assert "scene_1" in prompt
+    assert "Domain Inspection" in prompt
+    assert "scene_2" in prompt
+    assert "Incident Reporting" in prompt
+
+    # 4. Actionable remediation instruction
+    assert "TARGETED LEARNING OBJECTIVE REMEDIATION" in prompt
+    assert "Do NOT simply attach missing objective IDs to arbitrary scenes" in prompt
+
+
+def test_successful_revision_covering_all_four_objectives():
+    """Verify that a defective initial draft missing LO3 & LO4 successfully completes after targeted revision."""
+    analysis = _create_four_objective_analysis()
+
+    # Initial draft missing LO3 and LO4
+    initial_draft = ScriptDraft(
+        title="Phishing Fundamentals (Draft 1)",
+        audience="Enterprise Staff",
+        opening_hook="Can you reliably identify and report modern email threats?",
+        learning_objectives=analysis.learning_objectives,
+        scenes=[
+            SceneDraft(
+                scene_id="scene_1",
+                order=1,
+                title="Domain Inspection",
+                purpose="Teach domain inspection",
+                scene_type="presenter",
+                narration=SAMPLE_SCENE_1_NARRATION,
+                visual_direction="Visual 1",
+                learning_objective_ids=["LO1"],
+                estimated_duration_seconds=30
+            ),
+            SceneDraft(
+                scene_id="scene_2",
+                order=2,
+                title="Incident Reporting",
+                purpose="Teach reporting protocol",
+                scene_type="explanation",
+                narration=SAMPLE_SCENE_2_NARRATION,
+                visual_direction="Visual 2",
+                learning_objective_ids=["LO2"],
+                estimated_duration_seconds=30
+            ),
+        ],
+        total_estimated_duration_seconds=60
+    )
+
+    # Revised draft covering all four objectives (4 scenes * ~15s = ~60s)
+    revised_draft = ScriptDraft(
+        title="Phishing Fundamentals (Revised)",
+        audience="Enterprise Staff",
+        opening_hook="Can you reliably identify, report, and verify modern email threats?",
+        closing_summary="Vigilance and understanding technical verification protects our entire organization.",
+        learning_objectives=analysis.learning_objectives,
+        scenes=[
+            SceneDraft(
+                scene_id="scene_1",
+                order=1,
+                title="Spotting Indicators",
+                purpose="Domain inspection",
+                scene_type="presenter",
+                narration=SAMPLE_LO1_SHORT_NARRATION,
+                visual_direction="Close-up of spoofed header.",
+                on_screen_text="Check Sender Domain",
+                learning_objective_ids=["LO1"],
+                estimated_duration_seconds=15
+            ),
+            SceneDraft(
+                scene_id="scene_2",
+                order=2,
+                title="Reporting Protocol",
+                purpose="Reporting instruction",
+                scene_type="explanation",
+                narration=SAMPLE_LO2_SHORT_NARRATION,
+                visual_direction="Toolbar report button highlight.",
+                on_screen_text="Report Threat Promptly",
+                learning_objective_ids=["LO2"],
+                estimated_duration_seconds=15
+            ),
+            SceneDraft(
+                scene_id="scene_3",
+                order=3,
+                title="Technical Headers",
+                purpose="Header and SPF verification",
+                scene_type="visual_demo",
+                narration=SAMPLE_LO3_SHORT_NARRATION,
+                visual_direction="Diagram of SPF and DKIM authentication.",
+                on_screen_text="SPF / DKIM Verification",
+                learning_objective_ids=["LO3"],
+                estimated_duration_seconds=15
+            ),
+            SceneDraft(
+                scene_id="scene_4",
+                order=4,
+                title="Resolution & Quarantine",
+                purpose="Quarantine outcome evaluation",
+                scene_type="outro",
+                narration=SAMPLE_LO4_SHORT_NARRATION,
+                visual_direction="SOC dashboard showing quarantine and rule updates.",
+                on_screen_text="Quarantine & Protection",
+                learning_objective_ids=["LO4"],
+                estimated_duration_seconds=15
+            ),
+        ],
+        total_estimated_duration_seconds=60
+    )
+
+    mock_llm = MockLLMProvider(
+        analysis_fixture=analysis,
+        script_draft_fixture=initial_draft,
+        revised_script_fixture=revised_draft
+    )
+    app = create_script_workflow(llm_provider=mock_llm)
+
+    req = TrainingVideoRequest(topic="Phishing Defense", target_duration_seconds=60)
+    final_state = app.invoke(VideoScriptState(request=req, max_revisions=2))
+
+    assert final_state["workflow_status"] == "completed"
+    assert final_state["revision_count"] == 1
+    assert mock_llm.revise_script_call_count == 1
+    assert final_state["final_script"] is not None
+    assert final_state["final_script"].title == "Phishing Fundamentals (Revised)"
+    assert len(final_state["final_script"].scenes) == 4
+
+    # All 4 objectives represented in final script
+    covered_ids = set()
+    for s in final_state["final_script"].scenes:
+        covered_ids.update(s.learning_objective_ids)
+    assert covered_ids == {"LO1", "LO2", "LO3", "LO4"}
+
+
+def test_failed_revision_remains_in_needs_review():
+    """Verify that when a revision still leaves objectives uncovered and revision limit is reached, it marks needs_review."""
+    analysis = _create_four_objective_analysis()
+
+    # Initial draft missing LO3 and LO4
+    initial_draft = ScriptDraft(
+        title="Initial Draft",
+        audience="Staff",
+        opening_hook="Hook statement",
+        scenes=[
+            SceneDraft(
+                scene_id="scene_1",
+                order=1,
+                title="S1",
+                narration=SAMPLE_SCENE_1_NARRATION,
+                visual_direction="V1",
+                learning_objective_ids=["LO1"],
+                estimated_duration_seconds=30
+            ),
+            SceneDraft(
+                scene_id="scene_2",
+                order=2,
+                title="S2",
+                narration=SAMPLE_SCENE_2_NARRATION,
+                visual_direction="V2",
+                learning_objective_ids=["LO2"],
+                estimated_duration_seconds=30
+            ),
+        ]
+    )
+
+    # Incomplete revision: only fixes LO3, still forgets LO4
+    unresolved_revision = ScriptDraft(
+        title="Incomplete Revision",
+        audience="Staff",
+        opening_hook="Hook statement",
+        scenes=[
+            SceneDraft(
+                scene_id="scene_1",
+                order=1,
+                title="S1",
+                narration=SAMPLE_SCENE_1_NARRATION,
+                visual_direction="V1",
+                learning_objective_ids=["LO1", "LO2"],
+                estimated_duration_seconds=30
+            ),
+            SceneDraft(
+                scene_id="scene_2",
+                order=2,
+                title="S2",
+                narration=SAMPLE_SCENE_2_NARRATION,
+                visual_direction="V2",
+                learning_objective_ids=["LO3"],  # LO4 is still missing!
+                estimated_duration_seconds=30
+            ),
+        ]
+    )
+
+    mock_llm = MockLLMProvider(
+        analysis_fixture=analysis,
+        script_draft_fixture=initial_draft,
+        revised_script_fixture=unresolved_revision
+    )
+    app = create_script_workflow(llm_provider=mock_llm)
+
+    req = TrainingVideoRequest(topic="Unresolved Revision Test", target_duration_seconds=60)
+    final_state = app.invoke(VideoScriptState(request=req, max_revisions=1))
+
+    assert final_state["workflow_status"] == "needs_review"
+    assert final_state["revision_count"] == 1
+    assert final_state.get("final_script") is None
+    assert any("UNCOVERED_LEARNING_OBJECTIVE" in err for err in final_state["errors"])
+    assert any("LO4" in err for err in final_state["errors"])
+
+
+def test_multiple_objectives_legitimately_assigned_to_one_scene():
+    """Verify that multiple objectives assigned to a single scene pass deterministic validation."""
+    analysis = _create_four_objective_analysis()
+
+    # 2 scenes covering [LO1, LO2] and [LO3, LO4]
+    script = ScriptDraft(
+        title="Multi-Objective Script",
+        audience="Enterprise Staff",
+        opening_hook="Welcome to integrated threat identification and response.",
+        closing_summary="Comprehensive detection and verification ensures enterprise security.",
+        scenes=[
+            SceneDraft(
+                scene_id="scene_1",
+                order=1,
+                title="Detection and Reporting",
+                purpose="Cover domain inspection and immediate incident reporting",
+                scene_type="presenter",
+                narration=SAMPLE_SCENE_1_NARRATION,  # 71 words ~ 30s
+                visual_direction="Split screen of domain inspection and report button.",
+                learning_objective_ids=["LO1", "LO2"],
+                estimated_duration_seconds=30
+            ),
+            SceneDraft(
+                scene_id="scene_2",
+                order=2,
+                title="Verification and Resolution",
+                purpose="Cover cryptographic headers and incident resolution",
+                scene_type="explanation",
+                narration=SAMPLE_SCENE_2_NARRATION,  # 68 words ~ 29s
+                visual_direction="Diagram of SPF validation and quarantine log.",
+                learning_objective_ids=["LO3", "LO4"],
+                estimated_duration_seconds=30
+            ),
+        ],
+        total_estimated_duration_seconds=60
+    )
+
+    result = validate_script_draft(script, target_duration_seconds=60, analysis=analysis)
+
+    assert result.is_valid
+    assert not any(i.code == "UNCOVERED_LEARNING_OBJECTIVE" for i in result.issues)
+    assert not any(i.code == "UNKNOWN_OBJECTIVE_ID" for i in result.issues)
+    assert result.coverage_report["total_objectives"] == 4
+    assert result.coverage_report["covered_objectives"] == 4
+    assert result.coverage_report["uncovered_objectives"] == []
+
+
+def test_unknown_objective_ids_still_rejected():
+    """Verify that referencing unknown or hallucinated objective IDs fails validation."""
+    analysis = _create_four_objective_analysis()
+
+    script = ScriptDraft(
+        title="Unknown Objectives Test",
+        audience="Staff",
+        opening_hook="Hook statement",
+        scenes=[
+            SceneDraft(
+                scene_id="scene_1",
+                order=1,
+                title="S1",
+                narration=SAMPLE_SCENE_1_NARRATION,
+                visual_direction="V1",
+                learning_objective_ids=["LO1", "LO99", "HALLUCINATED_ID"],
+                estimated_duration_seconds=30
+            ),
+            SceneDraft(
+                scene_id="scene_2",
+                order=2,
+                title="S2",
+                narration=SAMPLE_SCENE_2_NARRATION,
+                visual_direction="V2",
+                learning_objective_ids=["LO2", "LO3", "LO4"],
+                estimated_duration_seconds=30
+            ),
+        ]
+    )
+
+    result = validate_script_draft(script, target_duration_seconds=60, analysis=analysis)
+
+    assert not result.is_valid
+    unknown_issues = [i for i in result.issues if i.code == "UNKNOWN_OBJECTIVE_ID"]
+    assert len(unknown_issues) == 2
+    messages = [i.message for i in unknown_issues]
+    assert any("LO99" in m for m in messages)
+    assert any("HALLUCINATED_ID" in m for m in messages)
+
+
+def test_mixed_duration_and_learning_objective_validation_failures():
+    """Verify script with both duration discrepancy and uncovered objectives is flagged and prompt addresses both."""
+    analysis = _create_four_objective_analysis()
+    req = TrainingVideoRequest(topic="Mixed Defect Test", target_duration_seconds=120)
+
+    # Only 14 words (~6s) for a 120s video, and only covers LO1
+    short_narration = "This brief scene covers only the introductory concept for our unit test validation."
+    script = ScriptDraft(
+        title="Short & Incomplete",
+        audience="Staff",
+        opening_hook="Quick hook",
+        scenes=[
+            SceneDraft(
+                scene_id="scene_1",
+                order=1,
+                title="Brief Scene",
+                narration=short_narration,
+                visual_direction="Brief visual",
+                learning_objective_ids=["LO1"],
+                estimated_duration_seconds=6
+            )
+        ]
+    )
+
+    result = validate_script_draft(script, target_duration_seconds=120, analysis=analysis)
+
+    assert not result.is_valid
+    codes = {i.code for i in result.issues}
+    assert "DURATION_OUT_OF_TOLERANCE" in codes
+    assert "UNCOVERED_LEARNING_OBJECTIVE" in codes
+
+    prompt = build_script_revision_prompt(req, analysis, script, result)
+
+    # Verifies duration expansion guidance is included
+    assert "DURATION GUIDANCE" in prompt
+    assert "TOO SHORT" in prompt
+
+    # Verifies missing objective remediation is included
+    assert "TARGETED LEARNING OBJECTIVE REMEDIATION" in prompt
+    assert "LO2" in prompt
+    assert "LO3" in prompt
+    assert "LO4" in prompt
+    assert "Apply organizational incident reporting protocols" in prompt
+    assert "Explain technical headers and SPF verification" in prompt
+    assert "Evaluate post-incident quarantine outcomes" in prompt
+
+
+def test_final_script_preserves_every_objective_from_content_analysis():
+    """Verify final script preserves every objective from ContentAnalysis even if ScriptDraft returned an incomplete list."""
+    analysis = _create_four_objective_analysis()
+
+    # Draft with incomplete learning_objectives list (LLM returned only LO1)
+    draft_with_incomplete_lo = ScriptDraft(
+        title="Complete Scenes Incomplete LO List",
+        audience="Staff",
+        opening_hook="Hook statement",
+        closing_summary="Summary statement",
+        learning_objectives=[
+            LearningObjective(id="LO1", description="Identify deceptive phishing indicators in email domains")
+        ],  # Only 1 of 4 objectives in draft field!
+        scenes=[
+            SceneDraft(scene_id="s1", order=1, title="S1", narration=SAMPLE_LO1_SHORT_NARRATION, visual_direction="V1", learning_objective_ids=["LO1"], estimated_duration_seconds=15),
+            SceneDraft(scene_id="s2", order=2, title="S2", narration=SAMPLE_LO2_SHORT_NARRATION, visual_direction="V2", learning_objective_ids=["LO2"], estimated_duration_seconds=15),
+            SceneDraft(scene_id="s3", order=3, title="S3", narration=SAMPLE_LO3_SHORT_NARRATION, visual_direction="V3", learning_objective_ids=["LO3"], estimated_duration_seconds=15),
+            SceneDraft(scene_id="s4", order=4, title="S4", narration=SAMPLE_LO4_SHORT_NARRATION, visual_direction="V4", learning_objective_ids=["LO4"], estimated_duration_seconds=15),
+        ],
+        total_estimated_duration_seconds=60
+    )
+
+    req = TrainingVideoRequest(topic="Canonical LO Test", target_duration_seconds=60)
+    mock_llm = MockLLMProvider()
+    nodes = ScriptWorkflowNodes(llm_provider=mock_llm)
+
+    state = VideoScriptState(
+        request=req,
+        analysis=analysis,
+        draft_script=draft_with_incomplete_lo,
+        revision_count=0
+    )
+
+    res = nodes.finalize_script(state)
+    assert res["workflow_status"] == "completed"
+    final: FinalScript = res["final_script"]
+    assert final is not None
+
+    # Canonical learning objectives must all be present
+    assert len(final.learning_objectives) == 4
+    final_ids = [lo.id for lo in final.learning_objectives]
+    assert final_ids == ["LO1", "LO2", "LO3", "LO4"]
+    assert final.learning_objectives[2].description == "Explain technical headers and SPF verification"
+    assert final.learning_objectives[3].description == "Evaluate post-incident quarantine outcomes"
+
+
+def test_coverage_diagnostics_structure_and_reusability():
+    """Verify assess_learning_objective_coverage produces deterministic structured report and get_scene_objective_map works."""
+    analysis = _create_four_objective_analysis()
+
+    # Script covering LO1 and LO3
+    script = ScriptDraft(
+        title="Coverage Diagnostics Test",
+        audience="Staff",
+        opening_hook="Hook",
+        scenes=[
+            SceneDraft(scene_id="scene_1", order=1, title="S1", narration=SAMPLE_LO1_SHORT_NARRATION, visual_direction="V1", learning_objective_ids=["LO1"], estimated_duration_seconds=15),
+            SceneDraft(scene_id="scene_2", order=2, title="S2", narration=SAMPLE_LO3_SHORT_NARRATION, visual_direction="V2", learning_objective_ids=["LO3"], estimated_duration_seconds=15),
+        ]
+    )
+
+    report = assess_learning_objective_coverage(script, analysis)
+
+    assert report["total_objectives"] == 4
+    assert report["covered_objectives"] == 2
+    assert len(report["uncovered_objectives"]) == 2
+
+    uncovered_ids = [u["id"] for u in report["uncovered_objectives"]]
+    assert uncovered_ids == ["LO2", "LO4"]
+    assert all("covered_scene_ids" in u for u in report["uncovered_objectives"])
+
+    # Empty analysis returns clean empty report
+    empty_report = assess_learning_objective_coverage(script, None)
+    assert empty_report["total_objectives"] == 0
+    assert empty_report["covered_objectives"] == 0
+    assert empty_report["uncovered_objectives"] == []
+
+    # Scene objective map
+    scene_map = get_scene_objective_map(script)
+    assert len(scene_map) == 2
+    assert scene_map[0]["scene_id"] == "scene_1"
+    assert scene_map[0]["learning_objective_ids"] == ["LO1"]
+
+
+def test_workflow_bounded_recovery_strategy_with_configurable_max_revisions():
+    """Verify bounded recovery strategy where workflow recovers on second revision when max_revisions=2."""
+    analysis = _create_four_objective_analysis()
+
+    # Initial draft: covers only LO1
+    draft_0 = ScriptDraft(
+        title="Draft 0",
+        audience="Staff",
+        opening_hook="Hook",
+        scenes=[
+            SceneDraft(scene_id="s1", order=1, title="S1", narration=SAMPLE_SCENE_1_NARRATION, visual_direction="V1", learning_objective_ids=["LO1"], estimated_duration_seconds=30),
+            SceneDraft(scene_id="s2", order=2, title="S2", narration=SAMPLE_SCENE_2_NARRATION, visual_direction="V2", learning_objective_ids=[], estimated_duration_seconds=30),
+        ]
+    )
+
+    # Revision 1: fixes LO2 and LO3, but still misses LO4
+    draft_rev_1 = ScriptDraft(
+        title="Draft Rev 1",
+        audience="Staff",
+        opening_hook="Hook",
+        scenes=[
+            SceneDraft(scene_id="s1", order=1, title="S1", narration=SAMPLE_SCENE_1_NARRATION, visual_direction="V1", learning_objective_ids=["LO1", "LO2"], estimated_duration_seconds=30),
+            SceneDraft(scene_id="s2", order=2, title="S2", narration=SAMPLE_SCENE_2_NARRATION, visual_direction="V2", learning_objective_ids=["LO3"], estimated_duration_seconds=30),
+        ]
+    )
+
+    # Revision 2: fixes LO4, all 4 objectives now covered
+    draft_rev_2 = ScriptDraft(
+        title="Draft Rev 2 - Finalized",
+        audience="Staff",
+        opening_hook="Hook",
+        closing_summary="Summary",
+        scenes=[
+            SceneDraft(scene_id="s1", order=1, title="S1", narration=SAMPLE_LO1_SHORT_NARRATION, visual_direction="V1", learning_objective_ids=["LO1"], estimated_duration_seconds=15),
+            SceneDraft(scene_id="s2", order=2, title="S2", narration=SAMPLE_LO2_SHORT_NARRATION, visual_direction="V2", learning_objective_ids=["LO2"], estimated_duration_seconds=15),
+            SceneDraft(scene_id="s3", order=3, title="S3", narration=SAMPLE_LO3_SHORT_NARRATION, visual_direction="V3", learning_objective_ids=["LO3"], estimated_duration_seconds=15),
+            SceneDraft(scene_id="s4", order=4, title="S4", narration=SAMPLE_LO4_SHORT_NARRATION, visual_direction="V4", learning_objective_ids=["LO4"], estimated_duration_seconds=15),
+        ],
+        total_estimated_duration_seconds=60
+    )
+
+    mock_llm = MockLLMProvider(
+        analysis_fixture=analysis,
+        script_draft_fixture=draft_0,
+        revision_fixtures=[draft_rev_1, draft_rev_2]
+    )
+    app = create_script_workflow(llm_provider=mock_llm)
+
+    req = TrainingVideoRequest(topic="Multi-Revision Recovery", target_duration_seconds=60)
+    final_state = app.invoke(VideoScriptState(request=req, max_revisions=2))
+
+    assert final_state["workflow_status"] == "completed"
+    assert final_state["revision_count"] == 2
+    assert final_state["final_script"] is not None
+    assert final_state["final_script"].title == "Draft Rev 2 - Finalized"
+
+
+def test_arbitrary_number_of_learning_objectives_five_objectives():
+    """Verify workflow and validation seamlessly support arbitrary numbers of objectives (e.g. 5 objectives)."""
+    analysis = ContentAnalysis(
+        topic_summary="Advanced Network Security",
+        key_concepts=["C1", "C2", "C3", "C4", "C5"],
+        learning_objectives=[
+            LearningObjective(id="LO1", description="Understand perimeter firewalls"),
+            LearningObjective(id="LO2", description="Configure zero-trust policies"),
+            LearningObjective(id="LO3", description="Inspect encrypted egress traffic"),
+            LearningObjective(id="LO4", description="Mitigate DNS tunneling"),
+            LearningObjective(id="LO5", description="Audit access anomalies"),
+        ],
+        audience_notes="Network engineers",
+        recommended_scene_count=5,
+        recommended_structure=["P1", "P2", "P3", "P4", "P5"],
+        important_terms=["Zero Trust", "DNS Tunneling"]
+    )
+
+    script = ScriptDraft(
+        title="Zero Trust Architecture",
+        audience="Network Engineers",
+        opening_hook="Can your perimeter withstand modern stealth threats?",
+        closing_summary="Zero trust ensures resilient defenses.",
+        scenes=[
+            SceneDraft(scene_id="s1", order=1, title="S1", narration=SAMPLE_LO1_SHORT_NARRATION, visual_direction="V1", learning_objective_ids=["LO1", "LO2"], estimated_duration_seconds=15),
+            SceneDraft(scene_id="s2", order=2, title="S2", narration=SAMPLE_LO2_SHORT_NARRATION, visual_direction="V2", learning_objective_ids=["LO3"], estimated_duration_seconds=15),
+            SceneDraft(scene_id="s3", order=3, title="S3", narration=SAMPLE_LO3_SHORT_NARRATION, visual_direction="V3", learning_objective_ids=["LO4"], estimated_duration_seconds=15),
+            SceneDraft(scene_id="s4", order=4, title="S4", narration=SAMPLE_LO4_SHORT_NARRATION, visual_direction="V4", learning_objective_ids=["LO5"], estimated_duration_seconds=15),
+        ],
+        total_estimated_duration_seconds=60
+    )
+
+    result = validate_script_draft(script, target_duration_seconds=60, analysis=analysis)
+    assert result.is_valid
+    assert result.coverage_report["total_objectives"] == 5
+    assert result.coverage_report["covered_objectives"] == 5
+    assert result.coverage_report["uncovered_objectives"] == []

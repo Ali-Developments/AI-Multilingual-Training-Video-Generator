@@ -33,10 +33,12 @@ def test_no_hardcoded_model_in_groq_provider_source():
     assert "gemma" not in source_code
 
 
-def test_default_model_is_openai_gpt_oss_20b():
+def test_default_model_is_openai_gpt_oss_20b(monkeypatch):
     """Verify default configured model for GroqProvider is openai/gpt-oss-20b."""
-    provider = GroqProvider(api_key="mock-key")
-    assert provider.model_name == "openai/gpt-oss-20b"
+    monkeypatch.delenv("GROQ_MODEL", raising=False)
+    with patch("app.services.llm.groq_provider.settings", Settings(_env_file=None)):
+        provider = GroqProvider(api_key="mock-key")
+        assert provider.model_name == "openai/gpt-oss-20b"
 
 
 def test_provider_switches_to_alternate_model_via_configuration(monkeypatch):

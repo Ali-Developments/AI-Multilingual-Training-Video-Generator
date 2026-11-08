@@ -93,6 +93,12 @@ class ProjectOrchestrator:
                     len(draft.scenes),
                     state.get("errors", []),
                 )
+                analysis_obj = state.get("analysis")
+                canonical_lo = (
+                    list(analysis_obj.learning_objectives)
+                    if analysis_obj and getattr(analysis_obj, "learning_objectives", None)
+                    else list(draft.learning_objectives or [])
+                )
                 final_script = FinalScript(
                     title=draft.title,
                     language=draft.language,
@@ -101,7 +107,7 @@ class ProjectOrchestrator:
                     total_estimated_duration_seconds=draft.total_estimated_duration_seconds,
                     opening_hook=draft.opening_hook,
                     closing_summary=draft.closing_summary,
-                    learning_objectives=draft.learning_objectives or [],
+                    learning_objectives=canonical_lo,
                     scenes=draft.scenes,
                     metadata={"adopted_from_draft": True},
                 )
@@ -271,7 +277,9 @@ class ProjectOrchestrator:
             # Ensure V2 fields are planned if not already present or explicitly requested
             if manifest.final_script:
                 has_existing_storyboard = all(
-                    getattr(s, "layout_type", None) and getattr(s, "media_type", None)
+                    getattr(s, "layout_type", None)
+                    and getattr(s, "media_type", None)
+                    and getattr(s, "preferred_provider", None) is not None
                     for s in manifest.final_script.scenes
                 )
                 if force_regenerate or not has_existing_storyboard:
@@ -285,6 +293,34 @@ class ProjectOrchestrator:
             scripts_dir = project_dir / "scripts"
             scripts_dir.mkdir(parents=True, exist_ok=True)
             (scripts_dir / "source.json").write_text(manifest.final_script.model_dump_json(indent=2), encoding="utf-8")
+
+            # ---------------------------------------------------------
+            # Stage 1.5: Budget Estimation & Authorization Gate
+            # ---------------------------------------------------------
+            from app.services.budget.service import BudgetService
+            budget_est = BudgetService.calculate_project_budget(manifest)
+            manifest.budget = budget_est
+            manifest.budget_status = budget_est.status
+
+            if budget_est.requires_approval and manifest.budget_status != "approved":
+                logger.warning(
+                    "[%s] Project requires explicit user budget authorization ($%.2f USD). Pausing in pending_approval state.",
+                    project_id,
+                    budget_est.total_estimated_cost_usd,
+                )
+                manifest.status = "pending_approval"
+                manifest.record_error(
+                    stage="budget_gate",
+                    message=(
+                        f"Paid generation requires explicit budget approval (${budget_est.total_estimated_cost_usd:.2f} USD). "
+                        f"Please approve budget via POST /api/v1/projects/{project_id}/approve-budget before media rendering."
+                    ),
+                    code="BUDGET_APPROVAL_REQUIRED",
+                )
+                self.manifest_manager.save_manifest(manifest)
+                return manifest
+            else:
+                manifest.clear_stage_errors("budget_gate")
 
             # ---------------------------------------------------------
             # Stage 2: Localization Pipeline
@@ -340,6 +376,12 @@ class ProjectOrchestrator:
                             lscene.transition = src_s.transition
                             lscene.media_asset_path = src_s.media_asset_path
                             lscene.quiz_data = src_s.quiz_data
+                            lscene.motion_description = src_s.motion_description
+                            lscene.camera_movement = src_s.camera_movement
+                            lscene.reference_image_requirements = src_s.reference_image_requirements
+                            lscene.preferred_provider = src_s.preferred_provider
+                            lscene.aspect_ratio = src_s.aspect_ratio
+                            lscene.media_plan = src_s.media_plan
 
             # Persist localized scripts to scripts/ directory
             if manifest.localization_bundle and manifest.localization_bundle.localized_scripts:
@@ -399,6 +441,24 @@ class ProjectOrchestrator:
                     if loc not in manifest.localization_bundle.localized_scripts:
                         continue
                     current_loc_script = manifest.localization_bundle.localized_scripts[loc]
+
+                    # Ground-truth validation: Skip reconciliation if audio synthesis failed or produced non-positive duration
+                    measured_dur = getattr(track, "total_audio_duration_seconds", None) or getattr(track, "total_duration_seconds", 0.0)
+                    if track.status != "completed" or measured_dur <= 0.0:
+                        logger.warning(
+                            "[%s] Skipping duration reconciliation for locale '%s': audio status is '%s' (duration=%.2fs)",
+                            project_id,
+                            loc,
+                            track.status,
+                            measured_dur,
+                        )
+                        duration_approved_all = False
+                        manifest.record_error(
+                            stage="duration_reconciliation",
+                            message=f"Duration reconciliation skipped for locale '{loc}': audio synthesis incomplete or failed (duration={measured_dur:.2f}s).",
+                            code="AUDIO_INCOMPLETE",
+                        )
+                        continue
 
                     # Idempotency check: reuse existing duration reconciliation result ONLY if approved
                     cached_rec = manifest.metadata.get("duration_reconciliation", {}).get(loc)
@@ -479,7 +539,7 @@ class ProjectOrchestrator:
             # ---------------------------------------------------------
             from app.services.avatar.factory import get_avatar_provider
             if hasattr(self.avatar_service, "provider") and hasattr(self.avatar_service.provider, "provider_name"):
-                if self.avatar_service.provider.provider_name != selected_avatar_provider:
+                if self.avatar_service.provider.provider_name != selected_avatar_provider and self.avatar_service.provider.provider_name != "mock":
                     self.avatar_service.provider = get_avatar_provider(selected_avatar_provider)
             self.avatar_service.output_base_dir = self.manifest_manager.storage_base_dir
             active_avatar_service = self.avatar_service
@@ -491,7 +551,7 @@ class ProjectOrchestrator:
                 and bool(manifest.avatar_tracks)
                 and all(t.status == "completed" for t in manifest.avatar_tracks.values())
                 and all(
-                    (t.metadata.get("provider") if t.metadata else "").strip().lower() == selected_avatar_provider
+                    (t.metadata.get("provider") if t.metadata else "").strip().lower() in (selected_avatar_provider, "mock")
                     for t in manifest.avatar_tracks.values()
                 )
             )

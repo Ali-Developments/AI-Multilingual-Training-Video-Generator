@@ -2,11 +2,13 @@
 
 from pathlib import Path
 from typing import Optional, Dict
+from app.core.config import settings
 from app.core.logging import logger
 from app.models.schemas import LocalizedScene
 from app.services.media.base import SceneMediaProvider
 from app.services.media.motion_visual_provider import LocalMotionVisualProvider
 from app.services.media.uploaded_media_provider import UploadedMediaProvider
+from app.services.media.factory import get_media_provider
 
 
 class SceneMediaService:
@@ -47,7 +49,25 @@ class SceneMediaService:
                 custom_media_path=custom_path,
             )
 
-        # 2. Default to cinematic local motion visual
+        # 2. Check if Veo AI Video was explicitly requested for this scene or globally
+        media_type = getattr(scene, "media_type", None)
+        mt_str = str(getattr(media_type, "value", media_type) or "").lower()
+        pref_prov = str(getattr(scene, "preferred_provider", "") or "").lower()
+        default_prov = str(getattr(settings, "DEFAULT_MEDIA_PROVIDER", "motion_visual") or "").lower()
+
+        if mt_str in ("veo", "ai_video") or pref_prov == "veo" or default_prov == "veo":
+            logger.info("Dispatching scene '%s' to Google Veo video provider.", scene.scene_id)
+            veo_provider = get_media_provider("veo")
+            return veo_provider.generate_scene_media(
+                scene=scene,
+                locale=locale,
+                output_dir=output_dir,
+                duration_seconds=duration_seconds,
+                background_image_path=background_image_path,
+                custom_media_path=custom_path,
+            )
+
+        # 3. Default to cinematic local motion visual
         return self.motion_provider.generate_scene_media(
             scene=scene,
             locale=locale,

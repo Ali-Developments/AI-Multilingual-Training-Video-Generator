@@ -33,7 +33,13 @@ def is_avatar_eligible(scene: Union[SceneDraft, LocalizedScene]) -> bool:
     """
     if getattr(scene, "avatar_enabled", True) is False:
         return False
-        
+
+    layout_type = getattr(scene, "layout_type", None)
+    if layout_type is not None:
+        lt = str(layout_type.value if hasattr(layout_type, "value") else layout_type).strip().lower()
+        if lt in ("presenter_split", "presenter_overlay", "presenter_full", "pip"):
+            return True
+
     media_type = getattr(scene, "media_type", None)
     if media_type is not None:
         mt = str(media_type.value if hasattr(media_type, "value") else media_type).strip().lower()
@@ -60,11 +66,16 @@ class AvatarProvider(ABC):
         self,
         scene_id: str,
         locale: str,
-        audio_path: Path,
+        audio_path: Optional[Path] = None,
         avatar_id: Optional[str] = None,
+        script_text: Optional[str] = None,
+        voice_id: Optional[str] = None,
+        mode: Optional[str] = None,
+        project_id: Optional[str] = None,
+        **kwargs: Any,
     ) -> str:
         """
-        Submit an avatar video generation task driven by scene audio.
+        Submit an avatar video generation task driven by scene audio or script.
         
         Returns:
             job_id: Unique task identifier.
@@ -91,16 +102,20 @@ class AvatarProvider(ABC):
         self,
         scene_id: str,
         locale: str,
-        audio_path: Path,
+        audio_path: Optional[Path],
         destination_path: Path,
         avatar_id: Optional[str] = None,
         poll_interval: Optional[float] = None,
         timeout_seconds: Optional[int] = None,
         force_regenerate: bool = False,
+        script_text: Optional[str] = None,
+        voice_id: Optional[str] = None,
+        mode: Optional[str] = None,
+        project_id: Optional[str] = None,
     ) -> AvatarVideoAsset:
         """
         Template method orchestrating full avatar video creation:
-        submit -> poll -> retrieve -> probe duration.
+        submit -> poll -> retrieve -> technical validation -> duration probe.
         Persists job_id immediately after submission to enable safe resume without duplicate paid calls.
         """
         avatar_name = avatar_id or settings.HEYGEN_DEFAULT_AVATAR_ID
@@ -131,14 +146,18 @@ class AvatarProvider(ABC):
 
         if not job_id:
             logger.info(
-                "Submitting avatar job for scene '%s' (%s, avatar=%s)",
-                scene_id, locale, avatar_name
+                "Submitting avatar job for scene '%s' (%s, avatar=%s, mode=%s)",
+                scene_id, locale, avatar_name, mode or "audio"
             )
             job_id = self.submit_avatar_job(
                 scene_id=scene_id,
                 locale=locale,
                 audio_path=audio_path,
                 avatar_id=avatar_name,
+                script_text=script_text,
+                voice_id=voice_id,
+                mode=mode,
+                project_id=project_id,
             )
             try:
                 job_data = {
@@ -147,6 +166,7 @@ class AvatarProvider(ABC):
                     "locale": locale,
                     "avatar_id": avatar_name,
                     "provider": self.provider_name,
+                    "mode": mode or "audio",
                     "submitted_at": time.time(),
                     "status": "processing",
                 }
@@ -172,13 +192,29 @@ class AvatarProvider(ABC):
                 
                 final_path = self.download_avatar_video(video_url, destination_path)
                 
+                # Perform technical validation with ffprobe
                 try:
-                    dur = get_audio_duration(final_path)
-                except Exception:
+                    from app.services.composition.ffmpeg_utils import validate_video_file, get_video_duration
+                    probe_meta = validate_video_file(
+                        final_path,
+                        min_duration=0.5,
+                        require_video=True,
+                        require_audio=False,
+                    )
+                    dur = probe_meta["duration"]
+                    logger.info(
+                        "Technical validation passed for avatar '%s': %dx%d, %.2fs, codec=%s",
+                        scene_id, probe_meta["width"], probe_meta["height"], dur, probe_meta["video_codec"]
+                    )
+                except Exception as ex:
+                    logger.warning("ffprobe stream validation fallback: %s", ex)
                     try:
-                        dur = get_audio_duration(audio_path)
+                        dur = get_video_duration(final_path)
                     except Exception:
-                        dur = 0.0
+                        try:
+                            dur = get_audio_duration(audio_path) if audio_path else 0.0
+                        except Exception:
+                            dur = 0.0
 
                 try:
                     if job_file.exists():

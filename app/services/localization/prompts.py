@@ -271,6 +271,7 @@ def build_post_tts_duration_revision_prompt(
     excess_seconds = measured_total_seconds - target_duration_seconds
     compression_ratio = target_duration_seconds / measured_total_seconds if measured_total_seconds > 0 else 1.0
     reduction_pct = round((1.0 - compression_ratio) * 100, 1)
+    overrun_pct = round((excess_seconds / target_duration_seconds) * 100, 1) if target_duration_seconds > 0 else 0.0
 
     scene_breakdown = []
     # Identify scenes contributing most to excess
@@ -320,7 +321,7 @@ def build_post_tts_duration_revision_prompt(
 CRITICAL DURATION OVERRUN DETECTED:
 - Client Target Duration: {target_duration_seconds:.1f} seconds
 - Real Measured Audio Duration: {measured_total_seconds:.2f} seconds
-- Net Excess Duration: +{excess_seconds:.2f} seconds ({round((excess_seconds / target_duration_seconds) * 100, 1)}% over target)
+- Net Excess Duration: +{excess_seconds:.2f} seconds ({overrun_pct}% over target)
 - Required Text Compression Ratio: ~{compression_ratio:.2f} (approx. {reduction_pct}% reduction in spoken words)
 
 SCENE TIMING BREAKDOWN (MEASURED TTS WAVEFORM):

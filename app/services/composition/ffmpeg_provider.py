@@ -48,6 +48,16 @@ class FFmpegCompositionProvider(CompositionProvider):
         if not audio_path.exists():
             raise FileNotFoundError(f"Required audio asset not found: {audio_path}")
 
+        if duration_seconds <= 0.0:
+            try:
+                from app.services.tts.audio_probe import get_audio_duration
+                duration_seconds = get_audio_duration(audio_path)
+            except Exception:
+                pass
+            if duration_seconds <= 0.0:
+                logger.warning("Scene '%s' has non-positive duration_seconds (%.2f); using safe fallback 1.0s.", scene_id, duration_seconds)
+                duration_seconds = 1.0
+
         output_path.parent.mkdir(parents=True, exist_ok=True)
         has_avatar = bool(avatar_video_path and avatar_video_path.exists() and avatar_video_path.stat().st_size > 0)
         has_motion = bool(motion_video_path and motion_video_path.exists() and motion_video_path.stat().st_size > 0)
@@ -115,25 +125,28 @@ class FFmpegCompositionProvider(CompositionProvider):
                 base_cmd = [settings.FFMPEG_BINARY_PATH, "-y", "-i", str(avatar_video_path.resolve())]
                 if media_is_loop:
                     base_cmd.extend(["-loop", "1"])
+                else:
+                    base_cmd.extend(["-stream_loop", "-1"])
                 base_cmd.extend(["-i", media_input, "-i", str(audio_path.resolve())])
 
-                # Build filter complex
-                av_filter = "[0:v]scale=806:806:force_original_aspect_ratio=decrease,pad=806:1080:(ow-iw)/2:(oh-ih)/2:color=0x090D1A,setsar=1[av];"
+                # Build filter complex with full-bleed presenter framing (no black bars)
+                av_filter = "[0:v]scale=806:1080:force_original_aspect_ratio=increase,crop=806:1080,setsar=1[av];"
                 med_filter = "[1:v]scale=1114:1080:force_original_aspect_ratio=increase,crop=1114:1080,setsar=1[med];"
                 if pos == "left":
-                    stack_filter = f"{av_filter}{med_filter}[av][med]hstack=inputs=2[stacked];[stacked]drawbox=x=805:y=0:w=3:h=1080:color=0x00E5FF@0.6:t=fill[composed]"
+                    stack_filter = f"{av_filter}{med_filter}[av][med]hstack=inputs=2[stacked];[stacked]drawbox=x=805:y=0:w=3:h=1080:color=0x00E5FF@0.7:t=fill[composed]"
                 else:  # right (default for RTL & modern studio)
-                    stack_filter = f"{av_filter}{med_filter}[med][av]hstack=inputs=2[stacked];[stacked]drawbox=x=1112:y=0:w=3:h=1080:color=0x00E5FF@0.6:t=fill[composed]"
+                    stack_filter = f"{av_filter}{med_filter}[med][av]hstack=inputs=2[stacked];[stacked]drawbox=x=1112:y=0:w=3:h=1080:color=0x00E5FF@0.7:t=fill[composed]"
 
-                final_split_filter = f"{stack_filter};[composed]{sub_filter}" if sub_filter else stack_filter
+                final_split_filter = f"{stack_filter};[composed]{sub_filter}[sub_out]" if sub_filter else stack_filter
+                out_map = "[sub_out]" if sub_filter else "[composed]"
 
                 cmd_split = base_cmd + [
                     "-filter_complex", final_split_filter,
+                    "-map", out_map,
                     "-map", "2:a:0",
                     "-c:v", settings.VIDEO_CODEC,
                     *audio_encoding_args,
                     "-pix_fmt", "yuv420p",
-                    "-shortest",
                     "-t", str(duration_seconds),
                     str(output_path.resolve()),
                 ]
@@ -141,20 +154,37 @@ class FFmpegCompositionProvider(CompositionProvider):
                 if _execute_ffmpeg(cmd_split):
                     sub_burned = bool(sub_filter)
                 else:
-                    logger.warning("Presenter split composition failed, falling back to centered presenter")
-                    layout = "presenter_full"
+                    logger.warning("Presenter split with subtitles failed; retrying unburned")
+                    cmd_split_no_sub = base_cmd + [
+                        "-filter_complex", stack_filter,
+                        "-map", "[composed]",
+                        "-map", "2:a:0",
+                        "-c:v", settings.VIDEO_CODEC,
+                        *audio_encoding_args,
+                        "-pix_fmt", "yuv420p",
+                        "-t", str(duration_seconds),
+                        str(output_path.resolve()),
+                    ]
+                    if _execute_ffmpeg(cmd_split_no_sub):
+                        sub_burned = False
+                    else:
+                        logger.warning("Presenter split composition failed, falling back to centered presenter")
+                        layout = "presenter_full"
             else:
                 layout = "presenter_full"
 
             if layout in ("presenter_full", "pip", "presenter_overlay") and not sub_burned:
                 # Presenter Full or Centered
-                logger.info("Composing presenter_full scene '%s' for locale '%s'", scene_id, locale)
-                # Frame presenter sharply at 960x960 centered on dark background (#090D1A) with bottom subtitle zone
-                full_av_filter = (
-                    f"scale=960:960:force_original_aspect_ratio=decrease,"
-                    f"pad={settings.VIDEO_WIDTH}:{settings.VIDEO_HEIGHT}:(ow-iw)/2:(oh-ih)/2-30:color=0x090D1A,setsar=1"
-                )
-                combined_filter = f"{full_av_filter},{sub_filter}" if sub_filter else full_av_filter
+                logger.info("Composing broadcast presenter_full scene '%s' for locale '%s'", scene_id, locale)
+                # Dual-layer broadcast framing:
+                # Layer 1 (Background): ambient blurred office background filled edge-to-edge (1920x1080)
+                # Layer 2 (Foreground): crisp centered 1080p presenter
+                bg_filter = "[0:v]split=2[fg][bg];[bg]scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,boxblur=25:25,eq=brightness=-0.15[bg_blur];"
+                fg_filter = "[fg]scale=1080:1080:force_original_aspect_ratio=decrease[fg_scaled];"
+                layer_filter = f"{bg_filter}{fg_filter}[bg_blur][fg_scaled]overlay=420:0[composed]"
+                combined_filter = f"{layer_filter};[composed]{sub_filter}[sub_out]" if sub_filter else layer_filter
+                out_map = "[sub_out]" if sub_filter else "[composed]"
+
                 base_cmd = [
                     settings.FFMPEG_BINARY_PATH,
                     "-y",
@@ -162,8 +192,8 @@ class FFmpegCompositionProvider(CompositionProvider):
                     "-i", str(audio_path.resolve()),
                 ]
                 cmd_full = base_cmd + [
-                    "-vf", combined_filter,
-                    "-map", "0:v:0",
+                    "-filter_complex", combined_filter,
+                    "-map", out_map,
                     "-map", "1:a:0",
                     "-c:v", settings.VIDEO_CODEC,
                     *audio_encoding_args,
@@ -176,8 +206,8 @@ class FFmpegCompositionProvider(CompositionProvider):
                 else:
                     # Fallback unburned
                     cmd_no_sub = base_cmd + [
-                        "-vf", full_av_filter,
-                        "-map", "0:v:0",
+                        "-filter_complex", layer_filter,
+                        "-map", "[composed]",
                         "-map", "1:a:0",
                         "-c:v", settings.VIDEO_CODEC,
                         *audio_encoding_args,
@@ -197,6 +227,8 @@ class FFmpegCompositionProvider(CompositionProvider):
             base_cmd = [settings.FFMPEG_BINARY_PATH, "-y"]
             if not has_motion:
                 base_cmd.extend(["-loop", "1"])
+            else:
+                base_cmd.extend(["-stream_loop", "-1"])
             base_cmd.extend(["-i", media_src, "-i", str(audio_path.resolve())])
 
             cmd_media = base_cmd + [
@@ -206,7 +238,6 @@ class FFmpegCompositionProvider(CompositionProvider):
                 "-c:v", settings.VIDEO_CODEC,
                 *audio_encoding_args,
                 "-pix_fmt", "yuv420p",
-                "-shortest",
                 "-t", str(duration_seconds),
                 str(output_path.resolve()),
             ]
@@ -221,7 +252,6 @@ class FFmpegCompositionProvider(CompositionProvider):
                     "-c:v", settings.VIDEO_CODEC,
                     *audio_encoding_args,
                     "-pix_fmt", "yuv420p",
-                    "-shortest",
                     "-t", str(duration_seconds),
                     str(output_path.resolve()),
                 ]
@@ -229,6 +259,14 @@ class FFmpegCompositionProvider(CompositionProvider):
                     raise RuntimeError(f"FFmpeg composition failed for visual scene '{scene_id}'")
 
         measured_dur = get_video_duration(output_path) or duration_seconds
+
+        # Technical validation with ffprobe
+        from app.services.composition.ffmpeg_utils import validate_video_file
+        try:
+            validate_video_file(output_path, min_duration=0.1, require_video=True, require_audio=True)
+        except Exception as ex:
+            logger.error("Composed scene '%s' failed technical validation: %s", scene_id, ex)
+            raise
 
         return SceneCompositionAsset(
             scene_id=scene_id,
@@ -311,6 +349,14 @@ class FFmpegCompositionProvider(CompositionProvider):
             manifest_path.unlink(missing_ok=True)
         except Exception:
             pass
+
+        # Technical validation of final concatenated video with ffprobe
+        from app.services.composition.ffmpeg_utils import validate_video_file
+        try:
+            validate_video_file(output_path, min_duration=0.5, require_video=True, require_audio=True)
+        except Exception as ex:
+            logger.error("Final concatenated video '%s' failed technical validation: %s", output_path, ex)
+            raise
 
         return FinalVideoAsset(
             locale=locale,
