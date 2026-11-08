@@ -1,7 +1,7 @@
 """Abstract base class defining the LLM provider interface."""
 
 from abc import ABC, abstractmethod
-from typing import Type, TypeVar, Optional, List
+from typing import Type, TypeVar, Optional, List, Any
 from pydantic import BaseModel
 from app.models.schemas import ScriptDraft
 from app.services.llm.prompts import (
@@ -38,7 +38,8 @@ class LLMProvider(ABC):
         prompt: str,
         schema: Type[T],
         system_prompt: Optional[str] = None,
-        temperature: float = 0.2
+        temperature: float = 0.2,
+        **kwargs: Any,
     ) -> T:
         """Generate a validated Pydantic model response from an LLM prompt."""
         pass

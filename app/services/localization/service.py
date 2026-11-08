@@ -1,6 +1,7 @@
 """Production-grade localization service and multi-locale bundle orchestrator."""
 
-from typing import List, Optional, Tuple, Dict, Any
+import time
+from typing import List, Optional, Tuple, Dict, Any, Type
 from app.core.config import settings
 from app.core.logging import logger
 from app.models.schemas import (
@@ -24,13 +25,16 @@ from app.services.localization.locale_utils import (
 from app.services.localization.prompts import (
     SYSTEM_PROMPT_LOCALIZER,
     SYSTEM_PROMPT_LOCALIZATION_REVISER,
+    SYSTEM_PROMPT_POST_TTS_DURATION_REVISER,
     build_localization_prompt,
     build_localization_revision_prompt,
+    build_post_tts_duration_revision_prompt,
 )
 from app.services.localization.validators import (
     normalize_localized_structure_and_durations,
     validate_localized_script,
 )
+from app.workflows.script_generation.validators import estimate_narration_duration_seconds
 
 
 class LocalizationService:
@@ -62,6 +66,28 @@ class LocalizationService:
             max_revisions
             if max_revisions is not None
             else settings.LOCALIZATION_MAX_REVISIONS
+        )
+
+    def _call_llm_structured(
+        self,
+        prompt: str,
+        schema: Type[Any],
+        system_prompt: Optional[str] = None,
+        temperature: float = 0.2,
+        reasoning_effort: Optional[str] = "low",
+    ) -> Any:
+        """Call LLM provider with optional reasoning_effort if supported by the provider signature."""
+        import inspect
+        sig = inspect.signature(self.llm_provider.generate_structured)
+        kwargs: Dict[str, Any] = {}
+        if "reasoning_effort" in sig.parameters or any(p.kind == p.VAR_KEYWORD for p in sig.parameters.values()):
+            kwargs["reasoning_effort"] = reasoning_effort
+        return self.llm_provider.generate_structured(
+            prompt=prompt,
+            schema=schema,
+            system_prompt=system_prompt,
+            temperature=temperature,
+            **kwargs,
         )
 
     def localize(
@@ -143,11 +169,12 @@ class LocalizationService:
         # Generate initial localized script draft
         prompt = build_localization_prompt(request, norm_locale, text_direction)
         try:
-            script_candidate = self.llm_provider.generate_structured(
+            script_candidate = self._call_llm_structured(
                 prompt=prompt,
                 schema=LocalizedScript,
                 system_prompt=SYSTEM_PROMPT_LOCALIZER,
                 temperature=0.2,
+                reasoning_effort="low",
             )
         except Exception as e:
             logger.error("LLM generation failed for locale '%s': %s", norm_locale, str(e))
@@ -191,11 +218,12 @@ class LocalizationService:
 
             rev_prompt = build_localization_revision_prompt(request, current_script, validation)
             try:
-                revised_script = self.llm_provider.generate_structured(
+                revised_script = self._call_llm_structured(
                     prompt=rev_prompt,
                     schema=LocalizedScript,
                     system_prompt=SYSTEM_PROMPT_LOCALIZATION_REVISER,
-                    temperature=0.2,
+                    temperature=0.1,
+                    reasoning_effort="low",
                 )
             except Exception as e:
                 logger.error("LLM revision failed for locale '%s': %s", norm_locale, str(e))
@@ -297,7 +325,10 @@ class LocalizationService:
                 }
 
         # Process each valid target independently (Error Isolation)
-        for target_loc in normalized_targets:
+        for idx, target_loc in enumerate(normalized_targets):
+            if idx > 0:
+                logger.info("Sequential locale pacing: pausing 3.0s before localizing '%s'...", target_loc)
+                time.sleep(3.0)
             try:
                 req = LocalizationRequest(
                     source_script=source_copy,
@@ -310,17 +341,51 @@ class LocalizationService:
                 script, val, status = self.localize(req)
                 if status == "completed" and script:
                     localized_scripts[target_loc] = script
+                elif status == "needs_review" and script:
+                    non_duration_issues = [
+                        i for i in val.issues
+                        if i.code not in ("LOCALIZED_DURATION_TOO_LONG", "LOCALIZED_DURATION_TOO_SHORT", "DURATION_DRIFT_EXCEEDED")
+                    ]
+                    if not non_duration_issues:
+                        logger.info(
+                            "Accepting localized script for '%s' despite duration warning; DurationReconciliationService will reconcile timing downstream.",
+                            target_loc,
+                        )
+                        localized_scripts[target_loc] = script
+                    else:
+                        failed_locales[target_loc] = {
+                            "status": status,
+                            "code": "LOCALIZATION_VALIDATION_FAILED",
+                            "issues": [i.model_dump() for i in val.issues],
+                            "script": script.model_dump() if script else None,
+                            "stage": "localization",
+                        }
                 else:
                     failed_locales[target_loc] = {
                         "status": status,
+                        "code": "LOCALIZATION_VALIDATION_FAILED",
                         "issues": [i.model_dump() for i in val.issues],
                         "script": script.model_dump() if script else None,
+                        "stage": "localization",
                     }
             except Exception as e:
                 logger.error("Localization failed with unhandled error for locale '%s': %s", target_loc, str(e))
+                err_str = str(e)
+                err_type = type(e).__name__
+                if "RateLimit" in err_type or "429" in err_str or "rate limit" in err_str.lower():
+                    code = "LOCALIZATION_RATE_LIMITED"
+                elif "json_validate_failed" in err_str or "Structured" in err_str or "json_schema" in err_str:
+                    code = "LOCALIZATION_STRUCTURED_OUTPUT_ERROR"
+                elif "ValidationError" in err_type or "Schema" in err_str or "validation" in err_str.lower():
+                    code = "LOCALIZATION_SCHEMA_VALIDATION_ERROR"
+                else:
+                    code = "LOCALIZATION_PROVIDER_ERROR"
+
                 failed_locales[target_loc] = {
                     "status": "failed",
+                    "code": code,
                     "error": str(e),
+                    "stage": "localization",
                 }
 
         bundle = LocalizationBundle(
@@ -336,3 +401,145 @@ class LocalizationService:
             },
         )
         return bundle
+
+    def reconcile_post_tts_duration(
+        self,
+        current_script: LocalizedScript,
+        measured_audio_track: Any,
+        target_duration_seconds: float,
+        tolerance_percent: Optional[float] = None,
+    ) -> Tuple[LocalizedScript, bool, str]:
+        """
+        Evaluate measured TTS audio duration against target duration.
+        If actual speech duration overruns target by more than tolerance_percent,
+        invoke LLM to intelligently shorten spoken narration while strictly
+        preserving learning objectives, scene structure, and pedagogical fidelity.
+
+        Returns:
+            Tuple of (reconciled_script, was_reconciled, summary_message)
+        """
+        tolerance_pct = (
+            tolerance_percent
+            if tolerance_percent is not None
+            else settings.POST_TTS_TOLERANCE_PERCENT
+        )
+        measured_total = (
+            getattr(measured_audio_track, "total_audio_duration_seconds", None)
+            or getattr(measured_audio_track, "total_duration_seconds", 0.0)
+        )
+        if measured_total <= 0.0:
+            return current_script, False, "No valid measured audio duration found."
+
+        allowed_diff = target_duration_seconds * (tolerance_pct / 100.0)
+        diff = measured_total - target_duration_seconds
+
+        # Only trigger reconciliation if audio genuinely overruns target beyond tolerance
+        if abs(diff) <= allowed_diff:
+            logger.info(
+                "Post-TTS timing check passed for locale '%s': measured=%.2fs, target=%.1fs (diff=%.2fs <= %.2fs tolerance)",
+                current_script.locale,
+                measured_total,
+                target_duration_seconds,
+                diff,
+                allowed_diff,
+            )
+            return (
+                current_script,
+                False,
+                f"Audio duration ({measured_total:.2f}s) is within {tolerance_pct}% of target ({target_duration_seconds:.1f}s)",
+            )
+
+        logger.warning(
+            "Post-TTS duration overrun for locale '%s': measured=%.2fs vs target=%.1fs (diff=%.2fs > %.2fs tolerance). Initiating condensation revision.",
+            current_script.locale,
+            measured_total,
+            target_duration_seconds,
+            diff,
+            allowed_diff,
+        )
+
+        audio_items = (
+            getattr(measured_audio_track, "scene_audio", None)
+            or getattr(measured_audio_track, "scene_audios", [])
+        )
+        scene_durations = {
+            sa.scene_id: sa.duration_seconds
+            for sa in audio_items
+        }
+
+        prompt = build_post_tts_duration_revision_prompt(
+            current_script=current_script,
+            measured_total_seconds=measured_total,
+            target_duration_seconds=target_duration_seconds,
+            scene_durations=scene_durations,
+        )
+
+        try:
+            raw_revised = self.llm_provider.generate_structured(
+                prompt=prompt,
+                schema=LocalizedScript,
+                system_prompt=SYSTEM_PROMPT_POST_TTS_DURATION_REVISER,
+            )
+
+            # Preserve immutable structural fields from current_script
+            revised = current_script.model_copy(deep=True)
+            revised.title = raw_revised.title or current_script.title
+            revised.opening_hook = raw_revised.opening_hook or current_script.opening_hook
+            revised.closing_summary = raw_revised.closing_summary or current_script.closing_summary
+            revised.target_duration_seconds = target_duration_seconds
+
+            # Align scenes
+            if len(raw_revised.scenes) == len(current_script.scenes):
+                for idx, src_s in enumerate(current_script.scenes):
+                    rev_s = raw_revised.scenes[idx]
+                    # Retain structural IDs
+                    revised.scenes[idx].scene_id = src_s.scene_id
+                    revised.scenes[idx].order = src_s.order
+                    revised.scenes[idx].scene_type = src_s.scene_type
+                    revised.scenes[idx].learning_objective_ids = src_s.learning_objective_ids
+                    # Apply shortened narration
+                    if rev_s.narration and rev_s.narration.strip():
+                        revised.scenes[idx].narration = rev_s.narration.strip()
+                    if rev_s.title:
+                        revised.scenes[idx].title = rev_s.title
+                    if rev_s.purpose:
+                        revised.scenes[idx].purpose = rev_s.purpose
+                    if rev_s.visual_direction:
+                        revised.scenes[idx].visual_direction = rev_s.visual_direction
+                    if src_s.on_screen_text is None:
+                        revised.scenes[idx].on_screen_text = None
+                    elif rev_s.on_screen_text:
+                        revised.scenes[idx].on_screen_text = rev_s.on_screen_text
+
+                    # Recalculate honest estimated duration
+                    est_dur = estimate_narration_duration_seconds(
+                        revised.scenes[idx].narration,
+                        locale=current_script.locale,
+                    )
+                    revised.scenes[idx].estimated_duration_seconds = est_dur
+            else:
+                logger.warning(
+                    "Post-TTS revised script scene count mismatch (%d vs %d); falling back to existing script.",
+                    len(raw_revised.scenes),
+                    len(current_script.scenes),
+                )
+                return current_script, False, "Revision produced scene count mismatch"
+
+            revised.total_estimated_duration_seconds = sum(
+                s.estimated_duration_seconds for s in revised.scenes
+            )
+
+            logger.info(
+                "Post-TTS duration reconciliation complete for locale '%s': condensed text estimated at %.2fs (down from measured %.2fs)",
+                current_script.locale,
+                revised.total_estimated_duration_seconds,
+                measured_total,
+            )
+            return (
+                revised,
+                True,
+                f"Condensed narration from measured {measured_total:.2f}s towards target {target_duration_seconds:.1f}s",
+            )
+        except Exception as e:
+            logger.error("Failed post-TTS duration reconciliation LLM call: %s", e)
+            return current_script, False, f"Reconciliation error: {e}"

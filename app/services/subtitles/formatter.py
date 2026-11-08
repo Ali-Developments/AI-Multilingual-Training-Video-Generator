@@ -1,7 +1,7 @@
 """Deterministic subtitle chunking, timestamp calculation, and SRT/VTT formatting."""
 
 import re
-from typing import List
+from typing import List, Optional
 from app.models.schemas import SubtitleChunk
 
 
@@ -129,3 +129,68 @@ def serialize_vtt(chunks: List[SubtitleChunk]) -> str:
         lines.append(chunk.text)
         lines.append("")
     return "\n".join(lines)
+
+
+def format_timestamp_ass(seconds: float) -> str:
+    """Format floating-point seconds into standard ASS timestamp H:MM:SS.cc (centiseconds)."""
+    total_cs = max(0, int(round(seconds * 100)))
+    hours = total_cs // 360000
+    minutes = (total_cs % 360000) // 6000
+    secs = (total_cs % 6000) // 100
+    centis = total_cs % 100
+    return f"{hours:d}:{minutes:02d}:{secs:02d}.{centis:02d}"
+
+
+def serialize_ass(
+    chunks: List[SubtitleChunk],
+    locale: str = "en-US",
+    font_name: Optional[str] = None,
+    font_size: Optional[int] = None,
+) -> str:
+    """
+    Serialize subtitle chunks to Advanced SubStation Alpha (.ass) format.
+    
+    Provides native support for complex RTL shaping (Arabic) and Indic shaping (Bengali)
+    via libass without character double-reversal.
+    """
+    from app.core.config import settings
+
+    norm_locale = locale.lower().replace("_", "-")
+    is_arabic = norm_locale.startswith("ar")
+    is_bengali = norm_locale.startswith("bn")
+
+    if not font_name:
+        if is_arabic:
+            font_name = getattr(settings, "SUBTITLE_FONT_NAME_ARABIC", "Segoe UI")
+        elif is_bengali:
+            font_name = getattr(settings, "SUBTITLE_FONT_NAME_BENGALI", "Nirmala UI")
+        else:
+            font_name = getattr(settings, "SUBTITLE_FONT_NAME_DEFAULT", "Arial")
+
+    actual_font_size = font_size or getattr(settings, "SUBTITLE_FONT_SIZE", 42)
+
+    lines = [
+        "[Script Info]",
+        "Title: Multilingual Training Video Subtitles",
+        "ScriptType: v4.00+",
+        "WrapStyle: 0",
+        "ScaledBorderAndShadow: yes",
+        "PlayResX: 1920",
+        "PlayResY: 1080",
+        "",
+        "[V4+ Styles]",
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+        f"Style: Default,{font_name},{actual_font_size},&H00FFFFFF,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,3,1,2,30,30,50,1",
+        "",
+        "[Events]",
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+    ]
+
+    for chunk in chunks:
+        start_str = format_timestamp_ass(chunk.start_seconds)
+        end_str = format_timestamp_ass(chunk.end_seconds)
+        clean_text = chunk.text.replace("\n", "\\N")
+        lines.append(f"Dialogue: 0,{start_str},{end_str},Default,,0,0,0,,{clean_text}")
+
+    return "\n".join(lines) + "\n"
+

@@ -1,7 +1,67 @@
 """Pydantic schemas for API requests, responses, content analysis, and video scripts."""
 
+from enum import Enum
+import re
 from typing import Dict, Any, Optional, List
+from datetime import datetime, timezone
 from pydantic import BaseModel, Field, model_validator
+
+
+class SceneMediaType(str, Enum):
+    """Presentation media source type for a scene."""
+
+    PRESENTER = "presenter"
+    BROLL = "broll"
+    UPLOADED_VIDEO = "uploaded_video"
+    UPLOADED_IMAGE = "uploaded_image"
+    MOTION_VISUAL = "motion_visual"
+    DIAGRAM = "diagram"
+    TITLE = "title"
+    QUIZ = "quiz"
+    OUTRO = "outro"
+
+
+class SceneLayoutType(str, Enum):
+    """Visual arrangement and layout composition for a scene."""
+
+    PRESENTER_FULL = "presenter_full"
+    PRESENTER_SPLIT = "presenter_split"
+    MEDIA_FULL = "media_full"
+    MEDIA_WITH_OVERLAY = "media_with_overlay"
+    PRESENTER_OVERLAY = "presenter_overlay"
+    TITLE_CARD = "title_card"
+    QUIZ_CARD = "quiz_card"
+
+
+class VideoStyle(str, Enum):
+    """Overall visual presentation style for the training video."""
+
+    PRESENTER_LED = "presenter_led"
+    HYBRID_PRESENTER_BROLL = "hybrid_presenter_broll"
+    VISUAL_EXPLAINER = "visual_explainer"
+    DEMONSTRATION_TUTORIAL = "demonstration_tutorial"
+    CORPORATE_TRAINING = "corporate_training"
+
+
+class QuizData(BaseModel):
+    """Structured question and answer data for educational quiz scenes."""
+
+    question: str = Field(..., description="Interactive training question prompt")
+    options: List[str] = Field(..., min_length=2, description="Available answer choices")
+    correct_index: Optional[int] = Field(default=None, description="0-indexed correct option")
+    explanation: Optional[str] = Field(default=None, description="Brief educational rationale for the answer")
+
+
+class BrandingConfig(BaseModel):
+    """Project brand identity and custom styling configuration."""
+
+    enabled: bool = Field(default=False, description="Whether custom branding is applied")
+    logo_path: Optional[str] = Field(default=None, description="Path or URL to company logo")
+    primary_accent: Optional[str] = Field(default="#00E5FF", description="Primary accent color (hex)")
+    secondary_accent: Optional[str] = Field(default="#4F46E5", description="Secondary accent color (hex)")
+    font_preference: Optional[str] = Field(default="modern", description="Typography style key")
+    intro_title: Optional[str] = Field(default=None, description="Custom branded title text")
+    outro_cta: Optional[str] = Field(default=None, description="Closing call-to-action text")
 
 
 class HealthResponse(BaseModel):
@@ -29,14 +89,42 @@ class TrainingVideoRequest(BaseModel):
     difficulty_level: Optional[str] = Field(default="intermediate", description="Difficulty level: beginner, intermediate, advanced")
     learning_objectives: Optional[List[str]] = Field(default=None, description="Explicit desired learning outcomes")
     locale: Optional[str] = Field(default=None, description="Cultural / regional locale hint (e.g., sa-Gulf, us-Corporate)")
+    avatar_provider: str = Field(default="mock", description="Avatar provider: 'mock', 'sadtalker', or 'heygen'")
+    ack_paid_credits: bool = Field(default=False, description="User acknowledgement for paid HeyGen credit usage")
+    video_style: str = Field(default="hybrid_presenter_broll", description="Presentation style")
+    branding: Optional[BrandingConfig] = Field(default=None, description="Visual branding overrides")
 
     @model_validator(mode="after")
     def validate_content_presence(self) -> "TrainingVideoRequest":
-        """Ensure that at least topic or source_content is provided and non-empty."""
+        """Ensure that content is provided, matches base_language, and adheres to avatar safety gates."""
         has_topic = bool(self.topic and self.topic.strip())
         has_source = bool(self.source_content and self.source_content.strip())
         if not (has_topic or has_source):
             raise ValueError("At least one of 'topic' or 'source_content' must be provided.")
+        
+        from app.core.language import validate_source_language_mismatch
+        source_text = self.source_content or self.topic
+        mismatch_err = validate_source_language_mismatch(source_text, self.base_language)
+        if mismatch_err:
+            raise ValueError(mismatch_err)
+
+        prov = self.avatar_provider.strip().lower()
+        if prov not in ("mock", "sadtalker", "heygen"):
+            raise ValueError(
+                f"Unsupported avatar provider '{self.avatar_provider}'. Supported options: 'mock', 'sadtalker', 'heygen'."
+            )
+
+        if prov == "heygen":
+            from app.core.config import settings
+            if not getattr(settings, "ENABLE_LIVE_HEYGEN", False):
+                raise ValueError(
+                    "Live HeyGen avatar generation is blocked: ENABLE_LIVE_HEYGEN is False in system configuration."
+                )
+            if not self.ack_paid_credits:
+                raise ValueError(
+                    "Live HeyGen avatar generation requires explicit acknowledgement that paid credits may be consumed."
+                )
+            
         return self
 
 
@@ -74,8 +162,22 @@ class SceneDraft(BaseModel):
     learning_objective_ids: List[str] = Field(default_factory=list, description="IDs of learning objectives addressed in this scene")
     scene_type: str = Field(
         default="presenter",
-        description="Scene classification (intro, presenter, explanation, visual_demo, example, recap, outro)"
+        description="Scene classification (intro, presenter, explanation, visual_demo, example, recap, outro, quiz)"
     )
+
+    # V2 Media & Layout Engine fields
+    media_type: str = Field(default="presenter", description="Media source type (presenter, broll, motion_visual, uploaded_video, quiz, outro, etc.)")
+    layout_type: str = Field(default="presenter_split", description="Scene visual composition layout (presenter_full, presenter_split, media_full, etc.)")
+    visual_prompt: Optional[str] = Field(default=None, description="Visual description or prompt for media synthesis/search")
+    media_search_terms: List[str] = Field(default_factory=list, description="Search keywords for finding b-roll / stock / asset")
+    avatar_enabled: bool = Field(default=True, description="Whether presenter avatar is actively rendered for this scene")
+    presenter_position: str = Field(default="right", description="Presenter screen placement: left, right, center")
+    transition: str = Field(default="fade", description="Scene transition: fade, cut, slide, crossfade")
+    media_asset_path: Optional[str] = Field(default=None, description="Custom assigned media video or image path")
+    quiz_data: Optional[QuizData] = Field(default=None, description="Structured quiz question and options if quiz scene")
+    render_status: Optional[str] = Field(default=None, description="Render status for scene: completed, rendering, failed, or unrendered")
+    rendered_video_url: Optional[str] = Field(default=None, description="Static storage URL to rendered scene MP4 if completed")
+    has_rendered_asset: bool = Field(default=False, description="True if rendered video asset exists on disk and is completed")
 
     # Backwards-compatibility fields
     scene_number: Optional[int] = Field(default=None, description="Legacy alias for order")
@@ -83,7 +185,7 @@ class SceneDraft(BaseModel):
 
     @model_validator(mode="after")
     def sync_scene_fields(self) -> "SceneDraft":
-        """Synchronize legacy and new field names."""
+        """Synchronize legacy and new field names, deriving V2 defaults if needed."""
         if not self.order and self.scene_number:
             self.order = self.scene_number
         elif not self.scene_number and self.order:
@@ -96,6 +198,41 @@ class SceneDraft(BaseModel):
             self.visual_direction = self.visual_description
         elif not self.visual_description and self.visual_direction:
             self.visual_description = self.visual_direction
+
+        # Derive V2 media and layout settings if using legacy defaults
+        user_set_avatar = "avatar_enabled" in getattr(self, "__pydantic_fields_set__", set())
+        stype = (self.scene_type or "presenter").lower()
+        if stype in ("intro", "outro"):
+            if self.layout_type == "presenter_split":
+                self.layout_type = "presenter_full"
+            if not user_set_avatar:
+                self.avatar_enabled = True
+            if stype == "outro" and self.media_type == "presenter":
+                self.media_type = "outro"
+        elif stype in ("explanation", "concept"):
+            if self.media_type == "presenter":
+                self.media_type = "motion_visual"
+            if self.layout_type == "presenter_split":
+                self.layout_type = "media_with_overlay"
+            if not user_set_avatar:
+                self.avatar_enabled = False
+        elif stype in ("visual_demo", "demonstration", "example"):
+            if self.media_type == "presenter":
+                self.media_type = "broll"
+            if self.layout_type == "presenter_split":
+                self.layout_type = "media_full"
+            if not user_set_avatar:
+                self.avatar_enabled = False
+        elif stype == "quiz":
+            self.media_type = "quiz"
+            self.layout_type = "quiz_card"
+            if not user_set_avatar:
+                self.avatar_enabled = False
+        elif stype in ("presenter", "recap", "summary"):
+            if not user_set_avatar:
+                self.avatar_enabled = True
+            if self.media_type == "presenter":
+                self.media_type = "presenter"
 
         return self
 
@@ -203,6 +340,53 @@ class LocalizedScene(BaseModel):
     on_screen_text: Optional[str] = Field(default=None, description="Localized on-screen text overlay")
     learning_objective_ids: List[str] = Field(default_factory=list, description="Learning objective IDs strictly matching source scene (protected)")
     scene_type: str = Field(default="presenter", description="Scene classification strictly matching source scene (protected)")
+
+    # V2 Media & Layout Engine fields
+    media_type: str = Field(default="presenter", description="Media source type matching source scene")
+    layout_type: str = Field(default="presenter_split", description="Scene layout composition matching source scene")
+    visual_prompt: Optional[str] = Field(default=None, description="Localized visual guidance or prompt")
+    media_search_terms: List[str] = Field(default_factory=list, description="Localized media search keywords")
+    avatar_enabled: bool = Field(default=True, description="Whether presenter avatar is actively rendered for this scene")
+    presenter_position: str = Field(default="right", description="Presenter screen placement: left, right, center")
+    transition: str = Field(default="fade", description="Scene transition: fade, cut, slide, crossfade")
+    media_asset_path: Optional[str] = Field(default=None, description="Custom assigned media path")
+    quiz_data: Optional[QuizData] = Field(default=None, description="Localized quiz question and options")
+    render_status: Optional[str] = Field(default=None, description="Render status for scene: completed, rendering, failed, or unrendered")
+    rendered_video_url: Optional[str] = Field(default=None, description="Static storage URL to rendered scene MP4 if completed")
+    has_rendered_asset: bool = Field(default=False, description="True if rendered video asset exists on disk and is completed")
+
+    @model_validator(mode="after")
+    def sync_localized_scene_fields(self) -> "LocalizedScene":
+        """Synchronize V2 defaults for localized scene based on scene_type."""
+        stype = (self.scene_type or "presenter").lower()
+        if stype in ("intro", "outro"):
+            if self.layout_type == "presenter_split":
+                self.layout_type = "presenter_full"
+            self.avatar_enabled = True
+            if stype == "outro":
+                self.media_type = "outro"
+        elif stype in ("explanation", "concept"):
+            if self.media_type == "presenter":
+                self.media_type = "motion_visual"
+            if self.layout_type == "presenter_split":
+                self.layout_type = "media_with_overlay"
+            self.avatar_enabled = False
+        elif stype in ("visual_demo", "demonstration", "example"):
+            if self.media_type == "presenter":
+                self.media_type = "broll"
+            if self.layout_type == "presenter_split":
+                self.layout_type = "media_full"
+            self.avatar_enabled = False
+        elif stype == "quiz":
+            self.media_type = "quiz"
+            self.layout_type = "quiz_card"
+            self.avatar_enabled = False
+        elif stype in ("presenter", "recap", "summary"):
+            if self.media_type == "presenter":
+                self.avatar_enabled = True
+                self.media_type = "presenter"
+
+        return self
 
 
 class LocalizedScript(BaseModel):
@@ -334,12 +518,13 @@ class SubtitleChunk(BaseModel):
 
 
 class SceneSubtitleAsset(BaseModel):
-    """Generated subtitle files (.srt and .vtt) for a specific scene."""
+    """Generated subtitle files (.srt, .vtt, and .ass) for a specific scene."""
 
     scene_id: str = Field(..., description="Unique scene identifier")
     locale: str = Field(..., description="Target locale code")
     srt_path: str = Field(..., description="Path to generated .srt file")
     vtt_path: Optional[str] = Field(default=None, description="Path to generated .vtt file")
+    ass_path: Optional[str] = Field(default=None, description="Path to generated .ass file with native RTL styling")
     chunk_count: int = Field(default=0, ge=0, description="Total number of caption cues")
     duration_seconds: float = Field(default=0.0, ge=0.0, description="Scene audio duration covered")
     text_direction: str = Field(default="ltr", description="Text layout direction: ltr or rtl")
@@ -354,6 +539,7 @@ class LocalizedSubtitleTrack(BaseModel):
     scene_subtitles: List[SceneSubtitleAsset] = Field(default_factory=list, description="Ordered per-scene subtitle assets")
     srt_path: Optional[str] = Field(default=None, description="Path to combined full-track .srt file")
     vtt_path: Optional[str] = Field(default=None, description="Path to combined full-track .vtt file")
+    ass_path: Optional[str] = Field(default=None, description="Path to combined full-track .ass file")
     status: str = Field(default="completed", description="Track status: completed, partial, failed")
     metadata: Dict[str, Any] = Field(default_factory=dict, description="Subtitle pipeline metadata")
 
@@ -422,14 +608,63 @@ class FinalVideoAsset(BaseModel):
 # =====================================================================
 
 
+class ManifestError(BaseModel):
+    """Structured diagnostic error record for pipeline stages."""
+
+    stage: str = Field(..., description="Pipeline stage where the error occurred")
+    code: str = Field(default="UNKNOWN", description="Machine-readable error code")
+    message: str = Field(..., description="Human-readable error description")
+    timestamp: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat(), description="ISO 8601 timestamp")
+    occurrence_count: int = Field(default=1, ge=1, description="Number of times this error was observed")
+
+
+def sanitize_diagnostic_message(msg: str) -> str:
+    """
+    Sanitize diagnostic error messages to strip API keys, Bearer tokens, or authorization data
+    before persistence in project manifests or exposure in APIs and UI.
+    """
+    if not msg:
+        return ""
+    clean = str(msg)
+    try:
+        from app.core.config import settings
+        if settings.GROQ_API_KEY and len(settings.GROQ_API_KEY) > 6:
+            clean = clean.replace(settings.GROQ_API_KEY, "[REDACTED_GROQ_KEY]")
+        if settings.HEYGEN_API_KEY and len(settings.HEYGEN_API_KEY) > 6:
+            clean = clean.replace(settings.HEYGEN_API_KEY, "[REDACTED_HEYGEN_KEY]")
+    except Exception:
+        pass
+
+    # Regex redact generic provider keys, tokens, auth headers
+    clean = re.sub(r"gsk_[A-Za-z0-9_\-]{15,}", "gsk_[REDACTED]", clean)
+    clean = re.sub(r"(?i)bearer\s+[A-Za-z0-9_\-\.]{8,}", "Bearer [REDACTED]", clean)
+    clean = re.sub(r"(?i)(api[_-]?key|authorization|token)[\"'\s:=]+[A-Za-z0-9_\-]{10,}", r"\1: [REDACTED]", clean)
+    return clean
+
+
 class ProjectManifest(BaseModel):
     """Persistent project manifest tracking end-to-end lifecycle and artifacts."""
 
     project_id: str = Field(..., description="Unique project identifier")
-    created_at: str = Field(..., description="ISO 8601 creation timestamp")
-    updated_at: str = Field(..., description="ISO 8601 last update timestamp")
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat(), description="ISO 8601 creation timestamp")
+    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat(), description="ISO 8601 last update timestamp")
     status: str = Field(default="pending", description="Pipeline status: pending, running, completed, needs_review, failed")
+    avatar_provider: str = Field(default="mock", description="Selected avatar provider for this project: 'mock', 'sadtalker', 'heygen'")
     source_request: TrainingVideoRequest = Field(..., description="Original input request parameters")
+
+    @model_validator(mode="before")
+    @classmethod
+    def populate_avatar_provider(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            if not data.get("avatar_provider"):
+                src = data.get("source_request", {})
+                if isinstance(src, dict) and src.get("avatar_provider"):
+                    data["avatar_provider"] = str(src["avatar_provider"]).strip().lower()
+                else:
+                    data["avatar_provider"] = "mock"
+            else:
+                data["avatar_provider"] = str(data["avatar_provider"]).strip().lower()
+        return data
     script_status: str = Field(default="pending", description="Script workflow status: pending, running, completed, failed")
     localization_status: str = Field(default="pending", description="Localization status: pending, running, completed, partial, failed")
     audio_status: str = Field(default="pending", description="Audio synthesis status: pending, running, completed, partial, failed")
@@ -444,8 +679,38 @@ class ProjectManifest(BaseModel):
     visual_tracks: Dict[str, LocalizedVisualTrack] = Field(default_factory=dict, description="Supporting visual tracks by locale")
     subtitle_tracks: Dict[str, LocalizedSubtitleTrack] = Field(default_factory=dict, description="Subtitle tracks by locale")
     final_videos: Dict[str, FinalVideoAsset] = Field(default_factory=dict, description="Composed final training videos by locale")
+    error_details: List[ManifestError] = Field(default_factory=list, description="Structured error records with occurrence counts and stages")
     errors: List[str] = Field(default_factory=list, description="Diagnostic error log")
     metadata: Dict[str, Any] = Field(default_factory=dict, description="Arbitrary pipeline metadata")
+
+    def record_error(self, stage: str, message: str, code: str = "ERROR") -> None:
+        """
+        Record or update a structured diagnostic error without duplicating identical messages.
+        Sanitizes secret keys and preserves insertion order and occurrence count.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        clean_msg = sanitize_diagnostic_message(message)
+        for err in self.error_details:
+            if err.stage == stage and err.message == clean_msg:
+                err.occurrence_count += 1
+                err.timestamp = now
+                return
+
+        new_err = ManifestError(
+            stage=stage,
+            code=code,
+            message=clean_msg,
+            timestamp=now,
+            occurrence_count=1,
+        )
+        self.error_details.append(new_err)
+        if clean_msg not in self.errors:
+            self.errors.append(clean_msg)
+
+    def clear_stage_errors(self, stage: str) -> None:
+        """Clear active errors associated with a specific stage upon successful execution/retry."""
+        self.error_details = [e for e in self.error_details if e.stage != stage]
+        self.errors = [e.message for e in self.error_details]
 
 
 # =====================================================================
@@ -477,6 +742,7 @@ class ProjectOutputsResponse(BaseModel):
 
     project_id: str = Field(..., description="Project identifier")
     status: str = Field(..., description="Overall pipeline status")
+    avatar_provider: str = Field(default="mock", description="Selected avatar provider")
     has_final_script: bool = Field(..., description="Whether final canonical script exists")
     locales: List[str] = Field(default_factory=list, description="Target locales in project")
     audio_tracks: Dict[str, str] = Field(default_factory=dict, description="Audio track status by locale")
@@ -484,6 +750,136 @@ class ProjectOutputsResponse(BaseModel):
     visual_tracks: Dict[str, str] = Field(default_factory=dict, description="Visual track status by locale")
     subtitle_tracks: Dict[str, str] = Field(default_factory=dict, description="Subtitle track status by locale")
     final_videos: Dict[str, str] = Field(default_factory=dict, description="Final video file paths by locale")
+
+
+class UpdateSceneRequest(BaseModel):
+    """Request payload for modifying an individual scene's attributes."""
+
+    title: Optional[str] = Field(default=None, description="Updated scene title")
+    narration: Optional[str] = Field(default=None, description="Updated narration text (triggers audio invalidation)")
+    media_type: Optional[str] = Field(default=None, description="Updated media source type")
+    layout_type: Optional[str] = Field(default=None, description="Updated layout composition")
+    avatar_enabled: Optional[bool] = Field(default=None, description="Toggle avatar video generation")
+    presenter_position: Optional[str] = Field(default=None, description="Presenter placement: left, right, center")
+    on_screen_text: Optional[str] = Field(default=None, description="Updated on-screen text overlay")
+    visual_direction: Optional[str] = Field(default=None, description="Updated visual directions")
+    visual_prompt: Optional[str] = Field(default=None, description="Updated generative visual prompt")
+    transition: Optional[str] = Field(default=None, description="Scene transition: fade, cut, etc.")
+    scene_type: Optional[str] = Field(default=None, description="Scene type classification")
+    media_asset_path: Optional[str] = Field(default=None, description="Path or filename of custom assigned media")
+    quiz_data: Optional[QuizData] = Field(default=None, description="Quiz question and choices")
+    estimated_duration_seconds: Optional[int] = Field(default=None, ge=1, description="Estimated duration in seconds")
+    target_duration: Optional[int] = Field(default=None, ge=1, description="Target duration in seconds")
+
+
+class ReorderScenesRequest(BaseModel):
+    """Request payload for updating scene sequencing order."""
+
+    scene_order: Optional[List[str]] = Field(default=None, description="Ordered list of scene_ids reflecting new order")
+    scene_ids: Optional[List[str]] = Field(default=None, description="Alias for scene_order")
+
+    @model_validator(mode="after")
+    def sync_scene_order(self) -> "ReorderScenesRequest":
+        if not self.scene_order and self.scene_ids:
+            self.scene_order = self.scene_ids
+        elif not self.scene_ids and self.scene_order:
+            self.scene_ids = self.scene_order
+        if not self.scene_order:
+            raise ValueError("Either scene_order or scene_ids must be provided.")
+        return self
+
+
+class UpdateProjectRequest(BaseModel):
+    """Request payload for updating top-level project metadata and configuration."""
+
+    topic: Optional[str] = Field(default=None, description="Training topic or title")
+    video_style: Optional[str] = Field(default=None, description="Video presentation style")
+    avatar_provider: Optional[str] = Field(default=None, description="Avatar provider: mock, sadtalker, heygen")
+    target_duration_seconds: Optional[int] = Field(default=None, ge=15, le=3600, description="Target duration in seconds")
+    target_languages: Optional[List[str]] = Field(default=None, description="Target localized locales")
+    branding: Optional[BrandingConfig] = Field(default=None, description="Project branding overrides")
+
+
+class ProjectSummary(BaseModel):
+    """Lightweight dashboard project card summary."""
+
+    project_id: str = Field(..., description="Project ID")
+    topic: str = Field(..., description="Project topic or title")
+    title: Optional[str] = Field(default=None, description="Display title alias for topic")
+    base_language: str = Field(default="en-US", description="Base canonical language")
+    source_language: Optional[str] = Field(default=None, description="Display language alias for base_language")
+    target_languages: List[str] = Field(default_factory=list, description="Target localization locales")
+    target_duration_seconds: int = Field(default=60, description="Target video duration")
+    duration_seconds: Optional[float] = Field(default=None, description="Measured or target duration in seconds")
+    status: str = Field(default="pending", description="Overall project status")
+    avatar_provider: str = Field(default="mock", description="Selected avatar provider")
+    video_style: str = Field(default="hybrid_presenter_broll", description="Selected video style")
+    created_at: str = Field(default="", description="ISO timestamp created")
+    updated_at: str = Field(default="", description="ISO timestamp last updated")
+    scenes_count: int = Field(default=0, description="Number of scenes in script")
+    completed_locales: List[str] = Field(default_factory=list, description="Locales with completed final videos")
+    thumbnail_url: Optional[str] = Field(default=None, description="URL or relative path to project preview thumbnail")
+    thumbnail_path: Optional[str] = Field(default=None, description="Alias for thumbnail_url")
+    is_legacy: bool = Field(default=False, description="Flag indicating legacy or migrated manifest")
+    migration_required: bool = Field(default=False, description="Flag indicating manifest requires schema migration")
+
+    @model_validator(mode="before")
+    @classmethod
+    def sync_summary_fields_before(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            # Sync title <-> topic
+            if not data.get("topic") and data.get("title"):
+                data["topic"] = data["title"]
+            if not data.get("title") and data.get("topic"):
+                data["title"] = data["topic"]
+
+            # Sync source_language <-> base_language
+            if not data.get("base_language") and data.get("source_language"):
+                data["base_language"] = data["source_language"]
+            if not data.get("source_language") and data.get("base_language"):
+                data["source_language"] = data["base_language"]
+
+            # Sync duration_seconds <-> target_duration_seconds
+            if data.get("duration_seconds") is None and data.get("target_duration_seconds") is not None:
+                data["duration_seconds"] = float(data["target_duration_seconds"])
+            elif data.get("target_duration_seconds") is None and data.get("duration_seconds") is not None:
+                data["target_duration_seconds"] = int(round(data["duration_seconds"]))
+
+            # Sync thumbnail_path <-> thumbnail_url
+            if not data.get("thumbnail_url") and data.get("thumbnail_path"):
+                data["thumbnail_url"] = data["thumbnail_path"]
+            if not data.get("thumbnail_path") and data.get("thumbnail_url"):
+                data["thumbnail_path"] = data["thumbnail_url"]
+        return data
+
+    @model_validator(mode="after")
+    def sync_summary_fields_after(self) -> "ProjectSummary":
+        if not self.title and self.topic:
+            self.title = self.topic
+        if not self.topic and self.title:
+            self.topic = self.title
+        if not self.source_language and self.base_language:
+            self.source_language = self.base_language
+        if not self.base_language and self.source_language:
+            self.base_language = self.source_language
+        if self.duration_seconds is None:
+            self.duration_seconds = float(self.target_duration_seconds)
+        if not self.thumbnail_path and self.thumbnail_url:
+            self.thumbnail_path = self.thumbnail_url
+        if not self.thumbnail_url and self.thumbnail_path:
+            self.thumbnail_url = self.thumbnail_path
+        return self
+
+
+class UploadedMediaItem(BaseModel):
+    """Uploaded media item in the project or global media library."""
+
+    filename: str = Field(..., description="Media filename")
+    file_path: str = Field(..., description="Filesystem absolute or storage path")
+    media_type: str = Field(..., description="Media kind: video or image")
+    size_bytes: int = Field(default=0, description="File size in bytes")
+    created_at: str = Field(default="", description="ISO upload timestamp")
+    url: str = Field(default="", description="API access URL")
 
 
 

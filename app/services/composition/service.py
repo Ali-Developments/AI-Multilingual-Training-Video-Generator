@@ -18,6 +18,7 @@ from app.models.schemas import (
 from app.services.composition.base import CompositionProvider
 from app.services.composition.factory import get_composition_provider
 from app.services.composition.ffmpeg_utils import get_video_duration
+from app.core.caching import load_asset_metadata, save_asset_metadata, hash_file, hash_text
 
 
 class CompositionService:
@@ -33,6 +34,8 @@ class CompositionService:
     ) -> None:
         self.provider = provider or get_composition_provider()
         self.output_base_dir = output_base_dir or settings.STORAGE_PATH
+        from app.services.media.service import SceneMediaService
+        self.media_service = SceneMediaService()
 
     def compose_locale_scenes(
         self,
@@ -73,7 +76,6 @@ class CompositionService:
         }
 
         scene_results: List[SceneCompositionAsset] = []
-
         for scene in script.scenes:
             out_file = rendered_dir / f"{scene.scene_id}.mp4"
             audio_asset = audio_map.get(scene.scene_id)
@@ -93,12 +95,21 @@ class CompositionService:
 
             duration = audio_asset.duration_seconds
 
-            # Idempotency check: reuse existing valid MP4 video
+            expected_has_av = scene.scene_id in avatar_map
+            curr_layout = getattr(scene, "layout_type", "presenter_split")
+            curr_pos = getattr(scene, "presenter_position", "right")
+
+            # Idempotency check: reuse existing valid MP4 video ONLY if duration, avatar presence, and layout match
             if not force_regenerate and out_file.exists() and out_file.stat().st_size > 0:
                 measured = get_video_duration(out_file)
-                if measured > 0:
-                    logger.info("Reusing existing rendered scene '%s' for locale '%s'", scene.scene_id, locale)
-                    has_av = scene.scene_id in avatar_map
+                meta = load_asset_metadata(out_file)
+                meta_has_av = meta.get("has_avatar") if meta else False
+                meta_layout = meta.get("layout_type") if meta else "presenter_split"
+                avatar_matches = (meta_has_av == expected_has_av)
+                layout_matches = (meta_layout == curr_layout)
+                
+                if measured > 0 and abs(measured - duration) <= 0.5 and avatar_matches and layout_matches:
+                    logger.info("Reusing existing rendered scene '%s' for locale '%s' (has_avatar=%s, layout=%s)", scene.scene_id, locale, expected_has_av, curr_layout)
                     has_sub = scene.scene_id in sub_map
                     scene_results.append(
                         SceneCompositionAsset(
@@ -106,12 +117,21 @@ class CompositionService:
                             locale=locale,
                             video_path=str(out_file.resolve()),
                             duration_seconds=measured,
-                            has_avatar=has_av,
+                            has_avatar=expected_has_av,
                             has_subtitles=has_sub,
                             status="completed",
                         )
                     )
                     continue
+                elif measured > 0:
+                    logger.warning(
+                        "Stale rendered scene asset detected for '%s' (file duration %.2fs vs audio %.2fs, avatar_matches=%s, layout_matches=%s). Re-rendering scene.",
+                        scene.scene_id,
+                        measured,
+                        duration,
+                        avatar_matches,
+                        layout_matches,
+                    )
 
             vis_asset = visual_map.get(scene.scene_id)
             vis_path = Path(vis_asset.image_path) if vis_asset and vis_asset.image_path else None
@@ -121,6 +141,21 @@ class CompositionService:
 
             sub_asset = sub_map.get(scene.scene_id)
             sub_path = Path(sub_asset.srt_path) if sub_asset and sub_asset.srt_path else None
+
+            # Generate or resolve motion video for this scene
+            motion_path: Optional[Path] = None
+            try:
+                media_out_dir = self.output_base_dir / project_id / "media" / locale
+                motion_path = self.media_service.generate_scene_media(
+                    scene=scene,
+                    locale=locale,
+                    output_dir=media_out_dir,
+                    duration_seconds=duration,
+                    background_image_path=vis_path,
+                    project_storage_dir=self.output_base_dir / project_id,
+                )
+            except Exception as e:
+                logger.warning("Could not generate motion media for scene '%s': %s", scene.scene_id, e)
 
             try:
                 asset = self.provider.compose_scene(
@@ -133,7 +168,22 @@ class CompositionService:
                     duration_seconds=duration,
                     output_path=out_file,
                     burn_subtitles=settings.BURN_SUBTITLES,
+                    layout_type=curr_layout,
+                    presenter_position=curr_pos,
+                    motion_video_path=motion_path,
                 )
+                if out_file.exists() and out_file.stat().st_size > 0:
+                    save_asset_metadata(
+                        out_file,
+                        {
+                            "scene_id": scene.scene_id,
+                            "locale": locale,
+                            "has_avatar": asset.has_avatar,
+                            "layout_type": curr_layout,
+                            "audio_hash": hash_file(audio_asset.audio_path),
+                            "duration": asset.duration_seconds,
+                        },
+                    )
                 scene_results.append(asset)
             except Exception as e:
                 logger.error("Failed to compose scene '%s': %s", scene.scene_id, e)
@@ -177,10 +227,19 @@ class CompositionService:
                 error="No successful scene videos available for concatenation.",
             )
 
-        # Idempotency check: reuse final video if already rendered
+        # Idempotency check: reuse final video ONLY if duration matches sum of scene videos and scene hash matches
+        expected_total = sum(s.duration_seconds for s in successful_scenes)
+        scenes_fingerprint = ";".join(
+            f"{s.scene_id}:{s.has_avatar}:{s.duration_seconds:.2f}:{hash_file(s.video_path)}"
+            for s in successful_scenes
+        )
+        scenes_hash = hash_text(scenes_fingerprint)
+
         if not force_regenerate and final_output.exists() and final_output.stat().st_size > 0:
+            meta = load_asset_metadata(final_output)
+            cached_scenes_hash = meta.get("scenes_hash") if meta else None
             measured = get_video_duration(final_output)
-            if measured > 0:
+            if measured > 0 and abs(measured - expected_total) <= 0.5 and (cached_scenes_hash == scenes_hash):
                 logger.info("Reusing existing final video for locale '%s'", locale)
                 return FinalVideoAsset(
                     locale=locale,
@@ -191,6 +250,14 @@ class CompositionService:
                     status="completed",
                     metadata={"provider": self.provider.provider_name, "reused": True},
                 )
+            elif measured > 0:
+                logger.warning(
+                    "Stale final video asset detected for locale '%s' (measured %.2fs != scenes sum %.2fs, hash_match=%s). Re-concatenating.",
+                    locale,
+                    measured,
+                    expected_total,
+                    (cached_scenes_hash == scenes_hash),
+                )
 
         try:
             final_asset = self.provider.concatenate_scenes(
@@ -199,6 +266,15 @@ class CompositionService:
                 output_path=final_output,
             )
             final_asset.scene_videos = scene_videos
+            save_asset_metadata(
+                final_output,
+                {
+                    "locale": locale,
+                    "scenes_hash": scenes_hash,
+                    "duration": final_asset.total_duration_seconds,
+                    "scene_count": len(successful_scenes),
+                },
+            )
             return final_asset
         except Exception as e:
             logger.error("Failed to concatenate final video for locale '%s': %s", locale, e)

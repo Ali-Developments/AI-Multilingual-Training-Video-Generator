@@ -1,5 +1,6 @@
 """Abstract base class and eligibility rules for talking-head avatar video synthesis."""
 
+import json
 import time
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -27,9 +28,20 @@ def is_avatar_eligible(scene: Union[SceneDraft, LocalizedScene]) -> bool:
     Determine if a scene is eligible for talking-head avatar synthesis.
     
     Returns:
-        True if scene_type is 'presenter', 'intro', 'outro', or 'recap'.
-        False for visual demos, slides, or explanations that rely purely on graphical assets.
+        True if avatar_enabled is True and media_type/scene_type indicates presenter representation.
+        False for visual demos, broll, slides, diagrams, quizzes, or when avatar_enabled is explicitly False.
     """
+    if getattr(scene, "avatar_enabled", True) is False:
+        return False
+        
+    media_type = getattr(scene, "media_type", None)
+    if media_type is not None:
+        mt = str(media_type.value if hasattr(media_type, "value") else media_type).strip().lower()
+        if mt in ("presenter", "outro"):
+            return True
+        if mt in ("broll", "motion_visual", "uploaded_video", "uploaded_image", "diagram", "quiz", "title"):
+            return False
+
     stype = (scene.scene_type or "presenter").strip().lower()
     return stype in AVATAR_ELIGIBLE_SCENE_TYPES
 
@@ -84,28 +96,64 @@ class AvatarProvider(ABC):
         avatar_id: Optional[str] = None,
         poll_interval: Optional[float] = None,
         timeout_seconds: Optional[int] = None,
+        force_regenerate: bool = False,
     ) -> AvatarVideoAsset:
         """
         Template method orchestrating full avatar video creation:
         submit -> poll -> retrieve -> probe duration.
+        Persists job_id immediately after submission to enable safe resume without duplicate paid calls.
         """
         avatar_name = avatar_id or settings.HEYGEN_DEFAULT_AVATAR_ID
         poll_wait = poll_interval or settings.HEYGEN_POLL_INTERVAL_SECONDS
         timeout = timeout_seconds or settings.HEYGEN_JOB_TIMEOUT_SECONDS
 
         destination_path.parent.mkdir(parents=True, exist_ok=True)
+        job_file = destination_path.with_suffix(".job.json")
+        job_id = None
 
-        logger.info(
-            "Submitting avatar job for scene '%s' (%s, avatar=%s)",
-            scene_id, locale, avatar_name
-        )
+        if not force_regenerate and job_file.exists():
+            try:
+                saved_info = json.loads(job_file.read_text(encoding="utf-8"))
+                saved_job_id = saved_info.get("job_id")
+                saved_prov = saved_info.get("provider") or "heygen"
+                if (
+                    saved_job_id
+                    and saved_prov.strip().lower() == self.provider_name.strip().lower()
+                    and saved_info.get("status") in ("submitted", "pending", "processing", "completed")
+                ):
+                    logger.info(
+                        "Found persisted avatar job ID '%s' for scene '%s' (%s); polling existing job instead of resubmitting.",
+                        saved_job_id, scene_id, self.provider_name
+                    )
+                    job_id = saved_job_id
+            except Exception as ex:
+                logger.warning("Could not read existing job file '%s': %s", job_file, ex)
 
-        job_id = self.submit_avatar_job(
-            scene_id=scene_id,
-            locale=locale,
-            audio_path=audio_path,
-            avatar_id=avatar_name,
-        )
+        if not job_id:
+            logger.info(
+                "Submitting avatar job for scene '%s' (%s, avatar=%s)",
+                scene_id, locale, avatar_name
+            )
+            job_id = self.submit_avatar_job(
+                scene_id=scene_id,
+                locale=locale,
+                audio_path=audio_path,
+                avatar_id=avatar_name,
+            )
+            try:
+                job_data = {
+                    "job_id": job_id,
+                    "scene_id": scene_id,
+                    "locale": locale,
+                    "avatar_id": avatar_name,
+                    "provider": self.provider_name,
+                    "submitted_at": time.time(),
+                    "status": "processing",
+                }
+                job_file.write_text(json.dumps(job_data, indent=2), encoding="utf-8")
+                logger.info("Persisted avatar job ID '%s' to '%s'", job_id, job_file)
+            except Exception as ex:
+                logger.warning("Failed to persist job file '%s': %s", job_file, ex)
 
         start_time = time.time()
         while True:
@@ -124,7 +172,6 @@ class AvatarProvider(ABC):
                 
                 final_path = self.download_avatar_video(video_url, destination_path)
                 
-                # Probe duration if possible, else default to audio duration
                 try:
                     dur = get_audio_duration(final_path)
                 except Exception:
@@ -132,6 +179,20 @@ class AvatarProvider(ABC):
                         dur = get_audio_duration(audio_path)
                     except Exception:
                         dur = 0.0
+
+                try:
+                    if job_file.exists():
+                        completed_data = json.loads(job_file.read_text(encoding="utf-8"))
+                        completed_data["status"] = "completed"
+                        completed_data["completed_at"] = time.time()
+                        completed_data["duration_seconds"] = dur
+                        completed_data["inference_time_seconds"] = status_info.get(
+                            "inference_time_seconds",
+                            round(completed_data["completed_at"] - completed_data.get("submitted_at", completed_data["completed_at"]), 2)
+                        )
+                        job_file.write_text(json.dumps(completed_data, indent=2), encoding="utf-8")
+                except Exception:
+                    pass
 
                 return AvatarVideoAsset(
                     scene_id=scene_id,
@@ -146,6 +207,14 @@ class AvatarProvider(ABC):
 
             elif current_status == "failed":
                 err_msg = status_info.get("error", "Unknown provider failure")
+                try:
+                    if job_file.exists():
+                        failed_data = json.loads(job_file.read_text(encoding="utf-8"))
+                        failed_data["status"] = "failed"
+                        failed_data["error"] = err_msg
+                        job_file.write_text(json.dumps(failed_data, indent=2), encoding="utf-8")
+                except Exception:
+                    pass
                 raise RuntimeError(f"Avatar job {job_id} failed: {err_msg}")
 
             time.sleep(poll_wait)

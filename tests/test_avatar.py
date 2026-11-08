@@ -20,6 +20,7 @@ Tests:
 
 from pathlib import Path
 import pytest
+from app.core.config import settings
 from app.models.schemas import (
     LocalizedScript,
     LocalizedScene,
@@ -209,7 +210,7 @@ def test_heygen_live_call_blocked_by_cost_safety(monkeypatch):
     """Test 9: Live HeyGen API calls are strictly blocked when ENABLE_LIVE_API_TESTS=False."""
     provider = HeyGenProvider(api_key="mock_test_key")
 
-    with pytest.raises(RuntimeError, match="Live HeyGen API calls are strictly disabled"):
+    with pytest.raises(RuntimeError, match="Live HeyGen"):
         provider.submit_avatar_job(
             scene_id="s1",
             locale="ar-SA",
@@ -220,6 +221,7 @@ def test_heygen_live_call_blocked_by_cost_safety(monkeypatch):
 def test_heygen_auth_error_on_missing_key(monkeypatch):
     """Test 10: Missing HeyGen API key raises HeyGenAuthError."""
     from app.core.config import settings
+    monkeypatch.setattr(settings, "ENABLE_LIVE_HEYGEN", True)
     monkeypatch.setattr(settings, "ENABLE_LIVE_API_TESTS", True)
     provider = HeyGenProvider(api_key="")
 
@@ -291,13 +293,65 @@ def test_avatar_service_caching_idempotency(tmp_path):
     assert provider.submit_call_count == 1  # Reused from disk!
 
 
-def test_avatar_factory_instantiation():
+def test_avatar_factory_instantiation(monkeypatch):
     """Test: Factory correctly instantiates requested avatar provider."""
     mock_prov = get_avatar_provider("mock")
     assert mock_prov.provider_name == "mock"
 
+    monkeypatch.setattr(settings, "ENABLE_LIVE_HEYGEN", True)
     heygen_prov = get_avatar_provider("heygen")
     assert heygen_prov.provider_name == "heygen"
 
     with pytest.raises(ValueError, match="Unsupported Avatar provider"):
         get_avatar_provider("unsupported_xyz")
+
+
+def test_avatar_job_id_persistence_and_resume(tmp_path):
+    """Test 16: Job ID is persisted immediately and retries poll existing job without re-submitting."""
+    import json
+    from app.services.tts.mock_tts_provider import generate_synthetic_wav_file
+
+    wav_path = generate_synthetic_wav_file(tmp_path / "sample.wav", duration_seconds=1.0)
+    dest_mp4 = tmp_path / "scene_resume.mp4"
+    job_file = tmp_path / "scene_resume.job.json"
+
+    provider = MockAvatarProvider(poll_attempts_before_complete=0)
+
+    # 1. First run generates video and persists job file
+    asset = provider.generate_scene_avatar(
+        scene_id="scene_resume",
+        locale="ar-SA",
+        audio_path=wav_path,
+        destination_path=dest_mp4,
+    )
+
+    assert dest_mp4.exists()
+    assert job_file.exists()
+    assert provider.submit_call_count == 1
+
+    saved_data = json.loads(job_file.read_text(encoding="utf-8"))
+    assert saved_data["job_id"] == asset.job_id
+    assert saved_data["status"] == "completed"
+
+    # 2. Simulate interruption where dest_mp4 was deleted or not yet downloaded,
+    # but job was already submitted and in flight
+    dest_mp4.unlink()
+    saved_data["status"] = "processing"
+    in_flight_id = asset.job_id
+    saved_data["job_id"] = in_flight_id
+    job_file.write_text(json.dumps(saved_data), encoding="utf-8")
+
+    # Re-run: should resume polling in_flight_id without calling submit_avatar_job
+    provider.submit_call_count = 0
+    resumed_asset = provider.generate_scene_avatar(
+        scene_id="scene_resume",
+        locale="ar-SA",
+        audio_path=wav_path,
+        destination_path=dest_mp4,
+    )
+
+    # Submit was NOT called again; existing job ID was polled and completed!
+    assert provider.submit_call_count == 0
+    assert resumed_asset.job_id == in_flight_id
+    assert dest_mp4.exists()
+

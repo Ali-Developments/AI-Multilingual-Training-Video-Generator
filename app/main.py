@@ -39,6 +39,10 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    from fastapi.staticfiles import StaticFiles
+    settings.ensure_directories()
+    app.mount("/storage", StaticFiles(directory=str(settings.STORAGE_PATH.resolve())), name="storage")
+
     # Include API Routers
     app.include_router(api_v1_router, prefix="/api/v1")
 

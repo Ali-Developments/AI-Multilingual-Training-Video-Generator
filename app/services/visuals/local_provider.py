@@ -77,71 +77,85 @@ class LocalVisualProvider(VisualAssetProvider):
         img_path = output_dir / f"{scene.scene_id}.png"
         visual_type = classify_visual_type(scene.scene_type)
 
-        # 1. Base Canvas - Deep modern navy / dark slate (#0B132B)
-        bg_color = (11, 19, 43)
+        # 1. Base Canvas - Deep modern cinematic slate (#090D1A)
+        bg_color = (9, 13, 26)
         image = Image.new("RGB", (width, height), color=bg_color)
         draw = ImageDraw.Draw(image)
 
-        # 2. Modern accent gradient / top bar (#00E5FF to #4F46E5)
+        # Draw ambient atmospheric soft glows
+        draw.ellipse([int(width * 0.15), int(height * 0.1), int(width * 0.7), int(height * 0.75)], fill=(16, 26, 52))
+        draw.ellipse([int(width * 0.5), int(height * 0.25), int(width * 0.95), int(height * 0.9)], fill=(14, 38, 62))
+
+        # 2. Sleek accent header line
         accent_color = (0, 229, 255)
         secondary_color = (79, 70, 229)
-        draw.rectangle([0, 0, width, 12], fill=accent_color)
-        draw.rectangle([80, 70, width - 80, 74], fill=secondary_color)
+        draw.rectangle([0, 0, width, 6], fill=accent_color)
+        draw.rectangle([100, 60, width - 100, 62], fill=(30, 41, 69))
 
         # 3. Fonts
-        badge_font = _get_font(24)
-        title_font = _get_font(52)
-        heading_font = _get_font(36)
-        body_font = _get_font(30)
-        footer_font = _get_font(22)
+        title_font = _get_font(48)
+        heading_font = _get_font(34)
+        body_font = _get_font(28)
+        option_font = _get_font(26)
 
-        # 4. Scene Badge
-        badge_text = f"SCENE {scene.order}  •  {scene.scene_type.upper()}  •  {visual_type.replace('_', ' ').upper()}"
-        draw.text((80, 95), badge_text, fill=(0, 229, 255), font=badge_font)
+        # Check if Quiz Scene
+        is_quiz = (getattr(scene, "media_type", "") == "quiz") or (scene.scene_type == "quiz") or (getattr(scene, "quiz_data", None) is not None)
 
-        # 5. Scene Title
-        title_lines = _wrap_text(scene.title, max_chars=40)[:2]
-        title_y = 145
-        for line in title_lines:
-            draw.text((80, title_y), line, fill=(255, 255, 255), font=title_font)
-            title_y += 65
+        if is_quiz and getattr(scene, "quiz_data", None):
+            quiz = scene.quiz_data
+            # Quiz Card UI
+            card_x0, card_y0 = 140, 150
+            card_x1, card_y1 = width - 140, height - 200
+            draw.rounded_rectangle([card_x0, card_y0, card_x1, card_y1], radius=20, fill=(16, 24, 46), outline=(0, 229, 255), width=2)
 
-        # 6. Main Content Area Card (#1C2541)
-        card_x0, card_y0 = 80, 310
-        card_x1, card_y1 = width - 80, height - 120
-        draw.rounded_rectangle([card_x0, card_y0, card_x1, card_y1], radius=16, fill=(28, 37, 65))
-        draw.rounded_rectangle([card_x0, card_y0, card_x1, card_y1], radius=16, outline=(58, 80, 107), width=2)
+            # Quiz Badge
+            draw.rounded_rectangle([card_x0 + 40, card_y0 - 20, card_x0 + 260, card_y0 + 20], radius=10, fill=(0, 229, 255))
+            draw.text((card_x0 + 55, card_y0 - 15), "KNOWLEDGE CHECK", fill=(9, 13, 26), font=_get_font(20))
 
-        # 7. Render Card Content
-        content_y = card_y0 + 50
+            # Question Text
+            q_lines = _wrap_text(quiz.question, max_chars=48)[:3]
+            qy = card_y0 + 50
+            for line in q_lines:
+                draw.text((card_x0 + 50, qy), line, fill=(255, 255, 255), font=title_font)
+                qy += 60
 
-        # On-Screen Text (Primary Visual Focus)
-        if scene.on_screen_text and scene.on_screen_text.strip():
-            draw.text((card_x0 + 50, content_y), "KEY TAKEAWAY", fill=(0, 229, 255), font=heading_font)
-            content_y += 55
+            # Option Cards
+            opt_y = qy + 20
+            letters = ["A", "B", "C", "D"]
+            for idx, opt in enumerate(quiz.options[:4]):
+                prefix = letters[idx] if idx < len(letters) else "•"
+                opt_x0 = card_x0 + 50
+                opt_x1 = card_x1 - 50
+                draw.rounded_rectangle([opt_x0, opt_y, opt_x1, opt_y + 55], radius=12, fill=(24, 35, 65), outline=(45, 62, 105), width=1)
+                draw.text((opt_x0 + 20, opt_y + 12), f"{prefix}.", fill=(0, 229, 255), font=heading_font)
+                draw.text((opt_x0 + 70, opt_y + 14), opt, fill=(235, 240, 250), font=option_font)
+                opt_y += 70
 
-            ost_lines = _wrap_text(scene.on_screen_text, max_chars=55)[:6]
-            for line in ost_lines:
-                draw.text((card_x0 + 70, content_y), f"•  {line}", fill=(240, 240, 245), font=body_font)
-                content_y += 45
-            content_y += 30
+        else:
+            # Standard Educational Visual Slide
+            # Scene Title (clean, no "SCENE 1" debug text)
+            title_lines = _wrap_text(scene.title, max_chars=45)[:2]
+            title_y = 100
+            for line in title_lines:
+                draw.text((100, title_y), line, fill=(255, 255, 255), font=title_font)
+                title_y += 62
 
-        # Purpose or Visual Direction
-        if scene.purpose and scene.purpose.strip():
-            draw.text((card_x0 + 50, content_y), "OBJECTIVE", fill=(160, 180, 210), font=heading_font)
-            content_y += 50
-            purpose_lines = _wrap_text(scene.purpose, max_chars=60)[:3]
-            for line in purpose_lines:
-                draw.text((card_x0 + 70, content_y), line, fill=(200, 210, 225), font=body_font)
-                content_y += 42
+            # Main Visual Focus Card
+            if scene.on_screen_text and scene.on_screen_text.strip():
+                card_x0, card_y0 = 100, title_y + 30
+                card_x1, card_y1 = width - 100, height - 200
+                draw.rounded_rectangle([card_x0, card_y0, card_x1, card_y1], radius=18, fill=(16, 25, 48), outline=(38, 55, 96), width=2)
 
-        # 8. Footer Info
-        footer_text = f"Locale: {locale}  |  Video Automation  |  {scene.scene_id}"
-        draw.text((80, height - 70), footer_text, fill=(110, 130, 160), font=footer_font)
+                # Key Focus Text
+                cy = card_y0 + 40
+                ost_lines = _wrap_text(scene.on_screen_text.strip(), max_chars=48)[:5]
+                for line in ost_lines:
+                    draw.text((card_x0 + 60, cy), line, fill=(240, 245, 255), font=heading_font)
+                    cy += 55
 
         # 9. Save PNG deterministically
         image.save(img_path, format="PNG")
-        logger.info("Generated local visual slide for scene '%s' at %s", scene.scene_id, img_path)
+        logger.info("Generated clean visual slide for scene '%s' at %s", scene.scene_id, img_path)
 
         return SceneVisualAsset(
             scene_id=scene.scene_id,

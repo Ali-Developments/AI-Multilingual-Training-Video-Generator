@@ -128,7 +128,10 @@ def test_provider_structured_output():
     assert parsed_model.title == "Introduction to Phishing"
     assert parsed_model.estimated_duration_seconds == 12
     _, call_kwargs = mock_client.chat.completions.create.call_args
-    assert call_kwargs["response_format"] == {"type": "json_object"}
+    resp_fmt = call_kwargs["response_format"]
+    assert resp_fmt["type"] == "json_schema"
+    assert resp_fmt["json_schema"]["strict"] is True
+    assert resp_fmt["json_schema"]["name"] == "SceneDraft"
 
 
 def test_provider_generate_script_draft():

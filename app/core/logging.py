@@ -14,6 +14,18 @@ def setup_logging(log_level: Optional[str] = None) -> logging.Logger:
     log_format = "%(asctime)s | %(levelname)-8s | %(name)s:%(funcName)s:%(lineno)d - %(message)s"
     date_format = "%Y-%m-%d %H:%M:%S"
 
+    # Ensure Windows console streams support UTF-8 characters (Arabic, Bengali, etc.)
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+    if hasattr(sys.stderr, "reconfigure"):
+        try:
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
     # Configure root logger
     logging.basicConfig(
         level=level,

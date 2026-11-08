@@ -18,6 +18,7 @@ from app.services.subtitles.formatter import (
     split_narration_into_chunks,
     serialize_srt,
     serialize_vtt,
+    serialize_ass,
 )
 from app.services.localization.locale_utils import get_text_direction
 
@@ -60,6 +61,7 @@ class SubtitleService:
         for scene in script.scenes:
             srt_dest = sub_dir / f"{scene.scene_id}.srt"
             vtt_dest = sub_dir / f"{scene.scene_id}.vtt"
+            ass_dest = sub_dir / f"{scene.scene_id}.ass"
             exact_duration = audio_map.get(scene.scene_id, float(scene.estimated_duration_seconds))
 
             # Idempotency check: reuse valid existing subtitle files
@@ -67,6 +69,7 @@ class SubtitleService:
                 not force_regenerate
                 and srt_dest.exists()
                 and vtt_dest.exists()
+                and ass_dest.exists()
             ):
                 logger.info("Reusing existing subtitle asset for scene '%s' (%s)", scene.scene_id, locale)
                 raw_srt = srt_dest.read_text(encoding="utf-8").strip()
@@ -77,6 +80,7 @@ class SubtitleService:
                         locale=locale,
                         srt_path=str(srt_dest.resolve()),
                         vtt_path=str(vtt_dest.resolve()),
+                        ass_path=str(ass_dest.resolve()),
                         chunk_count=len(parsed_cues),
                         duration_seconds=exact_duration,
                         text_direction=get_text_direction(locale),
@@ -102,6 +106,7 @@ class SubtitleService:
                         locale=locale,
                         srt_path="",
                         vtt_path="",
+                        ass_path="",
                         chunk_count=0,
                         duration_seconds=exact_duration,
                         text_direction=get_text_direction(locale),
@@ -120,7 +125,7 @@ class SubtitleService:
         else:
             track_status = "failed"
 
-        # Assemble track-level cumulative subtitles (subtitles.srt and subtitles.vtt)
+        # Assemble track-level cumulative subtitles (subtitles.srt, subtitles.vtt, subtitles.ass)
         all_chunks = []
         elapsed = 0.0
         global_cue_idx = 1
@@ -142,18 +147,22 @@ class SubtitleService:
 
         track_srt = sub_dir / "subtitles.srt"
         track_vtt = sub_dir / "subtitles.vtt"
+        track_ass = sub_dir / "subtitles.ass"
         if all_chunks:
             track_srt.write_text(serialize_srt(all_chunks), encoding="utf-8")
             track_vtt.write_text(serialize_vtt(all_chunks), encoding="utf-8")
+            track_ass.write_text(serialize_ass(all_chunks, locale=locale), encoding="utf-8")
         else:
             track_srt.write_text("", encoding="utf-8")
             track_vtt.write_text("WEBVTT\n\n", encoding="utf-8")
+            track_ass.write_text("", encoding="utf-8")
 
         return LocalizedSubtitleTrack(
             locale=locale,
             scene_subtitles=scene_subtitles,
             srt_path=str(track_srt.resolve()),
             vtt_path=str(track_vtt.resolve()),
+            ass_path=str(track_ass.resolve()),
             status=track_status,
             metadata={
                 "provider": self.provider.provider_name,

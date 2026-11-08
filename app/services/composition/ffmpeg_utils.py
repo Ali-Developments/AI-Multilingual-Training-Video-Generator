@@ -62,10 +62,15 @@ def escape_ffmpeg_filter_path(file_path: Path) -> str:
     """
     Escape filesystem path for use inside FFmpeg filtergraph strings on Windows and POSIX.
     
-    FFmpeg subtitles filter requires escaping backslashes and colons (e.g. C\\:/path/sub.srt).
+    FFmpeg subtitles and ass filters require double-escaping the drive colon
+    (e.g. C\\\\:/path/sub.ass) so the filtergraph parser preserves the full path.
     """
-    path_str = str(file_path.resolve()).replace("\\", "/")
-    # Escape colon following drive letter (e.g., C: -> C\\:)
-    if len(path_str) > 1 and path_str[1] == ":":
-        path_str = path_str[0] + "\\:" + path_str[2:]
-    return path_str
+    try:
+        # If path is inside current working directory, relative posix path avoids drive letters completely
+        return file_path.resolve().relative_to(Path.cwd()).as_posix()
+    except Exception:
+        path_str = str(file_path.resolve()).replace("\\", "/")
+        if len(path_str) > 1 and path_str[1] == ":":
+            path_str = path_str[0] + "\\\\:" + path_str[2:]
+        return path_str
+

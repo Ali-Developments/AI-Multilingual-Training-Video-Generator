@@ -40,7 +40,11 @@ async def get_health() -> HealthResponse:
         storage_accessible=storage_accessible,
         details={
             "default_llm": settings.DEFAULT_LLM_PROVIDER,
+            "llm_provider": settings.DEFAULT_LLM_PROVIDER,
+            "llm_model": settings.GROQ_MODEL if settings.DEFAULT_LLM_PROVIDER == "groq" else settings.DEFAULT_LLM_PROVIDER,
             "default_tts": settings.DEFAULT_TTS_PROVIDER,
-            "storage_path": str(settings.STORAGE_PATH)
+            "default_avatar": settings.DEFAULT_AVATAR_PROVIDER,
+            "enable_live_heygen": getattr(settings, "ENABLE_LIVE_HEYGEN", False),
+            "storage_path": str(settings.STORAGE_PATH),
         }
     )
