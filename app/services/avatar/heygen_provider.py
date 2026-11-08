@@ -374,19 +374,20 @@ class HeyGenProvider(AvatarProvider):
 
     def get_remaining_quota(self) -> Dict[str, Any]:
         """
-        Retrieve current remaining credit quota from HeyGen v1 user endpoint.
+        Retrieve current remaining credit quota from HeyGen v2 user endpoint.
         Used for budget checking and approval workflows.
         """
         self._check_live_call_permitted()
         headers = self._get_headers()
-        url = f"{self.BASE_URL}/v1/user.remaining_quota"
+        url = f"{self.BASE_URL}/v2/user/remaining_quota"
 
         try:
             resp = self.session.get(url, headers=headers, timeout=20)
             resp.raise_for_status()
             data = resp.json().get("data", {})
+            quota_val = data.get("remaining_quota") if "remaining_quota" in data else data.get("quota", 0.0)
             return {
-                "remaining_quota": data.get("quota", 0.0),
+                "remaining_quota": quota_val,
                 "details": data,
             }
         except Exception as e:

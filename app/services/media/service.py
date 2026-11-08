@@ -57,15 +57,21 @@ class SceneMediaService:
 
         if mt_str in ("veo", "ai_video") or pref_prov == "veo" or default_prov == "veo":
             logger.info("Dispatching scene '%s' to Google Veo video provider.", scene.scene_id)
-            veo_provider = get_media_provider("veo")
-            return veo_provider.generate_scene_media(
-                scene=scene,
-                locale=locale,
-                output_dir=output_dir,
-                duration_seconds=duration_seconds,
-                background_image_path=background_image_path,
-                custom_media_path=custom_path,
-            )
+            try:
+                veo_provider = get_media_provider("veo")
+                return veo_provider.generate_scene_media(
+                    scene=scene,
+                    locale=locale,
+                    output_dir=output_dir,
+                    duration_seconds=duration_seconds,
+                    background_image_path=background_image_path,
+                    custom_media_path=custom_path,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Veo video generation unavailable for scene '%s' (%s); falling back to continuous motion visual",
+                    scene.scene_id, e
+                )
 
         # 3. Default to cinematic local motion visual
         return self.motion_provider.generate_scene_media(
