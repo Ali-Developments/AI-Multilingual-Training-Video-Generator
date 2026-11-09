@@ -144,16 +144,21 @@ def test_sadtalker_subprocess_inference_mocked_success(dummy_source_image, dummy
     dest_mp4 = tmp_path / "final_scene_1.mp4"
 
     def mock_run(cmd, **kwargs):
-        # Find result_dir from cmd
-        res_idx = cmd.index("--result_dir") + 1
-        res_dir = Path(cmd[res_idx])
-        res_dir.mkdir(parents=True, exist_ok=True)
-        # Create simulated generated MP4
-        fake_mp4 = res_dir / "2026_10_07_output.mp4"
-        fake_mp4.write_bytes(b"MOCK_MP4_HEADER_DATA" + b"\x00" * 4096)
+        if "--result_dir" in cmd:
+            res_idx = cmd.index("--result_dir") + 1
+            res_dir = Path(cmd[res_idx])
+            res_dir.mkdir(parents=True, exist_ok=True)
+            # Create simulated generated MP4
+            fake_mp4 = res_dir / "2026_10_07_output.mp4"
+            fake_mp4.write_bytes(b"MOCK_MP4_HEADER_DATA" + b"\x00" * 4096)
+            mock_res = MagicMock()
+            mock_res.returncode = 0
+            mock_res.stdout = "Inference completed successfully"
+            mock_res.stderr = ""
+            return mock_res
         mock_res = MagicMock()
         mock_res.returncode = 0
-        mock_res.stdout = "Inference completed successfully"
+        mock_res.stdout = '{"format": {"duration": "8.35"}, "streams": [{"codec_type": "video", "width": 1024, "height": 1024, "codec_name": "h264"}]}'
         mock_res.stderr = ""
         return mock_res
 

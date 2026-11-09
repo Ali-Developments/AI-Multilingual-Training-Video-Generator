@@ -45,6 +45,18 @@ class FFmpegCompositionProvider(CompositionProvider):
                 "Please install FFmpeg or set DEFAULT_COMPOSITION_PROVIDER='mock'."
             )
 
+        audio_path = Path(audio_path)
+        if visual_image_path:
+            visual_image_path = Path(visual_image_path)
+        if avatar_video_path:
+            avatar_video_path = Path(avatar_video_path)
+        if subtitle_path:
+            subtitle_path = Path(subtitle_path)
+        if motion_video_path:
+            motion_video_path = Path(motion_video_path)
+        if output_path:
+            output_path = Path(output_path)
+
         if not audio_path.exists():
             raise FileNotFoundError(f"Required audio asset not found: {audio_path}")
 
