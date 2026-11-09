@@ -34,6 +34,7 @@ class StoryboardPlanner:
         request_or_topic: Any = "",
         video_style: Optional[str] = None,
         base_language: str = "en-US",
+        persistent_presenter: Optional[bool] = None,
     ) -> Any:
         """
         Enrich each scene in the script with intelligent media types,
@@ -61,12 +62,23 @@ class StoryboardPlanner:
         else:
             avatar_provider = getattr(settings, "DEFAULT_AVATAR_PROVIDER", "heygen").strip().lower()
 
+        # Determine whether persistent presenter architecture is active
+        if persistent_presenter is not None:
+            is_persistent = bool(persistent_presenter)
+        elif hasattr(request_or_topic, "persistent_presenter") and request_or_topic.persistent_presenter is not None:
+            is_persistent = bool(request_or_topic.persistent_presenter)
+        elif style == VideoStyle.PRESENTER_LED.value:
+            is_persistent = True
+        else:
+            is_persistent = getattr(settings, "PERSISTENT_PRESENTER_ENABLED", False)
+
         logger.info(
-            "Planning storyboard for %d scenes (topic='%s', style='%s', avatar_provider='%s')",
+            "Planning storyboard for %d scenes (topic='%s', style='%s', avatar_provider='%s', persistent=%s)",
             total,
             topic_clean,
             style,
             avatar_provider,
+            is_persistent,
         )
 
         for idx, scene in enumerate(scenes):
@@ -75,17 +87,22 @@ class StoryboardPlanner:
             is_last = (order == total)
             stype = (scene.scene_type or "presenter").lower()
             text_lower = f"{scene.title} {scene.purpose} {scene.narration}".lower()
+            has_spoken_narration = bool(scene.narration and scene.narration.strip())
 
             # 1. First Scene: Introduction
             if is_first:
                 scene.media_type = SceneMediaType.PRESENTER.value
                 scene.layout_type = (
-                    SceneLayoutType.PRESENTER_FULL.value
-                    if style in (VideoStyle.PRESENTER_LED.value, VideoStyle.HYBRID_PRESENTER_BROLL.value, VideoStyle.CORPORATE_TRAINING.value)
-                    else SceneLayoutType.PRESENTER_SPLIT.value
+                    SceneLayoutType.PRESENTER_LEFT_VISUAL_RIGHT.value
+                    if is_persistent
+                    else (
+                        SceneLayoutType.PRESENTER_FULL.value
+                        if style in (VideoStyle.PRESENTER_LED.value, VideoStyle.HYBRID_PRESENTER_BROLL.value, VideoStyle.CORPORATE_TRAINING.value)
+                        else SceneLayoutType.PRESENTER_SPLIT.value
+                    )
                 )
                 scene.avatar_enabled = True
-                scene.presenter_position = "center" if scene.layout_type == SceneLayoutType.PRESENTER_FULL.value else "right"
+                scene.presenter_position = "left" if is_persistent else ("center" if scene.layout_type == SceneLayoutType.PRESENTER_FULL.value else "right")
                 scene.visual_prompt = f"Professional studio setting introducing {topic_clean}"
                 scene.preferred_provider = avatar_provider
                 scene.camera_movement = "static"
@@ -94,7 +111,7 @@ class StoryboardPlanner:
             # 2. Final Scene: Outro / Call to Action
             elif is_last:
                 scene.media_type = SceneMediaType.OUTRO.value
-                scene.layout_type = SceneLayoutType.PRESENTER_FULL.value
+                scene.layout_type = SceneLayoutType.PRESENTER_CENTER_WITH_OVERLAYS.value if is_persistent else SceneLayoutType.PRESENTER_FULL.value
                 scene.avatar_enabled = True
                 scene.presenter_position = "center"
                 scene.visual_prompt = f"Presenter delivering closing takeaways and call to action for {topic_clean}"
@@ -105,8 +122,13 @@ class StoryboardPlanner:
             # 3. Quiz / Knowledge Check Scene
             elif stype == "quiz" or "question" in text_lower or "quiz" in text_lower or "اختبار" in text_lower or "سؤال" in text_lower:
                 scene.media_type = SceneMediaType.QUIZ.value
-                scene.layout_type = SceneLayoutType.QUIZ_CARD.value
-                scene.avatar_enabled = False
+                scene.layout_type = (
+                    SceneLayoutType.PRESENTER_LEFT_VISUAL_RIGHT.value
+                    if (is_persistent and has_spoken_narration)
+                    else SceneLayoutType.QUIZ_CARD.value
+                )
+                scene.avatar_enabled = bool(is_persistent and has_spoken_narration)
+                scene.presenter_position = "left"
                 scene.visual_prompt = f"Educational assessment question for {topic_clean}"
                 scene.preferred_provider = "quiz"
                 scene.camera_movement = "static"
@@ -114,21 +136,22 @@ class StoryboardPlanner:
                 if not scene.quiz_data:
                     scene.quiz_data = cls._generate_fallback_quiz(scene, topic_clean)
 
-            # 4. Middle Body Scenes planned according to VideoStyle
+            # 4. Middle Body Educational Scenes
             elif style == VideoStyle.PRESENTER_LED.value:
                 if idx % 2 == 1:
                     scene.media_type = SceneMediaType.PRESENTER.value
-                    scene.layout_type = SceneLayoutType.PRESENTER_SPLIT.value
+                    scene.layout_type = SceneLayoutType.PRESENTER_LEFT_VISUAL_RIGHT.value if is_persistent else SceneLayoutType.PRESENTER_SPLIT.value
                     scene.avatar_enabled = True
-                    scene.presenter_position = "right"
+                    scene.presenter_position = "left" if is_persistent else "right"
                     scene.visual_prompt = f"Supporting visual diagram illustrating {scene.title}"
                     scene.preferred_provider = avatar_provider
                     scene.camera_movement = "static"
                     scene.motion_description = f"Presenter explaining core concepts of {scene.title} with natural gestures and lip-sync."
                 else:
                     scene.media_type = SceneMediaType.MOTION_VISUAL.value
-                    scene.layout_type = SceneLayoutType.MEDIA_WITH_OVERLAY.value
-                    scene.avatar_enabled = False
+                    scene.layout_type = SceneLayoutType.PRESENTER_RIGHT_VISUAL_LEFT.value if is_persistent else SceneLayoutType.MEDIA_WITH_OVERLAY.value
+                    scene.avatar_enabled = is_persistent
+                    scene.presenter_position = "right"
                     scene.visual_prompt = f"High-impact motion visual for {scene.title}"
                     scene.preferred_provider = "local_motion"
                     scene.camera_movement = "slow zoom-in"
@@ -154,21 +177,21 @@ class StoryboardPlanner:
                 demo_keywords = (
                     "action", "step", "demonstrat", "procedure", "process", "workflow",
                     "hands-on", "technique", "practice", "guide", "setup", "perform",
-                    "execute", "apply", "how-to", "tutorial", "method", "drill"
+                    "execute", "apply", "how-to", "tutorial", "method", "drill", "تطبيق", "خطوة", "فحص"
                 )
                 if any(k in text_lower or k in topic_clean.lower() for k in demo_keywords):
                     scene.media_type = SceneMediaType.BROLL.value
-                    scene.layout_type = SceneLayoutType.MEDIA_FULL.value
-                    scene.avatar_enabled = False
+                    scene.layout_type = SceneLayoutType.PRESENTER_PICTURE_IN_PICTURE.value if is_persistent else SceneLayoutType.MEDIA_FULL.value
+                    scene.avatar_enabled = is_persistent
                     scene.preferred_provider = "veo"
                     scene.camera_movement = "slow pan"
                     scene.visual_prompt = f"Step-by-step demonstration B-roll showing {scene.title} for {topic_clean}"
                     scene.motion_description = f"Cinematic instructional demonstration showing {scene.title} with fluid realistic motion."
                 else:
                     scene.media_type = SceneMediaType.PRESENTER.value
-                    scene.layout_type = SceneLayoutType.PRESENTER_SPLIT.value
+                    scene.layout_type = SceneLayoutType.PRESENTER_LEFT_VISUAL_RIGHT.value if is_persistent else SceneLayoutType.PRESENTER_SPLIT.value
                     scene.avatar_enabled = True
-                    scene.presenter_position = "right"
+                    scene.presenter_position = "left" if is_persistent else "right"
                     scene.preferred_provider = avatar_provider
                     scene.camera_movement = "static"
                     scene.visual_prompt = f"Tutorial demonstration visual for {scene.title}"
@@ -176,47 +199,81 @@ class StoryboardPlanner:
 
             else:
                 # Default: HYBRID_PRESENTER_BROLL
-                if stype in ("visual_demo", "demonstration", "example"):
-                    scene.media_type = SceneMediaType.BROLL.value
-                    scene.layout_type = SceneLayoutType.MEDIA_FULL.value
-                    scene.avatar_enabled = False
-                    scene.preferred_provider = "veo"
-                    scene.camera_movement = "slow pan"
-                    scene.visual_prompt = f"Dynamic B-roll footage showing {scene.title}"
-                    scene.motion_description = f"Cinematic B-roll capturing {scene.title} with realistic camera motion and professional lighting."
-                elif stype in ("explanation", "concept"):
-                    scene.media_type = SceneMediaType.MOTION_VISUAL.value
-                    scene.layout_type = SceneLayoutType.MEDIA_WITH_OVERLAY.value
-                    scene.avatar_enabled = False
-                    scene.preferred_provider = "local_motion"
-                    scene.camera_movement = "slow zoom-in"
-                    scene.visual_prompt = f"Cinematic motion graphic illustrating {scene.title}"
-                    scene.motion_description = f"Subtle animated Ken Burns motion graphic overlay highlighting {scene.title}."
-                elif stype in ("presenter", "recap", "summary"):
-                    scene.media_type = SceneMediaType.PRESENTER.value
-                    scene.layout_type = SceneLayoutType.PRESENTER_SPLIT.value
+                demo_keywords = (
+                    "action", "step", "demonstrat", "procedure", "process", "workflow",
+                    "hands-on", "technique", "practice", "guide", "setup", "perform",
+                    "execute", "apply", "how-to", "tutorial", "method", "drill", "تطبيق", "خطوة", "فحص"
+                )
+                is_demo = stype in ("visual_demo", "demonstration", "example") or any(k in text_lower or k in topic_clean.lower() for k in demo_keywords)
+
+                if is_persistent:
                     scene.avatar_enabled = True
-                    scene.presenter_position = "right"
-                    scene.preferred_provider = avatar_provider
-                    scene.camera_movement = "static"
-                    scene.visual_prompt = f"Visual infographic card supporting {scene.title}"
-                    scene.motion_description = f"Presenter explaining {scene.title} with synchronized lip movements."
+                    if is_demo:
+                        scene.media_type = SceneMediaType.BROLL.value
+                        scene.layout_type = (
+                            SceneLayoutType.PRESENTER_PICTURE_IN_PICTURE.value
+                            if idx % 2 == 1
+                            else SceneLayoutType.PRESENTER_LEFT_VISUAL_RIGHT.value
+                        )
+                        scene.presenter_position = "right" if scene.layout_type == SceneLayoutType.PRESENTER_PICTURE_IN_PICTURE.value else "left"
+                        scene.preferred_provider = "veo"
+                        scene.camera_movement = "slow pan"
+                        scene.visual_prompt = f"Step-by-step demonstration B-roll showing {scene.title} for {topic_clean}"
+                        scene.motion_description = f"Cinematic instructional demonstration showing {scene.title} with fluid realistic motion while presenter instructs."
+                    else:
+                        scene.media_type = SceneMediaType.MOTION_VISUAL.value
+                        scene.layout_type = (
+                            SceneLayoutType.PRESENTER_RIGHT_VISUAL_LEFT.value
+                            if idx % 2 == 1
+                            else SceneLayoutType.PRESENTER_LEFT_VISUAL_RIGHT.value
+                        )
+                        scene.presenter_position = "right" if scene.layout_type == SceneLayoutType.PRESENTER_RIGHT_VISUAL_LEFT.value else "left"
+                        scene.preferred_provider = "local_motion"
+                        scene.camera_movement = "slow zoom-in"
+                        scene.visual_prompt = f"Cinematic motion graphic illustrating {scene.title}"
+                        scene.motion_description = f"Subtle animated motion graphic overlay highlighting {scene.title} supporting the presenter's narration."
                 else:
-                    if idx % 2 == 1:
+                    if stype in ("visual_demo", "demonstration", "example"):
+                        scene.media_type = SceneMediaType.BROLL.value
+                        scene.layout_type = SceneLayoutType.MEDIA_FULL.value
+                        scene.avatar_enabled = False
+                        scene.preferred_provider = "veo"
+                        scene.camera_movement = "slow pan"
+                        scene.visual_prompt = f"Dynamic B-roll footage showing {scene.title}"
+                        scene.motion_description = f"Cinematic B-roll capturing {scene.title} with realistic camera motion and professional lighting."
+                    elif stype in ("explanation", "concept"):
                         scene.media_type = SceneMediaType.MOTION_VISUAL.value
                         scene.layout_type = SceneLayoutType.MEDIA_WITH_OVERLAY.value
                         scene.avatar_enabled = False
                         scene.preferred_provider = "local_motion"
                         scene.camera_movement = "slow zoom-in"
-                        scene.motion_description = f"Motion visual highlighting {scene.title}."
-                    else:
+                        scene.visual_prompt = f"Cinematic motion graphic illustrating {scene.title}"
+                        scene.motion_description = f"Subtle animated Ken Burns motion graphic overlay highlighting {scene.title}."
+                    elif stype in ("presenter", "recap", "summary"):
                         scene.media_type = SceneMediaType.PRESENTER.value
                         scene.layout_type = SceneLayoutType.PRESENTER_SPLIT.value
                         scene.avatar_enabled = True
                         scene.presenter_position = "right"
                         scene.preferred_provider = avatar_provider
                         scene.camera_movement = "static"
-                        scene.motion_description = f"Presenter explaining {scene.title}."
+                        scene.visual_prompt = f"Visual infographic card supporting {scene.title}"
+                        scene.motion_description = f"Presenter explaining {scene.title} with synchronized lip movements."
+                    else:
+                        if idx % 2 == 1:
+                            scene.media_type = SceneMediaType.MOTION_VISUAL.value
+                            scene.layout_type = SceneLayoutType.MEDIA_WITH_OVERLAY.value
+                            scene.avatar_enabled = False
+                            scene.preferred_provider = "local_motion"
+                            scene.camera_movement = "slow zoom-in"
+                            scene.motion_description = f"Motion visual highlighting {scene.title}."
+                        else:
+                            scene.media_type = SceneMediaType.PRESENTER.value
+                            scene.layout_type = SceneLayoutType.PRESENTER_SPLIT.value
+                            scene.avatar_enabled = True
+                            scene.presenter_position = "right"
+                            scene.preferred_provider = avatar_provider
+                            scene.camera_movement = "static"
+                            scene.motion_description = f"Presenter explaining {scene.title}."
 
             # Finalize per-scene media metadata and structured media plan
             scene.aspect_ratio = getattr(scene, "aspect_ratio", None) or "16:9"

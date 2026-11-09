@@ -22,14 +22,26 @@ AVATAR_ELIGIBLE_SCENE_TYPES = {
     "recap",
 }
 
+# Layout types that actively feature the talking-head presenter
+PRESENTER_ACTIVE_LAYOUTS = {
+    "presenter_left_visual_right",
+    "presenter_right_visual_left",
+    "presenter_picture_in_picture",
+    "presenter_center_with_overlays",
+    "presenter_split",
+    "presenter_overlay",
+    "presenter_full",
+    "pip",
+}
+
 
 def is_avatar_eligible(scene: Union[SceneDraft, LocalizedScene]) -> bool:
     """
     Determine if a scene is eligible for talking-head avatar synthesis.
     
     Returns:
-        True if avatar_enabled is True and media_type/scene_type indicates presenter representation.
-        False for visual demos, broll, slides, diagrams, quizzes, or when avatar_enabled is explicitly False.
+        True if avatar_enabled is True and scene features a presenter layout or presenter scene/media type.
+        False for standalone visual demos, broll, slides, diagrams, quizzes, or when avatar_enabled is False.
     """
     if getattr(scene, "avatar_enabled", True) is False:
         return False
@@ -37,8 +49,10 @@ def is_avatar_eligible(scene: Union[SceneDraft, LocalizedScene]) -> bool:
     layout_type = getattr(scene, "layout_type", None)
     if layout_type is not None:
         lt = str(layout_type.value if hasattr(layout_type, "value") else layout_type).strip().lower()
-        if lt in ("presenter_split", "presenter_overlay", "presenter_full", "pip"):
+        if lt in PRESENTER_ACTIVE_LAYOUTS:
             return True
+        if lt in ("media_full", "media_with_overlay", "title_card", "quiz_card"):
+            return False
 
     media_type = getattr(scene, "media_type", None)
     if media_type is not None:

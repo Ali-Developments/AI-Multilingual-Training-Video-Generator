@@ -121,15 +121,12 @@ class FFmpegCompositionProvider(CompositionProvider):
             f"pad={settings.VIDEO_WIDTH}:{settings.VIDEO_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black,setsar=1"
         )
 
-        layout = (layout_type or "presenter_split").lower()
-        pos = (presenter_position or "right").lower()
+        layout = (layout_type or "presenter_left_visual_right").lower()
+        pos = (presenter_position or "left").lower()
 
-        # CASE 1: Presenter-Led Layouts
+        # CASE 1: Presenter-Led Layouts (Persistent Presenter Architecture)
         if has_avatar:
-            if layout in ("presenter_split", "presenter_overlay") and has_visual:
-                logger.info("Composing presenter_split scene '%s' (presenter_pos=%s)", scene_id, pos)
-                # Split proportions: Presenter = 42% (806px), Supporting Media = 58% (1114px)
-                # Base media input: motion video or image
+            if has_visual:
                 media_input = str(motion_video_path.resolve()) if has_motion else str(visual_image_path.resolve())
                 media_is_loop = not has_motion
 
@@ -141,13 +138,48 @@ class FFmpegCompositionProvider(CompositionProvider):
                     base_cmd.extend(["-stream_loop", "-1"])
                 base_cmd.extend(["-i", media_input, "-i", str(audio_path.resolve())])
 
-                # Build filter complex with full-bleed presenter framing (no black bars)
-                av_filter = "[0:v]scale=806:1080:force_original_aspect_ratio=increase,crop=806:1080,setsar=1[av];"
-                med_filter = "[1:v]scale=1114:1080:force_original_aspect_ratio=increase,crop=1114:1080,setsar=1[med];"
-                if pos == "left":
-                    stack_filter = f"{av_filter}{med_filter}[av][med]hstack=inputs=2[stacked];[stacked]drawbox=x=805:y=0:w=3:h=1080:color=0x00E5FF@0.7:t=fill[composed]"
-                else:  # right (default for RTL & modern studio)
-                    stack_filter = f"{av_filter}{med_filter}[med][av]hstack=inputs=2[stacked];[stacked]drawbox=x=1112:y=0:w=3:h=1080:color=0x00E5FF@0.7:t=fill[composed]"
+                # Determine presentation mode
+                if layout in ("presenter_right_visual_left",) or (layout == "presenter_split" and pos == "right"):
+                    # Presenter Right, Supporting Visual Left
+                    logger.info("Composing presenter_right_visual_left scene '%s'", scene_id)
+                    av_f = "[0:v]scale=806:1080:force_original_aspect_ratio=increase,crop=806:1080,setsar=1[av];"
+                    med_f = "[1:v]scale=1114:1080:force_original_aspect_ratio=increase,crop=1114:1080,setsar=1[med];"
+                    stack_filter = f"{av_f}{med_f}[med][av]hstack=inputs=2[stacked];[stacked]drawbox=x=1112:y=0:w=3:h=1080:color=0x00E5FF@0.7:t=fill[composed]"
+
+                elif layout in ("presenter_picture_in_picture", "pip", "presenter_overlay", "media_full", "media_with_overlay"):
+                    # High-emphasis Visual Full Screen + Persistent Floating Presenter PiP
+                    logger.info("Composing presenter_picture_in_picture scene '%s' (pip_pos=%s)", scene_id, pos)
+                    bg_f = "[1:v]scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,setsar=1[bg];"
+                    pip_f = "[0:v]scale=480:480:force_original_aspect_ratio=increase,crop=480:480,setsar=1[pip_av];"
+                    pip_x = 40 if pos == "left" else 1400
+                    pip_y = 560
+                    box_x = pip_x - 3
+                    box_y = pip_y - 3
+                    stack_filter = (
+                        f"{bg_f}{pip_f}[bg][pip_av]overlay={pip_x}:{pip_y}[with_pip];"
+                        f"[with_pip]drawbox=x={box_x}:y={box_y}:w=486:h=486:color=0x00E5FF@0.85:t=3[composed]"
+                    )
+
+                elif layout in ("presenter_center_with_overlays", "presenter_full"):
+                    # Centered Broadcast Presenter Studio with optional supporting visual preview
+                    logger.info("Composing presenter_center_with_overlays scene '%s'", scene_id)
+                    bg_f = "[0:v]split=2[fg][bg];[bg]scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,boxblur=25:25,eq=brightness=-0.15[bg_blur];"
+                    fg_f = "[fg]scale=1080:1080:force_original_aspect_ratio=decrease[fg_scaled];"
+                    # Small preview badge for supporting visual at top corner
+                    badge_x = 1420 if pos == "left" else 60
+                    badge_f = "[1:v]scale=440:248:force_original_aspect_ratio=increase,crop=440:248,setsar=1[badge];"
+                    stack_filter = (
+                        f"{bg_f}{fg_f}{badge_f}[bg_blur][fg_scaled]overlay=420:0[with_fg];"
+                        f"[with_fg][badge]overlay={badge_x}:60[with_badge];"
+                        f"[with_badge]drawbox=x={badge_x-2}:y=58:w=444:h=252:color=0x00E5FF@0.7:t=2[composed]"
+                    )
+
+                else:
+                    # Default: presenter_left_visual_right
+                    logger.info("Composing presenter_left_visual_right scene '%s'", scene_id)
+                    av_f = "[0:v]scale=806:1080:force_original_aspect_ratio=increase,crop=806:1080,setsar=1[av];"
+                    med_f = "[1:v]scale=1114:1080:force_original_aspect_ratio=increase,crop=1114:1080,setsar=1[med];"
+                    stack_filter = f"{av_f}{med_f}[av][med]hstack=inputs=2[stacked];[stacked]drawbox=x=805:y=0:w=3:h=1080:color=0x00E5FF@0.7:t=fill[composed]"
 
                 final_split_filter = f"{stack_filter};[composed]{sub_filter}[sub_out]" if sub_filter else stack_filter
                 out_map = "[sub_out]" if sub_filter else "[composed]"
@@ -166,7 +198,7 @@ class FFmpegCompositionProvider(CompositionProvider):
                 if _execute_ffmpeg(cmd_split):
                     sub_burned = bool(sub_filter)
                 else:
-                    logger.warning("Presenter split with subtitles failed; retrying unburned")
+                    logger.warning("Presenter composition with subtitles failed; retrying unburned")
                     cmd_split_no_sub = base_cmd + [
                         "-filter_complex", stack_filter,
                         "-map", "[composed]",
@@ -180,17 +212,11 @@ class FFmpegCompositionProvider(CompositionProvider):
                     if _execute_ffmpeg(cmd_split_no_sub):
                         sub_burned = False
                     else:
-                        logger.warning("Presenter split composition failed, falling back to centered presenter")
-                        layout = "presenter_full"
-            else:
-                layout = "presenter_full"
+                        raise RuntimeError(f"FFmpeg composition failed for persistent presenter scene '{scene_id}'")
 
-            if layout in ("presenter_full", "pip", "presenter_overlay") and not sub_burned:
-                # Presenter Full or Centered
-                logger.info("Composing broadcast presenter_full scene '%s' for locale '%s'", scene_id, locale)
-                # Dual-layer broadcast framing:
-                # Layer 1 (Background): ambient blurred office background filled edge-to-edge (1920x1080)
-                # Layer 2 (Foreground): crisp centered 1080p presenter
+            else:
+                # Presenter-only without supporting visual
+                logger.info("Composing broadcast presenter scene '%s' for locale '%s'", scene_id, locale)
                 bg_filter = "[0:v]split=2[fg][bg];[bg]scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,boxblur=25:25,eq=brightness=-0.15[bg_blur];"
                 fg_filter = "[fg]scale=1080:1080:force_original_aspect_ratio=decrease[fg_scaled];"
                 layer_filter = f"{bg_filter}{fg_filter}[bg_blur][fg_scaled]overlay=420:0[composed]"

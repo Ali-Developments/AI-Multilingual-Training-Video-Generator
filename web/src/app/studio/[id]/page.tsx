@@ -461,14 +461,14 @@ export default function SceneStudioPage() {
                     <div className="flex items-center gap-1.5 text-[10px]">
                       <span
                         className={`px-1.5 py-0.5 rounded font-medium capitalize ${
-                          isPresenter
+                          sc.avatar_enabled !== false
                             ? 'bg-purple-950/80 text-purple-300 border border-purple-800/60'
                             : isQuiz
                             ? 'bg-amber-950/80 text-amber-300 border border-amber-800/60'
                             : 'bg-slate-800 text-slate-300'
                         }`}
                       >
-                        {sc.media_type || 'presenter'}
+                        {sc.avatar_enabled !== false ? `Presenter + ${sc.media_type || 'visual'}` : (sc.media_type || 'visual')}
                       </span>
                       <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded ${
                         sc.render_status === 'completed' || sc.has_rendered_asset
@@ -706,7 +706,9 @@ export default function SceneStudioPage() {
                         : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
                     }`}
                   >
-                    <span className="truncate w-full text-center">#{idx + 1} {sc.media_type}</span>
+                    <span className="truncate w-full text-center">
+                      #{idx + 1} {sc.avatar_enabled !== false ? `Presenter + ${sc.media_type || 'Visual'}` : sc.media_type}
+                    </span>
                     <span className="text-[9px] opacity-80">{dur}s</span>
                   </div>
                 );
@@ -746,21 +748,21 @@ export default function SceneStudioPage() {
 
               {/* Media Type */}
               <div>
-                <label className="block text-slate-400 mb-1 font-medium">Media Source Type</label>
+                <label className="block text-slate-400 mb-1 font-medium">Supporting Visual Type</label>
                 <select
                   value={activeScene.media_type || 'presenter'}
                   onChange={(e) =>
                     setActiveScene({
                       ...activeScene,
                       media_type: e.target.value as SceneMediaType,
-                      avatar_enabled: e.target.value === 'presenter' || e.target.value === 'outro',
+                      avatar_enabled: true, // Presenter layer is persistent across spoken scenes
                     })
                   }
                   className="w-full px-3 py-1.5 rounded-lg bg-slate-950 border border-slate-800 text-white focus:outline-none"
                 >
-                  <option value="presenter">Presenter (Talking Avatar)</option>
-                  <option value="broll">B-Roll Footage</option>
-                  <option value="motion_visual">Cinematic Motion Visual</option>
+                  <option value="motion_visual">Cinematic Motion Visual (Procedural Animation)</option>
+                  <option value="broll">B-Roll Video Footage</option>
+                  <option value="presenter">Presenter Focus Only</option>
                   <option value="uploaded_video">Uploaded Video Clip</option>
                   <option value="uploaded_image">Uploaded Still Image</option>
                   <option value="quiz">Interactive Video Quiz</option>
@@ -770,31 +772,52 @@ export default function SceneStudioPage() {
 
               {/* Layout Type */}
               <div>
-                <label className="block text-slate-400 mb-1 font-medium">Layout Composition</label>
+                <label className="block text-slate-400 mb-1 font-medium">Visual Layout Composition</label>
                 <select
-                  value={activeScene.layout_type || 'presenter_split'}
+                  value={activeScene.layout_type || 'presenter_left_visual_right'}
                   onChange={(e) =>
                     setActiveScene({ ...activeScene, layout_type: e.target.value as SceneLayoutType })
                   }
                   className="w-full px-3 py-1.5 rounded-lg bg-slate-950 border border-slate-800 text-white focus:outline-none"
                 >
-                  <option value="presenter_split">Presenter Split (42% Avatar / 58% Media)</option>
-                  <option value="presenter_full">Presenter Full (Centered Studio)</option>
-                  <option value="media_full">Media Full Screen</option>
-                  <option value="media_with_overlay">Media + Keyphrase Overlay</option>
+                  <option value="presenter_left_visual_right">Presenter Left + Visual Right (Default)</option>
+                  <option value="presenter_right_visual_left">Presenter Right + Visual Left</option>
+                  <option value="presenter_picture_in_picture">Visual Full Screen + Presenter PiP</option>
+                  <option value="presenter_center_with_overlays">Centered Presenter Studio + Overlay</option>
+                  <option value="presenter_split">Presenter Split (Legacy)</option>
+                  <option value="presenter_full">Presenter Full (Legacy)</option>
                   <option value="quiz_card">Quiz Assessment Card</option>
+                </select>
+              </div>
+
+              {/* Presenter Position */}
+              <div>
+                <label className="block text-slate-400 mb-1 font-medium">Presenter Position</label>
+                <select
+                  value={activeScene.presenter_position || 'left'}
+                  onChange={(e) =>
+                    setActiveScene({
+                      ...activeScene,
+                      presenter_position: e.target.value as 'left' | 'right' | 'center',
+                    })
+                  }
+                  className="w-full px-3 py-1.5 rounded-lg bg-slate-950 border border-slate-800 text-white focus:outline-none"
+                >
+                  <option value="left">Left Side (Standard Teaching)</option>
+                  <option value="right">Right Side (RTL Focus)</option>
+                  <option value="center">Center Stage (Broadcast)</option>
                 </select>
               </div>
 
               {/* Avatar Toggle & Placement */}
               <div className="flex items-center justify-between p-2 rounded-lg bg-slate-950 border border-slate-800">
                 <div>
-                  <div className="font-semibold text-white">Presenter Active</div>
-                  <div className="text-[10px] text-slate-400">Generate Lipsynced Avatar</div>
+                  <div className="font-semibold text-white">Presenter Layer Active</div>
+                  <div className="text-[10px] text-cyan-400 font-medium">Persistent AI Talking Instructor</div>
                 </div>
                 <input
                   type="checkbox"
-                  checked={Boolean(activeScene.avatar_enabled)}
+                  checked={Boolean(activeScene.avatar_enabled ?? true)}
                   onChange={(e) => setActiveScene({ ...activeScene, avatar_enabled: e.target.checked })}
                   className="w-4 h-4 accent-cyan-400 rounded cursor-pointer"
                 />

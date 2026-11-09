@@ -24,6 +24,10 @@ class SceneMediaType(str, Enum):
 class SceneLayoutType(str, Enum):
     """Visual arrangement and layout composition for a scene."""
 
+    PRESENTER_LEFT_VISUAL_RIGHT = "presenter_left_visual_right"
+    PRESENTER_RIGHT_VISUAL_LEFT = "presenter_right_visual_left"
+    PRESENTER_PICTURE_IN_PICTURE = "presenter_picture_in_picture"
+    PRESENTER_CENTER_WITH_OVERLAYS = "presenter_center_with_overlays"
     PRESENTER_FULL = "presenter_full"
     PRESENTER_SPLIT = "presenter_split"
     MEDIA_FULL = "media_full"
@@ -107,6 +111,7 @@ class TrainingVideoRequest(BaseModel):
     avatar_provider: str = Field(default="mock", description="Avatar provider: 'mock', 'sadtalker', or 'heygen'")
     ack_paid_credits: bool = Field(default=False, description="User acknowledgement for paid HeyGen credit usage")
     video_style: str = Field(default="hybrid_presenter_broll", description="Presentation style")
+    persistent_presenter: Optional[bool] = Field(default=None, description="Whether presenter remains visible across all spoken scenes")
     branding: Optional[BrandingConfig] = Field(default=None, description="Visual branding overrides")
 
     @model_validator(mode="after")
@@ -182,11 +187,11 @@ class SceneDraft(BaseModel):
 
     # V2 Media & Layout Engine fields
     media_type: str = Field(default="presenter", description="Media source type (presenter, broll, motion_visual, uploaded_video, quiz, outro, etc.)")
-    layout_type: str = Field(default="presenter_split", description="Scene visual composition layout (presenter_full, presenter_split, media_full, etc.)")
+    layout_type: str = Field(default="presenter_left_visual_right", description="Scene visual composition layout (presenter_left_visual_right, presenter_right_visual_left, presenter_picture_in_picture, presenter_center_with_overlays, presenter_split, presenter_full, media_full, etc.)")
     visual_prompt: Optional[str] = Field(default=None, description="Visual description or prompt for media synthesis/search")
     media_search_terms: List[str] = Field(default_factory=list, description="Search keywords for finding b-roll / stock / asset")
     avatar_enabled: bool = Field(default=True, description="Whether presenter avatar is actively rendered for this scene")
-    presenter_position: str = Field(default="right", description="Presenter screen placement: left, right, center")
+    presenter_position: str = Field(default="left", description="Presenter screen placement: left, right, center")
     transition: str = Field(default="fade", description="Scene transition: fade, cut, slide, crossfade")
     media_asset_path: Optional[str] = Field(default=None, description="Custom assigned media video or image path")
     quiz_data: Optional[QuizData] = Field(default=None, description="Structured quiz question and options if quiz scene")
@@ -226,8 +231,8 @@ class SceneDraft(BaseModel):
         user_set_avatar = "avatar_enabled" in getattr(self, "__pydantic_fields_set__", set())
         stype = (self.scene_type or "presenter").lower()
         if stype in ("intro", "outro"):
-            if self.layout_type == "presenter_split":
-                self.layout_type = "presenter_full"
+            if self.layout_type in ("presenter_split", "presenter_full"):
+                self.layout_type = "presenter_center_with_overlays"
             if not user_set_avatar:
                 self.avatar_enabled = True
             if stype == "outro" and self.media_type == "presenter":
@@ -235,14 +240,14 @@ class SceneDraft(BaseModel):
         elif stype in ("explanation", "concept"):
             if self.media_type == "presenter":
                 self.media_type = "motion_visual"
-            if self.layout_type == "presenter_split":
+            if self.layout_type in ("presenter_split", "presenter_left_visual_right"):
                 self.layout_type = "media_with_overlay"
             if not user_set_avatar:
                 self.avatar_enabled = False
         elif stype in ("visual_demo", "demonstration", "example"):
             if self.media_type == "presenter":
                 self.media_type = "broll"
-            if self.layout_type == "presenter_split":
+            if self.layout_type in ("presenter_split", "presenter_left_visual_right"):
                 self.layout_type = "media_full"
             if not user_set_avatar:
                 self.avatar_enabled = False
@@ -391,11 +396,11 @@ class LocalizedScene(BaseModel):
 
     # V2 Media & Layout Engine fields
     media_type: str = Field(default="presenter", description="Media source type matching source scene")
-    layout_type: str = Field(default="presenter_split", description="Scene layout composition matching source scene")
+    layout_type: str = Field(default="presenter_left_visual_right", description="Scene layout composition matching source scene")
     visual_prompt: Optional[str] = Field(default=None, description="Localized visual guidance or prompt")
     media_search_terms: List[str] = Field(default_factory=list, description="Localized media search keywords")
     avatar_enabled: bool = Field(default=True, description="Whether presenter avatar is actively rendered for this scene")
-    presenter_position: str = Field(default="right", description="Presenter screen placement: left, right, center")
+    presenter_position: str = Field(default="left", description="Presenter screen placement: left, right, center")
     transition: str = Field(default="fade", description="Scene transition: fade, cut, slide, crossfade")
     media_asset_path: Optional[str] = Field(default=None, description="Custom assigned media path")
     quiz_data: Optional[QuizData] = Field(default=None, description="Localized quiz question and options")
@@ -417,32 +422,38 @@ class LocalizedScene(BaseModel):
     @model_validator(mode="after")
     def sync_localized_scene_fields(self) -> "LocalizedScene":
         """Synchronize V2 defaults for localized scene based on scene_type."""
+        user_set_avatar = "avatar_enabled" in getattr(self, "__pydantic_fields_set__", set())
         stype = (self.scene_type or "presenter").lower()
         if stype in ("intro", "outro"):
-            if self.layout_type == "presenter_split":
-                self.layout_type = "presenter_full"
-            self.avatar_enabled = True
+            if self.layout_type in ("presenter_split", "presenter_full"):
+                self.layout_type = "presenter_center_with_overlays"
+            if not user_set_avatar:
+                self.avatar_enabled = True
             if stype == "outro":
                 self.media_type = "outro"
         elif stype in ("explanation", "concept"):
             if self.media_type == "presenter":
                 self.media_type = "motion_visual"
-            if self.layout_type == "presenter_split":
+            if self.layout_type in ("presenter_split", "presenter_left_visual_right"):
                 self.layout_type = "media_with_overlay"
-            self.avatar_enabled = False
+            if not user_set_avatar:
+                self.avatar_enabled = False
         elif stype in ("visual_demo", "demonstration", "example"):
             if self.media_type == "presenter":
                 self.media_type = "broll"
-            if self.layout_type == "presenter_split":
+            if self.layout_type in ("presenter_split", "presenter_left_visual_right"):
                 self.layout_type = "media_full"
-            self.avatar_enabled = False
+            if not user_set_avatar:
+                self.avatar_enabled = False
         elif stype == "quiz":
             self.media_type = "quiz"
             self.layout_type = "quiz_card"
-            self.avatar_enabled = False
+            if not user_set_avatar:
+                self.avatar_enabled = False
         elif stype in ("presenter", "recap", "summary"):
-            if self.media_type == "presenter":
+            if not user_set_avatar:
                 self.avatar_enabled = True
+            if self.media_type == "presenter":
                 self.media_type = "presenter"
 
         if not self.visual_direction and self.visual_description:

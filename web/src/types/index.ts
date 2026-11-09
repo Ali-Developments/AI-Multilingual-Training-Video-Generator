@@ -15,6 +15,10 @@ export type SceneMediaType =
   | 'outro';
 
 export type SceneLayoutType =
+  | 'presenter_left_visual_right'
+  | 'presenter_right_visual_left'
+  | 'presenter_picture_in_picture'
+  | 'presenter_center_with_overlays'
   | 'presenter_full'
   | 'presenter_split'
   | 'media_full'
