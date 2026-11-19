@@ -114,13 +114,21 @@ class LocalizationService:
             request.adaptation_level,
         )
 
-        # Optimization: if target locale matches source language, avoid unnecessary LLM call
+        # Optimization: if target locale matches source language AND canonical narration genuinely matches target locale, avoid unnecessary LLM call
         try:
             norm_source = normalize_locale(source.language)
         except Exception:
             norm_source = source.language.strip()
 
-        if norm_locale.lower() == norm_source.lower():
+        from app.core.language import verify_output_language
+        combined_source_narration = " ".join(
+            s.narration.strip() for s in source.scenes if s.narration and s.narration.strip()
+        )
+        source_genuinely_matches_target, mismatch_reason = verify_output_language(
+            combined_source_narration, norm_locale
+        )
+
+        if norm_locale.lower() == norm_source.lower() and source_genuinely_matches_target:
             logger.info("Target locale '%s' matches source '%s'; mirroring canonical script without LLM call.", norm_locale, norm_source)
             localized_scenes = [
                 LocalizedScene(
@@ -165,6 +173,15 @@ class LocalizationService:
             )
             val = validate_localized_script(mirror_script, source, norm_locale)
             return mirror_script, val, "completed"
+        elif norm_locale.lower() == norm_source.lower() and not source_genuinely_matches_target:
+            logger.warning(
+                "Canonical script is labeled '%s' but narration failed language verification for '%s' (%s). "
+                "Executing full LLM translation into '%s' instead of mirroring.",
+                source.language,
+                norm_locale,
+                mismatch_reason,
+                norm_locale,
+            )
 
         # Generate initial localized script draft
         prompt = build_localization_prompt(request, norm_locale, text_direction)

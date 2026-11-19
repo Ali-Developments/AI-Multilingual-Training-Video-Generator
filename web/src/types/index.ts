@@ -106,8 +106,12 @@ export interface TrainingVideoRequest {
   topic?: string | null;
   source_content?: string | null;
   audience?: string;
+  source_language?: string;
+  detected_source_language?: string | null;
   base_language?: string;
+  canonical_language?: string;
   target_languages?: string[];
+  language_warnings?: string[];
   target_duration_seconds?: number;
   tone?: string;
   difficulty_level?: string | null;
@@ -150,7 +154,9 @@ export function serializeCreateProjectRequest(input: {
   topic: string;
   sourceContent?: string;
   audience?: string;
+  sourceLanguage?: string;
   baseLanguage?: string;
+  canonicalLanguage?: string;
   targetLanguages?: string[] | string;
   duration?: number | string;
   videoStyle?: string;
@@ -161,6 +167,9 @@ export function serializeCreateProjectRequest(input: {
   learningObjectives?: string[];
   customId?: string | null;
 }): CreateProjectRequest {
+  const canonicalLang = (input.canonicalLanguage || input.baseLanguage)?.trim() || 'en-US';
+  const sourceLang = input.sourceLanguage?.trim() || 'auto';
+
   // 1. Sanitize target languages to string array
   let targetLangs: string[] = ['en-US'];
   if (Array.isArray(input.targetLanguages)) {
@@ -169,7 +178,7 @@ export function serializeCreateProjectRequest(input: {
     targetLangs = [input.targetLanguages.trim()];
   }
   if (targetLangs.length === 0) {
-    targetLangs = [input.baseLanguage?.trim() || 'en-US'];
+    targetLangs = [canonicalLang];
   }
 
   // 2. Sanitize duration to valid integer between 15 and 3600
@@ -218,10 +227,12 @@ export function serializeCreateProjectRequest(input: {
   }
 
   const req: TrainingVideoRequest = {
-    topic: input.topic?.trim() || 'Untitled Project',
+    topic: input.topic?.trim() || undefined,
     source_content: input.sourceContent?.trim() || undefined,
     audience: input.audience?.trim() || 'General Professional / Adult Learner',
-    base_language: input.baseLanguage?.trim() || 'en-US',
+    source_language: sourceLang,
+    base_language: canonicalLang,
+    canonical_language: canonicalLang,
     target_languages: targetLangs,
     target_duration_seconds: durationSecs,
     tone: input.tone?.trim() || 'engaging and professional',

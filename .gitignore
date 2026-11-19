@@ -50,6 +50,7 @@ storage/projects/*
 !storage/projects/.gitkeep
 storage/demonstrations/*
 !storage/demonstrations/.gitkeep
+storage/audit_*/
 storage/sadtalker_temp/
 *.mp4
 *.wav

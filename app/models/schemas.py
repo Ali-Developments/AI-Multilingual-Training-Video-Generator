@@ -101,8 +101,12 @@ class TrainingVideoRequest(BaseModel):
     topic: Optional[str] = Field(default=None, description="Topic or headline of the training module")
     source_content: Optional[str] = Field(default=None, description="Raw source text, transcript, or bullet points")
     audience: str = Field(default="General Professional / Adult Learner", description="Target learner profile")
+    source_language: Optional[str] = Field(default="auto", description="Original input material language ('auto' or locale code)")
+    detected_source_language: Optional[str] = Field(default=None, description="Detected or resolved source material locale")
     base_language: str = Field(default="en-US", description="Language for canonical script generation")
+    canonical_language: Optional[str] = Field(default=None, description="Canonical language in which the primary script is written")
     target_languages: List[str] = Field(default_factory=lambda: ["en-US"], description="Future localization target languages")
+    language_warnings: List[str] = Field(default_factory=list, description="Non-blocking language mismatch or mixed-script warnings")
     target_duration_seconds: int = Field(default=120, ge=15, le=3600, description="Target total video duration in seconds")
     tone: str = Field(default="engaging and professional", description="Stylistic tone of instruction")
     difficulty_level: Optional[str] = Field(default="intermediate", description="Difficulty level: beginner, intermediate, advanced")
@@ -116,17 +120,69 @@ class TrainingVideoRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_content_presence(self) -> "TrainingVideoRequest":
-        """Ensure that content is provided, matches base_language, and adheres to avatar safety gates."""
+        """Ensure that content is provided, locales are valid, and avatar safety gates are enforced."""
         has_topic = bool(self.topic and self.topic.strip())
         has_source = bool(self.source_content and self.source_content.strip())
         if not (has_topic or has_source):
             raise ValueError("At least one of 'topic' or 'source_content' must be provided.")
-        
-        from app.core.language import validate_source_language_mismatch
-        source_text = self.source_content or self.topic
-        mismatch_err = validate_source_language_mismatch(source_text, self.base_language)
-        if mismatch_err:
-            raise ValueError(mismatch_err)
+
+        from app.core.language import (
+            check_source_canonical_mismatch_warning,
+            detect_source_language,
+            validate_supported_locale,
+        )
+
+        # Synchronize canonical_language <-> base_language
+        fields_set = getattr(self, "__pydantic_fields_set__", set())
+        if self.canonical_language and "base_language" not in fields_set:
+            self.base_language = self.canonical_language
+
+        # Resolve and validate base_language (canonical language)
+        if self.base_language and self.base_language.strip().lower() == "auto":
+            det = detect_source_language(topic=self.topic, source_content=self.source_content)
+            if not det.is_uncertain and det.detected_locale:
+                self.base_language = det.detected_locale
+            else:
+                self.base_language = "en-US"
+        else:
+            self.base_language = validate_supported_locale(self.base_language, allow_auto=False)
+
+        self.canonical_language = self.base_language
+
+        # Validate source_language ('auto' or supported locale)
+        if self.source_language and self.source_language.strip():
+            self.source_language = validate_supported_locale(self.source_language, allow_auto=True)
+        else:
+            self.source_language = "auto"
+
+        # Validate target_languages
+        if self.target_languages:
+            normalized_targets = []
+            for tl in self.target_languages:
+                if tl and tl.strip():
+                    norm_tl = validate_supported_locale(tl, allow_auto=False)
+                    if norm_tl not in normalized_targets:
+                        normalized_targets.append(norm_tl)
+            self.target_languages = normalized_targets or [self.base_language]
+        else:
+            self.target_languages = [self.base_language]
+
+        # Non-blocking source language detection and mismatch warning
+        warning_msg, detection = check_source_canonical_mismatch_warning(
+            topic=self.topic,
+            source_content=self.source_content,
+            canonical_language=self.base_language,
+            explicit_source_language=self.source_language,
+        )
+        if not detection.is_uncertain and detection.detected_locale:
+            self.detected_source_language = detection.detected_locale
+        elif self.source_language and self.source_language != "auto":
+            self.detected_source_language = self.source_language
+        else:
+            self.detected_source_language = self.base_language
+
+        if warning_msg and warning_msg not in self.language_warnings:
+            self.language_warnings.append(warning_msg)
 
         prov = self.avatar_provider.strip().lower()
         if prov not in ("mock", "sadtalker", "heygen"):
@@ -286,6 +342,59 @@ class SceneDraft(BaseModel):
             if not self.reference_image_requirements and self.media_plan.reference_image_requirements:
                 self.reference_image_requirements = self.media_plan.reference_image_requirements
 
+        return self
+
+
+class SceneOutlineItem(BaseModel):
+    """Compact scene blueprint used during Stage 1 of staged script generation."""
+
+    scene_id: str = Field(default="", description="Unique scene identifier (e.g., scene_1)")
+    order: int = Field(default=1, ge=1, description="1-indexed sequence order")
+    title: str = Field(..., description="Short scene title in canonical language")
+    purpose: str = Field(default="Content delivery", description="Instructional purpose or summary of this scene")
+    scene_type: str = Field(
+        default="presenter",
+        description="Scene classification (intro, presenter, explanation, visual_demo, example, recap, outro, quiz)",
+    )
+    learning_objective_ids: List[str] = Field(
+        default_factory=list,
+        description="IDs of learning objectives addressed in this scene (e.g., ['LO1'])",
+    )
+    target_duration_seconds: int = Field(default=10, ge=2, description="Target spoken duration for this scene in seconds")
+
+    @model_validator(mode="after")
+    def sync_outline_item(self) -> "SceneOutlineItem":
+        if not self.scene_id:
+            self.scene_id = f"scene_{self.order}"
+        return self
+
+
+class ScriptOutline(BaseModel):
+    """
+    Stage 1 compact script outline containing top-level metadata and brief scene summaries.
+    Designed to fit comfortably within small/free LLM output token limits (~250-400 tokens).
+    """
+
+    title: str = Field(..., description="Module title in canonical language")
+    language: str = Field(default="en-US", description="Canonical language code")
+    audience: str = Field(default="General Professional", description="Target learner profile in canonical language")
+    opening_hook: str = Field(..., description="Engaging opening statement for the video in canonical language")
+    closing_summary: str = Field(..., description="Key takeaways and closing sign-off in canonical language")
+    learning_objectives: List[LearningObjective] = Field(
+        default_factory=list,
+        description="Target learning objectives",
+    )
+    scene_outlines: List[SceneOutlineItem] = Field(
+        ...,
+        min_length=1,
+        description="Ordered list of compact scene outlines",
+    )
+
+    @model_validator(mode="after")
+    def sync_outline_fields(self) -> "ScriptOutline":
+        for idx, item in enumerate(self.scene_outlines, start=1):
+            item.order = idx
+            item.scene_id = f"scene_{idx}"
         return self
 
 
@@ -724,11 +833,14 @@ def sanitize_diagnostic_message(msg: str) -> str:
     """
     if not msg:
         return ""
-    clean = str(msg)
+    # Older manifests can include a raw generation appended to the diagnostic.
+    clean = re.split(r"(?im)^\s*Raw:\s*", str(msg), maxsplit=1)[0].rstrip()
     try:
         from app.core.config import settings
         if settings.GROQ_API_KEY and len(settings.GROQ_API_KEY) > 6:
             clean = clean.replace(settings.GROQ_API_KEY, "[REDACTED_GROQ_KEY]")
+        if getattr(settings, "OPENROUTER_API_KEY", None) and len(settings.OPENROUTER_API_KEY) > 6:
+            clean = clean.replace(settings.OPENROUTER_API_KEY, "[REDACTED_OPENROUTER_KEY]")
         if settings.HEYGEN_API_KEY and len(settings.HEYGEN_API_KEY) > 6:
             clean = clean.replace(settings.HEYGEN_API_KEY, "[REDACTED_HEYGEN_KEY]")
     except Exception:
@@ -736,6 +848,7 @@ def sanitize_diagnostic_message(msg: str) -> str:
 
     # Regex redact generic provider keys, tokens, auth headers
     clean = re.sub(r"gsk_[A-Za-z0-9_\-]{15,}", "gsk_[REDACTED]", clean)
+    clean = re.sub(r"sk-or-(?:v1-)?[A-Za-z0-9_\-]{15,}", "sk-or-[REDACTED]", clean)
     clean = re.sub(r"(?i)bearer\s+[A-Za-z0-9_\-\.]{8,}", "Bearer [REDACTED]", clean)
     clean = re.sub(r"(?i)(api[_-]?key|authorization|token)[\"'\s:=]+[A-Za-z0-9_\-]{10,}", r"\1: [REDACTED]", clean)
     return clean

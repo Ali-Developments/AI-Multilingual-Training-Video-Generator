@@ -191,35 +191,38 @@ def test_detect_primary_script():
     assert detect_primary_script("short") is None
 
 
-def test_schema_rejects_latin_content_with_arabic_base_language():
-    """Verify TrainingVideoRequest raises ValidationError on English source + ar-SA base_language."""
-    with pytest.raises(ValidationError) as exc_info:
-        TrainingVideoRequest(
-            topic="Workplace Phishing Defense Essentials for Corporate Employees",
-            source_content="Phishing emails often mimic IT department urgent password reset requests. Always inspect the sender domain.",
-            base_language="ar-SA",
-            target_languages=["ar-SA"],
-            target_duration_seconds=60,
-        )
-    assert "Source / Base Language" in str(exc_info.value)
-    assert "ar-SA" in str(exc_info.value)
+def test_schema_accepts_latin_content_with_arabic_base_language_and_warns():
+    """Verify TrainingVideoRequest accepts English source + ar-SA base_language with non-blocking warning."""
+    req = TrainingVideoRequest(
+        topic="Workplace Phishing Defense Essentials for Corporate Employees",
+        source_content="Phishing emails often mimic IT department urgent password reset requests. Always inspect the sender domain.",
+        base_language="ar-SA",
+        target_languages=["ar-SA"],
+        target_duration_seconds=60,
+    )
+    assert req.base_language == "ar-SA"
+    assert req.detected_source_language == "en-US"
+    assert len(req.language_warnings) == 1
+    assert "ar-SA" in req.language_warnings[0]
 
 
-def test_schema_rejects_arabic_content_with_english_base_language():
-    """Verify TrainingVideoRequest raises ValidationError on Arabic source + en-US base_language."""
-    with pytest.raises(ValidationError) as exc_info:
-        TrainingVideoRequest(
-            topic="أساسيات الحماية من التصيد الاحتيالي في بيئة العمل للموظفين",
-            source_content="رسائل التصيد الاحتيالي غالبا ما تحاكي طلبات إعادة تعيين كلمة المرور العاجلة من إدارة تقنية المعلومات",
-            base_language="en-US",
-            target_languages=["ar-SA"],
-            target_duration_seconds=60,
-        )
-    assert "Arabic script" in str(exc_info.value)
+def test_schema_accepts_arabic_content_with_english_base_language_and_warns():
+    """Verify TrainingVideoRequest accepts Arabic source + en-US base_language with non-blocking warning."""
+    req = TrainingVideoRequest(
+        topic="أساسيات الحماية من التصيد الاحتيالي في بيئة العمل للموظفين",
+        source_content="رسائل التصيد الاحتيالي غالبا ما تحاكي طلبات إعادة تعيين كلمة المرور العاجلة من إدارة تقنية المعلومات",
+        base_language="en-US",
+        target_languages=["ar-SA"],
+        target_duration_seconds=60,
+    )
+    assert req.base_language == "en-US"
+    assert req.detected_source_language == "ar-SA"
+    assert len(req.language_warnings) == 1
+    assert "Arabic" in req.language_warnings[0]
 
 
-def test_normalize_input_node_rejects_mismatch():
-    """Verify normalize_input node fails early before any LLM calls on mismatch."""
+def test_normalize_input_node_accepts_cross_language_and_preserves_warnings():
+    """Verify normalize_input node succeeds and attaches non-blocking language warnings on cross-language input."""
     req = TrainingVideoRequest.model_construct(
         topic="Workplace Phishing Defense Essentials for Corporate Employees",
         source_content="Detailed English instructional reference content regarding email security.",
@@ -233,8 +236,9 @@ def test_normalize_input_node_rejects_mismatch():
     nodes = ScriptWorkflowNodes(llm_provider=FailingMockLLM())
     state = VideoScriptState.model_construct(request=req)
     res = nodes.normalize_input(state)
-    assert res["workflow_status"] == "failed"
-    assert any("Source / Base Language" in err for err in res["errors"])
+    assert res["workflow_status"] == "processing"
+    assert res["request"].base_language == "ar-SA"
+    assert len(res["request"].language_warnings) == 1
 
 
 def test_matching_languages_accepted():

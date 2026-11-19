@@ -91,6 +91,13 @@ export async function parseResponseError(res: Response, fallback = 'Operation fa
   const formatted = formatApiError(errData, fallback);
   const statusPrefix = `HTTP ${res.status}${res.statusText ? ` (${res.statusText})` : ''}`;
 
+  if (
+    res.status >= 500 &&
+    (!errData || formatted === fallback || formatted === 'Internal Server Error')
+  ) {
+    return `${statusPrefix}: ${fallback} — Backend request timed out or proxy could not reach the FastAPI server.`;
+  }
+
   if (formatted && formatted !== fallback) {
     if (formatted.includes(`HTTP ${res.status}`)) {
       return formatted;

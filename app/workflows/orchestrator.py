@@ -1,15 +1,26 @@
 """End-to-end video automation project orchestrator connecting all lifecycle stages."""
 
+from contextlib import nullcontext
+import threading
+import time
+from uuid import uuid4
+from threading import Lock
 from typing import Optional, List
 from app.core.config import settings
 from app.core.logging import logger
 from app.models.schemas import (
     TrainingVideoRequest,
     ProjectManifest,
-    FinalScript,
+    sanitize_diagnostic_message,
     VideoStyle,
 )
 from app.services.llm.base import LLMProvider
+from app.services.llm.groq_provider import GroqProvider
+from app.services.llm.openrouter_provider import (
+    OpenRouterCancelledError,
+    OpenRouterProvider,
+    OpenRouterTimeoutError,
+)
 from app.services.localization.service import LocalizationService
 from app.services.tts.service import TTSService
 from app.services.avatar.service import AvatarService
@@ -18,6 +29,15 @@ from app.services.subtitles.service import SubtitleService
 from app.services.composition.service import CompositionService
 from app.services.duration import DurationReconciliationService
 from app.workflows.script_generation import create_script_workflow
+from app.workflows.script_generation.checkpoint import ScriptCheckpoint
+from app.workflows.script_generation.storage import (
+    RequestLedger,
+    RunControl,
+    ScriptBusyError,
+    ScriptCancelledError,
+    atomic_json,
+    exclusive,
+)
 from app.workflows.storyboard_planner import StoryboardPlanner
 from app.workflows.manifest import ProjectManifestManager
 
@@ -29,6 +49,9 @@ class ProjectOrchestrator:
     
     Supports idempotent execution, partial resume from manifest, and per-locale failure containment.
     """
+
+    _script_locks_guard = Lock()
+    _script_locks = {}
 
     def __init__(
         self,
@@ -52,7 +75,17 @@ class ProjectOrchestrator:
         self.llm_provider = llm_provider
         self.localization_service = localization_service or LocalizationService(llm_provider=self.llm_provider)
         self.tts_service = tts_service or TTSService()
-        self.avatar_service = avatar_service or AvatarService(output_base_dir=self.manifest_manager.storage_base_dir)
+        if avatar_service is None:
+            try:
+                avatar_service = AvatarService(output_base_dir=self.manifest_manager.storage_base_dir)
+            except PermissionError:
+                from app.services.avatar.factory import get_avatar_provider
+                fallback_prov = "sadtalker" if getattr(settings, "SADTALKER_ENABLED", False) else "mock"
+                avatar_service = AvatarService(
+                    provider=get_avatar_provider(fallback_prov),
+                    output_base_dir=self.manifest_manager.storage_base_dir,
+                )
+        self.avatar_service = avatar_service
         self.visual_service = visual_service or VisualService()
         self.subtitle_service = subtitle_service or SubtitleService()
         self.composition_service = composition_service or CompositionService()
@@ -65,52 +98,202 @@ class ProjectOrchestrator:
     ) -> ProjectManifest:
         """
         Execute canonical script workflow for a project without proceeding to media stages.
-        Validates, finalizes, and persists final_script and scripts/source.json.
+        Protected by an OS-backed per-project exclusive lock (.script.lock) covering execution,
+        checkpoint updates, and durable request-budget reservations.
         Does NOT execute TTS, avatar generation, visual generation, or final composition.
         """
+        manifest_path = self.manifest_manager.storage_base_dir / project_id / "project.json"
+        if not manifest_path.exists():
+            raise ValueError(f"Project '{project_id}' does not exist.")
+        lock_path = self.manifest_manager.get_project_dir(project_id) / ".script.lock"
+        with exclusive(lock_path, wait_seconds=0.0):
+            return self._generate_project_script(project_id, force_regenerate)
+
+    def _resolve_script_provider_identity(self):
+        provider = self.llm_provider
+        if isinstance(provider, OpenRouterProvider):
+            return "openrouter", provider._base_url, provider.model_name
+        if isinstance(provider, GroqProvider):
+            return "groq", "https://api.groq.com/openai/v1", provider.model_name
+        if provider is not None:
+            return type(provider).__name__.lower(), "local", provider.model_name
+        return (
+            (settings.LLM_PROVIDER or "openrouter").strip().lower(),
+            settings.OPENROUTER_BASE_URL,
+            settings.OPENROUTER_MODEL,
+        )
+
+    def _generate_project_script(self, project_id: str, force_regenerate: bool) -> ProjectManifest:
         manifest = self.manifest_manager.load_manifest(project_id)
         if not manifest:
             raise ValueError(f"Project '{project_id}' does not exist.")
 
+        provider_name, endpoint, model_name = self._resolve_script_provider_identity()
+        expected_identity = ScriptCheckpoint.compute_identity_hash(
+            manifest.source_request,
+            model=model_name,
+            provider=provider_name,
+            endpoint=endpoint,
+        )
+
+        # Blocker 5: Verify current generation identity before returning a cached completed script
         if not force_regenerate and manifest.script_status == "completed" and manifest.final_script:
-            logger.info("[%s] Reusing existing finalized canonical script", project_id)
-            return manifest
+            cached_identity = manifest.metadata.get("script_identity_hash")
+            if cached_identity == expected_identity:
+                logger.info("[%s] Reusing existing finalized canonical script (identity verified)", project_id)
+                return manifest
+            logger.warning(
+                "[%s] Cached completed script identity mismatch (cached=%s, expected=%s). Invalidating cached script.",
+                project_id,
+                cached_identity,
+                expected_identity,
+            )
 
         logger.info("[%s] Executing canonical script workflow", project_id)
-        manifest.script_status = "running"
-        self.manifest_manager.save_manifest(manifest)
+        project_dir = self.manifest_manager.get_project_dir(project_id)
+        run_id = uuid4().hex
+        run_control = RunControl(run_id=run_id, timeout_seconds=settings.OPENROUTER_SCRIPT_TIMEOUT_SECONDS)
+        checkpoint: Optional[ScriptCheckpoint] = None
+        ledger: Optional[RequestLedger] = None
 
-        workflow = create_script_workflow(llm_provider=self.llm_provider)
-        state = workflow.invoke({"request": manifest.source_request})
+        try:
+            # Blocker 6: Fail-closed provider & model authorization BEFORE budget reservation or transport
+            provider = self.llm_provider
+            if isinstance(provider, GroqProvider) and not getattr(settings, "ALLOW_PAID_SCRIPT_PROVIDERS", False):
+                raise PermissionError(
+                    "Groq script generation is blocked under the free-only policy "
+                    "(set ALLOW_PAID_SCRIPT_PROVIDERS=true to explicitly authorize Groq)."
+                )
+            if isinstance(provider, OpenRouterProvider):
+                provider.assert_model_authorized()
+
+            if force_regenerate:
+                manifest.metadata["script_generation_id"] = uuid4().hex
+            generation_id = manifest.metadata.get("script_generation_id", "")
+
+            # Blocker 2: Durable OS-locked request accounting ledger
+            legacy_count = manifest.metadata.get("script_openrouter_requests", 0)
+            if not isinstance(legacy_count, int) or legacy_count < 0:
+                raise ValueError("Invalid previous script request accounting in manifest.")
+            ledger = RequestLedger(
+                project_dir,
+                ceiling=settings.OPENROUTER_SCRIPT_PROJECT_REQUEST_LIMIT,
+                legacy_count=legacy_count,
+                required=bool(manifest.metadata.get("script_request_ledger")),
+            )
+            manifest.metadata["script_request_ledger"] = "script_requests.json"
+            manifest.metadata["script_openrouter_requests"] = ledger.count
+
+            # Blocker 3 & missing referenced checkpoint: require checkpoint if previously referenced for this exact identity
+            expected_rel = f"script_checkpoints/{expected_identity}{'-' + generation_id if generation_id else ''}.json"
+            prev_cp_ref = (manifest.metadata.get("script_checkpoint") or "").replace("\\", "/")
+            checkpoint_required = (not force_regenerate) and (prev_cp_ref == expected_rel)
+
+            checkpoint = ScriptCheckpoint(
+                project_dir,
+                manifest.source_request,
+                model_name,
+                generation=generation_id,
+                provider=provider_name,
+                endpoint=endpoint,
+                required=checkpoint_required,
+                run_id=run_id,
+                cancel_check=run_control.is_cancelled,
+            )
+
+            manifest.metadata["script_checkpoint"] = str(checkpoint.path.relative_to(project_dir))
+            manifest.metadata["script_run_id"] = run_id
+            manifest.metadata["script_lease_expires"] = time.time() + settings.OPENROUTER_SCRIPT_TIMEOUT_SECONDS
+            manifest.script_status = "running"
+            self.manifest_manager.save_manifest(manifest)
+
+            def reserve_request() -> str:
+                if run_control.is_cancelled():
+                    raise OpenRouterCancelledError("Script run was explicitly cancelled.", error_code="script_cancelled")
+                if run_control.is_timed_out():
+                    raise OpenRouterTimeoutError(
+                        f"Script time limit reached ({int(run_control.timeout_seconds)}s). "
+                        "Accepted stages were saved; retry this project's script stage to resume.",
+                        error_code="script_timeout",
+                    )
+                assert ledger is not None
+                reservation_id = ledger.reserve()
+                manifest.metadata["script_openrouter_requests"] = ledger.count
+                self.manifest_manager.save_manifest(manifest)
+                return reservation_id
+
+            def record_outcome(
+                reservation_id: str,
+                status: str,
+                http_status=None,
+                routed_model=None,
+                category=None,
+            ) -> None:
+                if ledger is not None:
+                    ledger.record_outcome(
+                        reservation_id,
+                        status=status,
+                        http_status=http_status,
+                        routed_model=routed_model,
+                        category=category,
+                    )
+
+            # Start per-run deadline timer scoped strictly to `run_id`
+            run_control.start_deadline_timer()
+
+            session = (
+                provider.script_session(reserve_request, after_request=record_outcome, run_control=run_control)
+                if isinstance(provider, OpenRouterProvider)
+                else nullcontext(provider)
+            )
+            with session as run_provider:
+                if isinstance(run_provider, OpenRouterProvider):
+                    run_provider._checkpoint = checkpoint
+                workflow = create_script_workflow(llm_provider=run_provider, checkpoint=checkpoint)
+                initial_state = {
+                    "request": manifest.source_request,
+                    "revision_count": int(checkpoint.data.get("revision_count", 0)),
+                }
+                state = workflow.invoke(initial_state)
+            # Mark completed immediately so a late-firing timer can never convert completion into timeout/cancel
+            run_control.mark_completed()
+        except Exception as exc:
+            is_timeout = isinstance(exc, OpenRouterTimeoutError) or run_control.is_timed_out()
+            is_cancelled = isinstance(exc, (OpenRouterCancelledError, ScriptCancelledError)) or run_control.is_cancelled()
+            finish_reason = "cancelled" if is_cancelled else ("timeout" if is_timeout else "interrupted")
+            err_code = "SCRIPT_CANCELLED" if is_cancelled else ("SCRIPT_TIMEOUT" if is_timeout else "SCRIPT_FAILED")
+            if checkpoint is not None:
+                try:
+                    checkpoint.finish(False, reason=finish_reason)
+                except Exception as cp_err:
+                    logger.warning("[%s] Checkpoint finish failed during error handling: %s", project_id, cp_err)
+            err_msg = sanitize_diagnostic_message(f"Script generation failed (error): {exc}")
+            logger.error("[%s] %s", project_id, err_msg)
+            manifest.script_status = "failed"
+            manifest.status = "failed"
+            if ledger is not None:
+                try:
+                    manifest.metadata["script_openrouter_requests"] = ledger.count
+                except Exception:
+                    pass
+            manifest.record_error(stage="script", message=err_msg, code=err_code)
+            self.manifest_manager.save_manifest(manifest)
+            return manifest
+        finally:
+            run_control.stop_timer()
+
         final_script = state.get("final_script")
-
-        if not final_script and state.get("workflow_status") == "completed" and state.get("draft_script"):
-            draft = state.get("draft_script")
-            if draft and getattr(draft, "scenes", None):
-                logger.warning(
-                    "[%s] Adopting draft script with %d scenes despite validation review flag: %s",
-                    project_id,
-                    len(draft.scenes),
-                    state.get("errors", []),
+        if checkpoint is not None:
+            try:
+                errors_joined = " ".join(state.get("errors", []) or []).lower()
+                fail_reason = (
+                    "cancelled"
+                    if "explicitly cancelled" in errors_joined
+                    else ("timeout" if "time limit" in errors_joined else "interrupted")
                 )
-                analysis_obj = state.get("analysis")
-                canonical_lo = (
-                    list(analysis_obj.learning_objectives)
-                    if analysis_obj and getattr(analysis_obj, "learning_objectives", None)
-                    else list(draft.learning_objectives or [])
-                )
-                final_script = FinalScript(
-                    title=draft.title,
-                    language=draft.language,
-                    audience=draft.audience,
-                    target_duration_seconds=manifest.source_request.target_duration_seconds,
-                    total_estimated_duration_seconds=draft.total_estimated_duration_seconds,
-                    opening_hook=draft.opening_hook,
-                    closing_summary=draft.closing_summary,
-                    learning_objectives=canonical_lo,
-                    scenes=draft.scenes,
-                    metadata={"adopted_from_draft": True},
-                )
+                checkpoint.finish(bool(final_script), reason=None if final_script else fail_reason)
+            except Exception as cp_err:
+                logger.warning("[%s] Checkpoint finish failed after workflow completion: %s", project_id, cp_err)
 
         if not final_script:
             workflow_status = state.get("workflow_status", "failed")
@@ -127,23 +310,35 @@ class ProjectOrchestrator:
             else:
                 err_details.append("No final script produced")
 
-            err_msg = f"Script generation failed ({workflow_status}): {'; '.join(err_details)}"
+            joined_lower = " ".join(err_details).lower()
+            err_code = (
+                "SCRIPT_CANCELLED"
+                if "explicitly cancelled" in joined_lower
+                else ("SCRIPT_TIMEOUT" if "time limit" in joined_lower else f"SCRIPT_{workflow_status.upper()}")
+            )
+            err_msg = sanitize_diagnostic_message(f"Script generation failed ({workflow_status}): {'; '.join(err_details)}")
             logger.error("[%s] %s", project_id, err_msg)
             manifest.script_status = "failed"
             manifest.status = "failed"
-            manifest.record_error(stage="script", message=err_msg, code=f"SCRIPT_{workflow_status.upper()}")
+            if ledger is not None:
+                manifest.metadata["script_openrouter_requests"] = ledger.count
+            manifest.record_error(stage="script", message=err_msg, code=err_code)
             self.manifest_manager.save_manifest(manifest)
             return manifest
 
         manifest.clear_stage_errors("script")
         manifest.final_script = final_script
         manifest.script_status = "completed"
+        manifest.metadata["script_identity_hash"] = checkpoint.identity_hash if checkpoint else expected_identity
+        if ledger is not None:
+            manifest.metadata["script_openrouter_requests"] = ledger.count
+        if manifest.status == "failed" and not manifest.errors:
+            manifest.status = "script_completed"
 
-        # Persist canonical script to scripts/ directory
-        project_dir = self.manifest_manager.get_project_dir(project_id)
+        # Persist canonical script to scripts/source.json atomically (fsync + os.replace)
         scripts_dir = project_dir / "scripts"
         scripts_dir.mkdir(parents=True, exist_ok=True)
-        (scripts_dir / "source.json").write_text(manifest.final_script.model_dump_json(indent=2), encoding="utf-8")
+        atomic_json(scripts_dir / "source.json", manifest.final_script.model_dump(mode="json"))
 
         self.manifest_manager.save_manifest(manifest)
         return manifest

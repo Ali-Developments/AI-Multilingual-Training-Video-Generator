@@ -92,6 +92,8 @@ def normalize_script_durations(
     Also recalculates total_estimated_duration_seconds as the strict sum of scene durations.
     """
     lang = language or getattr(script, "language", None)
+    if language:
+        script.language = language
     for scene in script.scenes:
         scene.estimated_duration_seconds = estimate_narration_duration_seconds(
             narration=scene.narration,
@@ -365,6 +367,23 @@ def validate_script_draft(
                         severity="error",
                         message=f"Outro scene '{scene.scene_id}' appears before the end of the script.",
                         scene_id=scene.scene_id
+                    )
+                )
+
+    # 9. Canonical Language Compliance Check
+    if lang:
+        from app.core.language import verify_output_language
+        combined_narration = " ".join(
+            s.narration.strip() for s in script.scenes if s.narration and s.narration.strip()
+        )
+        if combined_narration:
+            lang_ok, lang_err = verify_output_language(combined_narration, lang)
+            if not lang_ok and lang_err:
+                issues.append(
+                    ValidationIssue(
+                        code="SCRIPT_LANGUAGE_MISMATCH",
+                        severity="error",
+                        message=lang_err,
                     )
                 )
 

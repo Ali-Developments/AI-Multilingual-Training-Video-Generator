@@ -3,7 +3,7 @@
 from pathlib import Path
 from typing import Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import Field
+from pydantic import Field, model_validator
 
 
 class Settings(BaseSettings):
@@ -21,10 +21,94 @@ class Settings(BaseSettings):
     # Local Storage Directory
     STORAGE_PATH: Path = Field(default=Path("./storage/projects"), description="Base directory for project assets")
 
-    # LLM Settings (Groq is default, extensible to others)
-    DEFAULT_LLM_PROVIDER: str = Field(default="groq", description="Default LLM provider")
+    # LLM Settings (Supports 'groq' and 'openrouter')
+    LLM_PROVIDER: Optional[str] = Field(default=None, description="Active LLM provider ('groq' or 'openrouter')")
+    DEFAULT_LLM_PROVIDER: str = Field(default="groq", description="Default LLM provider ('groq' or 'openrouter')")
     GROQ_API_KEY: Optional[str] = Field(default=None, description="Groq API Key")
     GROQ_MODEL: str = Field(default="openai/gpt-oss-20b", description="Active Groq LLM model ID")
+
+    # OpenRouter Settings
+    OPENROUTER_API_KEY: Optional[str] = Field(default=None, description="OpenRouter API Key")
+    OPENROUTER_MODEL: str = Field(default="openrouter/free", description="Active OpenRouter LLM model ID")
+    OPENROUTER_SCRIPT_PROJECT_REQUEST_LIMIT: int = Field(default=48, ge=1, le=256)
+    OPENROUTER_SCRIPT_TIMEOUT_SECONDS: float = Field(default=260, gt=0, le=280)
+    OPENROUTER_BASE_URL: str = Field(
+        default="https://openrouter.ai/api/v1",
+        description="Official OpenRouter API base URL"
+    )
+    OPENROUTER_TIMEOUT_SECONDS: float = Field(
+        default=90.0,
+        gt=0,
+        description="HTTP request timeout in seconds for OpenRouter API calls"
+    )
+    OPENROUTER_SITE_URL: Optional[str] = Field(
+        default=None,
+        description="Optional HTTP-Referer header for OpenRouter app attribution"
+    )
+    OPENROUTER_APP_NAME: Optional[str] = Field(
+        default="AI Multilingual Training Video Generator",
+        description="Optional X-Title header for OpenRouter app attribution"
+    )
+    OPENROUTER_FALLBACK_MODELS: str = Field(
+        default="",
+        description=(
+            "Optional comma-separated, ordered list of explicit OpenRouter model IDs (e.g. ':free' models) "
+            "tried deterministically for structured generation after OPENROUTER_MODEL is rejected as incompatible. "
+            "Paid models are never added automatically."
+        ),
+    )
+    OPENROUTER_REASONING_EFFORT: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional OpenRouter unified reasoning effort for structured generation "
+            "('none', 'minimal', 'low', 'medium', 'high'). Sent only to explicitly named models, "
+            "never to the 'openrouter/free' router."
+        ),
+    )
+    OPENROUTER_REASONING_MIN_OUTPUT_TOKENS: int = Field(
+        default=8192,
+        ge=512,
+        le=16384,
+        description=(
+            "Minimum max_tokens budget for structured calls to free/reasoning models, because reasoning "
+            "tokens count against max_tokens before any final JSON content is produced."
+        ),
+    )
+    OPENROUTER_ALLOW_PAID_MODELS: bool = Field(
+        default=False,
+        description=(
+            "Fail-closed authorization gate for paid or unverified OpenRouter models. "
+            "Must remain False unless paid model spend is explicitly authorized."
+        ),
+    )
+    OPENROUTER_VERIFIED_FREE_MODELS: str = Field(
+        default="openrouter/free",
+        description=(
+            "Comma-separated allowlist of OpenRouter model IDs explicitly verified as zero-cost. "
+            "If OPENROUTER_ALLOW_PAID_MODELS is False, any model outside this verified allowlist is refused before transport."
+        ),
+    )
+    ALLOW_PAID_SCRIPT_PROVIDERS: bool = Field(
+        default=False,
+        description=(
+            "Fail-closed authorization gate preventing script generation from silently dispatching "
+            "to non-free/paid providers (such as Groq) without explicit approval."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def sync_llm_provider_fields(self) -> "Settings":
+        """Synchronize LLM_PROVIDER and DEFAULT_LLM_PROVIDER for seamless configuration."""
+        fields_set = getattr(self, "__pydantic_fields_set__", set())
+        if self.LLM_PROVIDER and self.LLM_PROVIDER.strip():
+            cleaned = self.LLM_PROVIDER.strip().lower()
+            self.LLM_PROVIDER = cleaned
+            if "DEFAULT_LLM_PROVIDER" not in fields_set:
+                self.DEFAULT_LLM_PROVIDER = cleaned
+        else:
+            self.DEFAULT_LLM_PROVIDER = (self.DEFAULT_LLM_PROVIDER or "groq").strip().lower()
+            self.LLM_PROVIDER = self.DEFAULT_LLM_PROVIDER
+        return self
 
     # TTS Settings (Edge-TTS is default free tier)
     DEFAULT_TTS_PROVIDER: str = Field(default="edge_tts", description="Default TTS provider (edge_tts, azure, mock)")
@@ -43,6 +127,8 @@ class Settings(BaseSettings):
             "fr": "fr-FR-HenriNeural",
             "de-DE": "de-DE-ConradNeural",
             "de": "de-DE-ConradNeural",
+            "ur-PK": "ur-PK-AsadNeural",
+            "ur": "ur-PK-AsadNeural",
             "zh-CN": "zh-CN-YunxiNeural",
             "zh": "zh-CN-YunxiNeural",
         },

@@ -25,10 +25,12 @@ from app.models.schemas import (
     LocalizedScene,
     ProjectBudgetEstimate,
     ApproveBudgetRequest,
+    sanitize_diagnostic_message,
 )
 from app.services.budget.service import BudgetService
 from app.workflows.manifest import ProjectManifestManager
 from app.workflows.orchestrator import ProjectOrchestrator
+from app.workflows.script_generation.storage import ScriptBusyError
 from app.workflows.storyboard_planner import StoryboardPlanner
 
 router = APIRouter()
@@ -58,10 +60,11 @@ async def create_project(payload: CreateProjectRequest) -> ProjectManifest:
         logger.info("Created new project manifest: '%s'", project_id)
         return manifest
     except Exception as e:
-        logger.error("Failed to create project '%s': %s", project_id, e)
+        safe_msg = sanitize_diagnostic_message(str(e))
+        logger.error("Failed to create project '%s': %s", project_id, safe_msg)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Could not create project: {str(e)}",
+            detail=f"Could not create project: {safe_msg}",
         )
 
 
@@ -614,22 +617,43 @@ async def generate_script(
             },
         )
 
-    manifest = await run_in_threadpool(
-        orchestrator.generate_canonical_script,
-        project_id,
-        force_regenerate=force_regenerate,
-    )
+    try:
+        manifest = await run_in_threadpool(
+            orchestrator.generate_canonical_script,
+            project_id,
+            force_regenerate=force_regenerate,
+        )
+    except HTTPException:
+        raise
+    except ScriptBusyError as busy_err:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "SCRIPT_GENERATION_IN_PROGRESS",
+                "message": sanitize_diagnostic_message(str(busy_err)),
+            },
+        )
+    except Exception as exc:
+        safe_msg = sanitize_diagnostic_message(str(exc))
+        logger.error("Unhandled error generating script for '%s': %s", project_id, safe_msg)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "SCRIPT_GENERATION_FAILED",
+                "message": safe_msg,
+                "errors": [safe_msg],
+            },
+        )
     if manifest.script_status == "failed" or not manifest.final_script:
         err_msg = f"Failed to generate canonical script for project '{project_id}'."
         if manifest.errors:
-            err_msg = str(manifest.errors[-1])
-        err_list = [e.model_dump() for e in manifest.error_details] if manifest.error_details else manifest.errors
+            err_msg = sanitize_diagnostic_message(str(manifest.errors[-1]))
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={
                 "code": "SCRIPT_GENERATION_FAILED",
                 "message": err_msg,
-                "errors": err_list,
+                "errors": [err_msg],
             },
         )
     return manifest
@@ -657,17 +681,39 @@ async def prepare_studio(
             },
         )
 
-    manifest = await run_in_threadpool(
-        orchestrator.prepare_studio_project,
-        project_id,
-        video_style=video_style,
-        force_regenerate_script=force_regenerate,
-        force_regenerate_storyboard=force_regenerate,
-    )
+    try:
+        manifest = await run_in_threadpool(
+            orchestrator.prepare_studio_project,
+            project_id,
+            video_style=video_style,
+            force_regenerate_script=force_regenerate,
+            force_regenerate_storyboard=force_regenerate,
+        )
+    except HTTPException:
+        raise
+    except ScriptBusyError as busy_err:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "SCRIPT_GENERATION_IN_PROGRESS",
+                "message": sanitize_diagnostic_message(str(busy_err)),
+            },
+        )
+    except Exception as exc:
+        safe_msg = sanitize_diagnostic_message(str(exc))
+        logger.error("Unhandled error preparing studio for '%s': %s", project_id, safe_msg)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "FINAL_SCRIPT_MISSING",
+                "message": safe_msg,
+                "errors": [safe_msg],
+            },
+        )
     if manifest.script_status == "failed" or not manifest.final_script:
         err_msg = f"Failed to bootstrap script during studio preparation for project '{project_id}'."
         if manifest.errors:
-            err_msg = str(manifest.errors[-1])
+            err_msg = sanitize_diagnostic_message(str(manifest.errors[-1]))
         err_list = [e.model_dump() for e in manifest.error_details] if manifest.error_details else manifest.errors
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -881,6 +927,13 @@ async def get_providers_status() -> Dict[str, Any]:
             "name": "Groq LLM",
             "available": bool(settings.GROQ_API_KEY),
             "ready": bool(settings.GROQ_API_KEY),
+            "model": settings.GROQ_MODEL,
+        },
+        "openrouter": {
+            "name": "OpenRouter LLM",
+            "available": bool(getattr(settings, "OPENROUTER_API_KEY", None)),
+            "ready": bool(getattr(settings, "OPENROUTER_API_KEY", None)),
+            "model": getattr(settings, "OPENROUTER_MODEL", "openai/gpt-4o-mini"),
         },
         "edge_tts": {
             "name": "Edge-TTS",

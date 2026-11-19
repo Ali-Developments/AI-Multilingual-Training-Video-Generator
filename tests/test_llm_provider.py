@@ -241,8 +241,9 @@ def test_non_retryable_auth_error():
 
 def test_factory_returns_configured_provider():
     """Verify get_llm_provider instantiates the correct provider using settings."""
+    from app.services.llm.openrouter_provider import OpenRouterProvider
     provider = get_llm_provider(api_key="mock-key", model="factory-test-model")
-    assert isinstance(provider, GroqProvider)
+    assert isinstance(provider, (GroqProvider, OpenRouterProvider))
     assert provider.model_name == "factory-test-model"
 
 

@@ -10,7 +10,13 @@ from pydantic import BaseModel, ValidationError
 from app.core.config import settings
 from app.core.logging import logger
 from app.services.llm.base import LLMProvider
-from app.services.llm.schema_utils import to_strict_json_schema
+from app.services.llm.schema_utils import (
+    build_json_instance_template,
+    extract_json_payload,
+    to_compact_json_schema_str,
+    to_strict_json_schema,
+    validate_structured_instance,
+)
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -50,7 +56,7 @@ class GroqProvider(LLMProvider):
         if client is not None:
             self._client = client
         elif self._api_key:
-            self._client = Groq(api_key=self._api_key)
+            self._client = Groq(api_key=self._api_key, max_retries=0, timeout=60.0)
         else:
             self._client = None
 
@@ -73,7 +79,7 @@ class GroqProvider(LLMProvider):
             raise ValueError(
                 "Missing GROQ_API_KEY. Provide it in constructor or set GROQ_API_KEY in .env."
             )
-        self._client = Groq(api_key=self._api_key)
+        self._client = Groq(api_key=self._api_key, max_retries=0, timeout=60.0)
         return self._client
 
     def _execute_with_retry(self, api_call_fn):
@@ -83,6 +89,14 @@ class GroqProvider(LLMProvider):
             try:
                 return api_call_fn()
             except RateLimitError as e:
+                status_code = getattr(e, "status_code", None) or getattr(getattr(e, "response", None), "status_code", 429)
+                if status_code == 413 or "request too large" in str(e).lower():
+                    logger.error(
+                        "Groq HTTP 413 Oversized Request / TPM limit exceeded (non-retryable unchanged): %s",
+                        str(e),
+                    )
+                    raise
+
                 last_exception = e
                 delay = max(4.0, (self.retry_backoff_factor ** attempt) * 2.0)
 
@@ -124,7 +138,10 @@ class GroqProvider(LLMProvider):
                     "Groq RateLimitError on attempt %d/%d (model: %s, remaining_tokens: %s). Backing off for %.2fs: %s",
                     attempt, self.max_retries, self._model, rem_tokens or "unknown", delay, str(e)
                 )
-                time.sleep(delay)
+                if delay > 30:
+                    raise RuntimeError("Groq rate limit exceeds the retry window. Retry later.") from e
+                if attempt < self.max_retries:
+                    time.sleep(delay)
             except APIConnectionError as e:
                 last_exception = e
                 delay = max(2.0, (self.retry_backoff_factor ** attempt))
@@ -132,7 +149,8 @@ class GroqProvider(LLMProvider):
                     "Groq APIConnectionError on attempt %d/%d. Backing off for %.2fs: %s",
                     attempt, self.max_retries, delay, str(e)
                 )
-                time.sleep(delay)
+                if attempt < self.max_retries:
+                    time.sleep(delay)
             except AuthenticationError as e:
                 logger.error("Groq AuthenticationError: Invalid API key. Non-retryable: %s", str(e))
                 raise
@@ -152,7 +170,8 @@ class GroqProvider(LLMProvider):
                         "Groq transient 5xx error (%s) on attempt %d/%d. Backing off for %.2fs: %s",
                         getattr(e, "status_code", "5xx"), attempt, self.max_retries, delay, str(e)
                     )
-                    time.sleep(delay)
+                    if attempt < self.max_retries:
+                        time.sleep(delay)
                 else:
                     logger.error("Groq non-retryable APIError (%s): %s", err_code or getattr(e, "status_code", "unknown"), str(e))
                     raise
@@ -160,8 +179,9 @@ class GroqProvider(LLMProvider):
                 logger.error("Unexpected error during Groq API execution: %s", str(e))
                 raise
 
+        cause_suffix = f" Last error: {last_exception}" if last_exception else ""
         raise RuntimeError(
-            f"Groq API call failed after {self.max_retries} attempts with model '{self._model}'."
+            f"Groq API call failed after {self.max_retries} attempts with model '{self._model}'.{cause_suffix}"
         ) from last_exception
 
     def generate_text(
@@ -288,13 +308,15 @@ class GroqProvider(LLMProvider):
         max_tokens: Optional[int] = 4096,
         reasoning_effort: Optional[str] = None,
     ) -> T:
-        """Attempt 2: Fallback to json_object mode with explicit JSON prompt and local validation."""
+        """Attempt 2: Fallback to json_object mode with explicit JSON instance template and local validation."""
         client = self._get_client()
-        schema_json = json.dumps(schema.model_json_schema(), indent=2)
+        instance_template_str = build_json_instance_template(schema)
         augmented_system_prompt = (
             f"{system_prompt or 'You are a helpful assistant.'}\n\n"
-            f"You MUST output ONLY a valid JSON object matching this JSON Schema:\n{schema_json}\n\n"
-            "Ensure the JSON object includes all required fields. Output raw JSON only with no conversational text or markdown formatting."
+            f"You MUST output ONLY a valid JSON object instance for `{schema.__name__}` following this example structure:\n"
+            f"{instance_template_str}\n\n"
+            "Do NOT output a JSON Schema definition ('$defs', 'properties', 'additionalProperties') and NEVER use placeholder ellipses ('{...}', '[...]'). "
+            "Ensure the JSON object includes all required fields with real content. Output raw JSON only with no conversational text or markdown formatting."
         )
 
         messages = [
@@ -302,13 +324,16 @@ class GroqProvider(LLMProvider):
             {"role": "user", "content": prompt}
         ]
 
+        use_json_obj_fmt = True
+
         def _call_json_obj():
             params: Dict[str, Any] = {
                 "model": self._model,
                 "messages": messages,
                 "temperature": temperature,
-                "response_format": {"type": "json_object"},
             }
+            if use_json_obj_fmt:
+                params["response_format"] = {"type": "json_object"}
             if max_tokens:
                 params["max_tokens"] = max_tokens
             if reasoning_effort:
@@ -316,12 +341,25 @@ class GroqProvider(LLMProvider):
             response = client.chat.completions.create(**params)
             return response.choices[0].message.content
 
-        raw_json_str = self._execute_with_retry(_call_json_obj)
-
         try:
-            parsed_data = json.loads(raw_json_str)
-            return schema.model_validate(parsed_data)
-        except (json.JSONDecodeError, ValidationError) as val_err:
+            raw_json_str = self._execute_with_retry(_call_json_obj)
+        except APIError as api_err:
+            err_dict = getattr(api_err, "body", {}) or {}
+            err_code = err_dict.get("error", {}).get("code", "") if isinstance(err_dict, dict) else ""
+            if err_code == "json_validate_failed" or "json_validate_failed" in str(api_err):
+                logger.warning(
+                    "Groq json_object mode returned json_validate_failed for '%s'. Retrying with prompt-enforced JSON mode.",
+                    schema.__name__,
+                )
+                use_json_obj_fmt = False
+                raw_json_str = self._execute_with_retry(_call_json_obj)
+            else:
+                raise
+
+        cleaned_json_str = extract_json_payload(raw_json_str, target_schema=schema)
+        try:
+            return validate_structured_instance(raw_json_str, schema)  # type: ignore[return-value]
+        except (json.JSONDecodeError, ValidationError, ValueError) as val_err:
             logger.warning(
                 "Local validation failed on json_object fallback for '%s': %s. Executing bounded repair attempt.",
                 schema.__name__, val_err
@@ -329,7 +367,7 @@ class GroqProvider(LLMProvider):
             return self._repair_json_output(
                 prompt=prompt,
                 schema=schema,
-                previous_output=raw_json_str,
+                previous_output=cleaned_json_str or raw_json_str,
                 validation_error=str(val_err),
                 system_prompt=augmented_system_prompt,
                 temperature=temperature,
@@ -348,8 +386,9 @@ class GroqProvider(LLMProvider):
         max_tokens: Optional[int] = 4096,
         reasoning_effort: Optional[str] = None,
     ) -> T:
-        """One single repair attempt using validation error feedback."""
+        """One single repair attempt using validation error feedback and concrete instance structure."""
         client = self._get_client()
+        instance_template_str = build_json_instance_template(schema)
         repair_messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt},
@@ -358,7 +397,10 @@ class GroqProvider(LLMProvider):
                 "role": "user",
                 "content": (
                     f"The previous JSON output failed validation with the following error:\n{validation_error}\n\n"
-                    "Please output the corrected JSON object strictly conforming to the required schema."
+                    f"INVALID PREVIOUS OUTPUT:\n{previous_output[:1500]}\n\n"
+                    "Please output ONLY the corrected JSON object instance populated with real content "
+                    "(do NOT output '$defs'/'properties' schema definitions or '{...}' placeholders):\n"
+                    f"{instance_template_str}"
                 ),
             },
         ]
@@ -379,10 +421,9 @@ class GroqProvider(LLMProvider):
 
         repaired_str = self._execute_with_retry(_call_repair)
         try:
-            parsed = json.loads(repaired_str)
-            return schema.model_validate(parsed)
-        except (json.JSONDecodeError, ValidationError) as final_err:
-            logger.error("Repaired JSON output still failed validation for '%s': %s", schema.__name__, final_err)
+            return validate_structured_instance(repaired_str, schema)  # type: ignore[return-value]
+        except (json.JSONDecodeError, ValidationError, ValueError) as final_err:
+            logger.error("Repaired JSON output still failed validation for '%s'.", schema.__name__)
             raise ValueError(
-                f"Groq output validation failed for {schema.__name__} after repair attempt: {final_err}\nRaw: {repaired_str}"
+                f"Groq output validation failed for {schema.__name__} after repair attempt."
             ) from final_err

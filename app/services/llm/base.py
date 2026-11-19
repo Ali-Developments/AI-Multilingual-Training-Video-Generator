@@ -21,6 +21,15 @@ class LLMProvider(ABC):
         """Return the name or identifier of the active underlying model."""
         pass
 
+    @property
+    def prefers_staged_script_generation(self) -> bool:
+        """
+        Whether this provider/model should use staged structured script generation
+        (Outline -> Scene-by-Scene -> Assembly -> Validation -> Targeted Scene Repair)
+        instead of a monolithic single-shot ScriptDraft completion.
+        """
+        return False
+
     @abstractmethod
     def generate_text(
         self,

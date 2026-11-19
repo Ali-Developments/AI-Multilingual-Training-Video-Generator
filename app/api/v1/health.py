@@ -31,6 +31,14 @@ async def get_health() -> HealthResponse:
 
     logger.debug(f"Health check executed. Storage accessible: {storage_accessible}")
 
+    active_llm = (getattr(settings, "LLM_PROVIDER", None) or settings.DEFAULT_LLM_PROVIDER).lower()
+    if active_llm == "openrouter":
+        active_llm_model = settings.OPENROUTER_MODEL
+    elif active_llm == "groq":
+        active_llm_model = settings.GROQ_MODEL
+    else:
+        active_llm_model = active_llm
+
     return HealthResponse(
         status="healthy" if storage_accessible else "degraded",
         app_name=settings.APP_NAME,
@@ -39,9 +47,9 @@ async def get_health() -> HealthResponse:
         debug=settings.DEBUG,
         storage_accessible=storage_accessible,
         details={
-            "default_llm": settings.DEFAULT_LLM_PROVIDER,
-            "llm_provider": settings.DEFAULT_LLM_PROVIDER,
-            "llm_model": settings.GROQ_MODEL if settings.DEFAULT_LLM_PROVIDER == "groq" else settings.DEFAULT_LLM_PROVIDER,
+            "default_llm": active_llm,
+            "llm_provider": active_llm,
+            "llm_model": active_llm_model,
             "default_tts": settings.DEFAULT_TTS_PROVIDER,
             "default_avatar": settings.DEFAULT_AVATAR_PROVIDER,
             "enable_live_heygen": getattr(settings, "ENABLE_LIVE_HEYGEN", False),

@@ -1,4 +1,10 @@
 /** @type {import('next').NextConfig} */
+const backendOrigin = (
+  process.env.BACKEND_URL ||
+  process.env.NEXT_PUBLIC_API_URL ||
+  "http://127.0.0.1:8000"
+).replace(/\/$/, "");
+
 const nextConfig = {
   reactStrictMode: true,
   experimental: {
@@ -8,11 +14,11 @@ const nextConfig = {
     return [
       {
         source: "/api/v1/:path*",
-        destination: "http://127.0.0.1:8000/api/v1/:path*",
+        destination: `${backendOrigin}/api/v1/:path*`,
       },
       {
         source: "/storage/:path*",
-        destination: "http://127.0.0.1:8000/storage/:path*",
+        destination: `${backendOrigin}/storage/:path*`,
       },
     ];
   },

@@ -2,6 +2,7 @@
 
 from typing import Optional
 from app.models.schemas import TrainingVideoRequest, ContentAnalysis, ScriptDraft, ScriptValidationResult
+from app.services.localization.locale_utils import get_language_name
 
 SYSTEM_PROMPT_CONTENT_ANALYZER = (
     "You are an expert instructional designer and curriculum architect. "
@@ -11,6 +12,7 @@ SYSTEM_PROMPT_CONTENT_ANALYZER = (
     "- Assign stable, clean IDs to learning objectives (e.g., 'LO1', 'LO2', 'LO3').\n"
     "- Identify critical domain terminology that must remain precise.\n"
     "- Recommend a logical scene count and structure suited to the target duration.\n"
+    "- Write all analysis output fields in the requested Canonical Language, translating from the source material if it is written in a different or mixed language, while preserving technical terms, product names, and proper nouns where appropriate.\n"
     "- Output valid JSON matching the ContentAnalysis schema."
 )
 
@@ -19,6 +21,7 @@ SYSTEM_PROMPT_SCRIPT_WRITER = (
     "Your objective is to produce engaging, modular, video-ready scripts for an AI presenter "
     "with supporting visual guidance, camera/motion directions, and on-screen text.\n"
     "Pedagogical & Structural Guidelines:\n"
+    "- Canonical Language Enforcement: Author EVERY generated text field (title, opening_hook, closing_summary, learning_objectives, and scene title, purpose, narration, visual_direction, on_screen_text) strictly in the requested Canonical Language. If the source material or topic is in another language or mixed languages, translate and adapt it naturally into the Canonical Language. Preserve technical terms, product names, and proper nouns where appropriate.\n"
     "- Complete Objective Coverage: 100% of the defined learning objectives MUST be addressed. Every single objective must be taught in at least one instructional scene.\n"
     "- Meaningful Instruction: Teach each objective through substantive spoken narration and concrete visual direction. Avoid generic filler scenes that do not contribute to educational outcomes.\n"
     "- Objective Tagging: Explicitly assign the correct learning objective IDs (e.g. ['LO1']) to the scenes that teach them. Multiple objectives may be legitimately assigned to a single scene when conceptually unified.\n"
@@ -31,8 +34,9 @@ SYSTEM_PROMPT_SCRIPT_WRITER = (
 SYSTEM_PROMPT_SCRIPT_REVISER = (
     "You are a master educational quality assurance editor for instructional video scripts. "
     "Your task is to fix specific defects identified by the automated validation layer, "
-    "including uncovered learning objectives, duration discrepancies, and scene integrity defects.\n"
+    "including language mismatches, uncovered learning objectives, duration discrepancies, and scene integrity defects.\n"
     "Revision Rules:\n"
+    "- Canonical Language Compliance: Ensure all script fields (title, opening_hook, narration, visual_direction, on_screen_text, closing_summary) are written in the required Canonical Language.\n"
     "- Objective Remediation: When learning objectives are uncovered, you must substantively teach them by adding new scenes or expanding relevant existing scenes with targeted narration and visual direction. Never simply attach missing objective IDs to unrelated scenes without updating narration.\n"
     "- Preserve Compliant Content: Keep valid, compliant scenes intact to maintain pedagogical and narrative continuity.\n"
     "- Complete Coverage: Ensure 100% of required learning objectives are represented in scene learning_objective_ids.\n"
@@ -54,16 +58,26 @@ def build_content_analysis_prompt(request: TrainingVideoRequest) -> str:
         objectives_clause = f"User Requested Objectives:\n{formatted}\n"
 
     target_mins = round(request.target_duration_seconds / 60, 1)
+    canonical_lang = request.base_language or "en-US"
+    canonical_lang_name = get_language_name(canonical_lang)
+    src_lang = getattr(request, "detected_source_language", None) or getattr(request, "source_language", "auto")
 
     return (
         f"Perform an instructional design analysis for an educational video with the following requirements:\n"
         f"{content_clause}"
+        f"Source Material Language: {src_lang}\n"
         f"Target Audience: {request.audience}\n"
-        f"Base Language: {request.base_language}\n"
+        f"Base Language: {canonical_lang} ({canonical_lang_name})\n"
+        f"Canonical Output Language: {canonical_lang} ({canonical_lang_name})\n"
         f"Target Total Duration: {request.target_duration_seconds} seconds (~{target_mins} minutes)\n"
         f"Desired Tone: {request.tone}\n"
         f"Difficulty Level: {request.difficulty_level or 'intermediate'}\n"
         f"{objectives_clause}\n"
+        f"MANDATORY LANGUAGE INSTRUCTION:\n"
+        f"Write all analysis fields (topic_summary, key_concepts, learning_objectives descriptions, audience_notes, "
+        f"recommended_structure, factual_constraints) in {canonical_lang_name} ({canonical_lang}), even if the Topic or "
+        f"Source Material is written in another language or mixed languages. Preserve technical terms, product names, "
+        f"and proper nouns where appropriate.\n\n"
         f"Analyze this material and generate a structured ContentAnalysis blueprint. "
         f"Ensure every learning objective is assigned a clean ID (LO1, LO2, etc.)."
     )
@@ -76,6 +90,8 @@ def build_workflow_script_prompt(request: TrainingVideoRequest, analysis: Conten
     obj_ids_formatted = ", ".join(f"'{oid}'" for oid in all_obj_ids)
     key_terms = ", ".join(analysis.important_terms) if analysis.important_terms else "None specified"
     structure = " -> ".join(analysis.recommended_structure) if analysis.recommended_structure else "Standard progression"
+    canonical_lang = request.base_language or "en-US"
+    canonical_lang_name = get_language_name(canonical_lang)
 
     coverage_instructions = (
         f"MANDATORY LEARNING OBJECTIVES COVERAGE:\n"
@@ -88,28 +104,39 @@ def build_workflow_script_prompt(request: TrainingVideoRequest, analysis: Conten
         f"4. Valid IDs Only: Only use valid IDs from [{obj_ids_formatted}]. Do not reference unknown or hallucinated objective IDs."
     )
 
+    language_instructions = (
+        f"MANDATORY CANONICAL LANGUAGE REQUIREMENT ({canonical_lang_name} / '{canonical_lang}'):\n"
+        f"- Set script 'language' to '{canonical_lang}'.\n"
+        f"- Write ALL script fields—including 'title', 'opening_hook', 'closing_summary', 'learning_objectives' descriptions, "
+        f"and every scene's 'title', 'purpose', 'narration', 'visual_direction', and 'on_screen_text'—strictly in {canonical_lang_name} ('{canonical_lang}').\n"
+        f"- If the input topic or source material is in a different language or mixed languages, translate and adapt all spoken narration "
+        f"and text into natural, fluent {canonical_lang_name} ('{canonical_lang}').\n"
+        f"- Preserve technical terms, product names, and proper nouns where appropriate."
+    )
+
     return (
         f"Generate a canonical, scene-by-scene instructional video script based on the following analysis:\n\n"
         f"Topic Summary: {analysis.topic_summary}\n"
         f"Target Audience: {request.audience}\n"
         f"Tone: {request.tone}\n"
-        f"Language: {request.base_language}\n"
+        f"Language: {canonical_lang} ({canonical_lang_name})\n"
         f"Target Total Duration: {request.target_duration_seconds} seconds\n"
         f"Recommended Scene Count: {analysis.recommended_scene_count}\n"
         f"Recommended Structure: {structure}\n"
         f"Key Terminology to Preserve: {key_terms}\n\n"
+        f"{language_instructions}\n\n"
         f"{coverage_instructions}\n\n"
         f"For each scene, provide:\n"
         f"- scene_id (e.g. 'scene_1', 'scene_2')\n"
         f"- order (1, 2, ...)\n"
-        f"- title\n"
-        f"- purpose\n"
+        f"- title (in {canonical_lang_name})\n"
+        f"- purpose (in {canonical_lang_name})\n"
         f"- scene_type (intro, presenter, explanation, visual_demo, example, recap, outro, quiz)\n"
-        f"- narration (clear spoken presenter script)\n"
-        f"- visual_direction (instructional visual guide text)\n"
+        f"- narration (clear spoken presenter script in {canonical_lang_name})\n"
+        f"- visual_direction (instructional visual guide text in {canonical_lang_name})\n"
         f"- motion_description (cinematic camera or subject movement guidance)\n"
         f"- camera_movement (e.g. 'static', 'slow zoom-in', 'pan right', 'tracking')\n"
-        f"- on_screen_text (optional short text overlay)\n"
+        f"- on_screen_text (optional short text overlay in {canonical_lang_name})\n"
         f"- learning_objective_ids (subset of [{obj_ids_formatted}])\n"
         f"- estimated_duration_seconds\n"
     )
@@ -183,13 +210,26 @@ def build_script_revision_prompt(
             f"to reach approximately {target_words} total words (~{request.target_duration_seconds} seconds).\n"
         )
 
+    canonical_lang = request.base_language or "en-US"
+    canonical_lang_name = get_language_name(canonical_lang)
+    language_remediation = ""
+    if any(i.code == "SCRIPT_LANGUAGE_MISMATCH" for i in validation.issues):
+        language_remediation = (
+            f"\nMANDATORY LANGUAGE CORRECTION:\n"
+            f"The previous draft was not written in the required Canonical Language ({canonical_lang_name} / '{canonical_lang}'). "
+            f"You MUST rewrite the entire script—including title, opening_hook, closing_summary, learning_objectives, "
+            f"and all scene titles, narrations, visual_directions, and on_screen_text—strictly in {canonical_lang_name} ('{canonical_lang}').\n"
+        )
+
     return (
         f"The current script draft failed automated quality validation with the following issues:\n"
         f"{issues_text}\n\n"
+        f"Required Canonical Language: {canonical_lang} ({canonical_lang_name})\n"
         f"Current Script Summary:\n"
         f"Title: {current_script.title}\n"
         f"Target Duration: {request.target_duration_seconds}s | Current Estimate: {validation.estimated_total_duration_seconds}s "
         f"(Deviation: {validation.duration_difference_seconds}s / {validation.duration_difference_percent:.1f}%)\n"
+        f"{language_remediation}"
         f"{duration_guidance}\n"
         f"{objective_remediation_guidance}\n"
         f"Existing Scenes & Assigned Objectives:\n"
@@ -197,10 +237,11 @@ def build_script_revision_prompt(
         f"Canonical Learning Objectives Reference:\n"
         f"{canonical_objectives_text}\n\n"
         f"REVISION INSTRUCTIONS:\n"
-        f"1. Preserve valid existing scenes whenever possible.\n"
-        f"2. Add or improve instructional content (spoken narration and visual direction) addressing each missing objective.\n"
-        f"3. Spoken durations are calculated deterministically from your narration word count (~140 WPM). "
+        f"1. Ensure all text fields and spoken narration are written in {canonical_lang_name} ('{canonical_lang}'), preserving technical terms and proper nouns where appropriate.\n"
+        f"2. Preserve valid existing scenes whenever possible.\n"
+        f"3. Add or improve instructional content (spoken narration and visual direction) addressing each missing objective.\n"
+        f"4. Spoken durations are calculated deterministically from your narration word count (~140 WPM). "
         f"Do NOT simply alter numeric duration numbers; you MUST adjust the actual text length and word count of the spoken narration.\n"
-        f"4. Please repair and regenerate the complete ScriptDraft so that all validation issues are resolved. "
+        f"5. Please repair and regenerate the complete ScriptDraft so that all validation issues are resolved. "
         f"Ensure non-empty opening_hook, valid opening scene, and 100% learning objective coverage."
     )

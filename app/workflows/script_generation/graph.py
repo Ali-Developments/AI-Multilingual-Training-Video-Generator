@@ -50,7 +50,7 @@ def route_after_validation(state: VideoScriptState) -> str:
     return "mark_needs_review"
 
 
-def create_script_workflow(llm_provider: Optional[LLMProvider] = None):
+def create_script_workflow(llm_provider: Optional[LLMProvider] = None, checkpoint=None):
     """
     Build and compile the deterministic LangGraph script generation workflow.
     
@@ -58,7 +58,7 @@ def create_script_workflow(llm_provider: Optional[LLMProvider] = None):
         llm_provider: Injected LLM provider interface. Defaults to application factory.
     """
     provider = llm_provider or get_llm_provider()
-    nodes = ScriptWorkflowNodes(llm_provider=provider)
+    nodes = ScriptWorkflowNodes(llm_provider=provider, checkpoint=checkpoint)
 
     workflow = StateGraph(VideoScriptState)
 
@@ -93,7 +93,7 @@ def create_script_workflow(llm_provider: Optional[LLMProvider] = None):
         route_after_validation,
         ["finalize_script", "revise_script", "mark_needs_review", END]
     )
-    workflow.add_edge("revise_script", "validate_script")
+    workflow.add_conditional_edges("revise_script", route_after_generate, ["validate_script", END])
     workflow.add_edge("finalize_script", END)
     workflow.add_edge("mark_needs_review", END)
 
