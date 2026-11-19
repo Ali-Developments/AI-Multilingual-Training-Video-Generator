@@ -616,7 +616,8 @@ def test_20_visual_scene_duration_follows_audio(tmp_path):
     audio_p.write_bytes(b"dummy_audio")
     vis_p = tmp_path / "v.png"
     vis_p.write_bytes(b"dummy_visual")
-    with patch("subprocess.run") as mock_run:
+    with patch("subprocess.run") as mock_run, \
+         patch("app.services.composition.ffmpeg_utils.validate_video_file"):
         mock_run.return_value = MagicMock(returncode=0)
         with patch("app.services.composition.ffmpeg_provider.get_video_duration", return_value=8.35):
             res = provider.compose_scene(
@@ -641,7 +642,8 @@ def test_21_sadtalker_scene_duration_follows_audio(tmp_path):
     audio_p.write_bytes(b"dummy_audio")
     av_p = tmp_path / "av.mp4"
     av_p.write_bytes(b"dummy_avatar")
-    with patch("subprocess.run") as mock_run:
+    with patch("subprocess.run") as mock_run, \
+         patch("app.services.composition.ffmpeg_utils.validate_video_file"):
         mock_run.return_value = MagicMock(returncode=0)
         with patch("app.services.composition.ffmpeg_provider.get_video_duration", return_value=8.35):
             res = provider.compose_scene(
@@ -662,7 +664,8 @@ def test_22_all_rendered_audio_becomes_48k_stereo(tmp_path):
     audio_p.write_bytes(b"dummy_audio")
     vis_p = tmp_path / "v.png"
     vis_p.write_bytes(b"dummy_visual")
-    with patch("subprocess.run") as mock_run:
+    with patch("subprocess.run") as mock_run, \
+         patch("app.services.composition.ffmpeg_utils.validate_video_file"):
         mock_run.return_value = MagicMock(returncode=0)
         with patch("app.services.composition.ffmpeg_provider.get_video_duration", return_value=5.0):
             provider.compose_scene(
@@ -687,7 +690,8 @@ def test_23_final_duration_equals_scene_timeline(tmp_path):
         SceneCompositionAsset(scene_id="s1", locale="ar-SA", video_path=str(tmp_path / "s1.mp4"), duration_seconds=8.0, status="completed"),
         SceneCompositionAsset(scene_id="s2", locale="ar-SA", video_path=str(tmp_path / "s2.mp4"), duration_seconds=7.0, status="completed"),
     ]
-    with patch("subprocess.run") as mock_run:
+    with patch("subprocess.run") as mock_run, \
+         patch("app.services.composition.ffmpeg_utils.validate_video_file"):
         mock_run.return_value = MagicMock(returncode=0)
         with patch("app.services.composition.ffmpeg_provider.get_video_duration", return_value=15.0):
             final = provider.concatenate_scenes(scenes, "ar-SA", tmp_path / "final.mp4")
@@ -702,7 +706,8 @@ def test_24_no_heterogeneous_concat_regression(tmp_path):
         SceneCompositionAsset(scene_id="s1", locale="ar-SA", video_path=str(tmp_path / "s1.mp4"), duration_seconds=8.35, status="completed"),
         SceneCompositionAsset(scene_id="s2", locale="ar-SA", video_path=str(tmp_path / "s2.mp4"), duration_seconds=35.86, status="completed"),
     ]
-    with patch("subprocess.run") as mock_run:
+    with patch("subprocess.run") as mock_run, \
+         patch("app.services.composition.ffmpeg_utils.validate_video_file"):
         mock_run.return_value = MagicMock(returncode=0)
         with patch("app.services.composition.ffmpeg_provider.get_video_duration", return_value=44.21):
             final = provider.concatenate_scenes(scenes, "ar-SA", tmp_path / "final.mp4")
@@ -737,7 +742,8 @@ def test_26_rtl_shaping_command_remains_valid(tmp_path):
     vis_p.write_bytes(b"dummy_visual")
     sub_file = tmp_path / "sub.ass"
     sub_file.write_text("[Script Info]\n", encoding="utf-8")
-    with patch("subprocess.run") as mock_run:
+    with patch("subprocess.run") as mock_run, \
+         patch("app.services.composition.ffmpeg_utils.validate_video_file"):
         mock_run.return_value = MagicMock(returncode=0)
         with patch("app.services.composition.ffmpeg_provider.get_video_duration", return_value=5.0):
             provider.compose_scene(

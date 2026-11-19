@@ -10,6 +10,7 @@ import re
 from app.core.config import settings
 from app.core.logging import logger
 from app.models.schemas import (
+    AnimationStep,
     SceneDraft,
     ScriptDraft,
     FinalScript,
@@ -179,7 +180,7 @@ class StoryboardPlanner:
                     "hands-on", "technique", "practice", "guide", "setup", "perform",
                     "execute", "apply", "how-to", "tutorial", "method", "drill", "تطبيق", "خطوة", "فحص"
                 )
-                if any(k in text_lower or k in topic_clean.lower() for k in demo_keywords):
+                if stype in ("visual_demo", "demonstration", "example") or any(k in text_lower or k in topic_clean.lower() for k in demo_keywords):
                     scene.media_type = SceneMediaType.BROLL.value
                     scene.layout_type = SceneLayoutType.PRESENTER_PICTURE_IN_PICTURE.value if is_persistent else SceneLayoutType.MEDIA_FULL.value
                     scene.avatar_enabled = is_persistent
@@ -283,21 +284,210 @@ class StoryboardPlanner:
                 "introduction" if is_first else ("conclusion summary" if is_last else scene.purpose)
             )
 
-            # Build comprehensive SceneMediaPlan
-            scene.media_plan = SceneMediaPlan(
-                scene_id=scene.scene_id,
-                purpose=scene.purpose or "Content delivery",
-                narration=scene.narration or "",
-                visual_description=scene.visual_direction or scene.visual_description or scene.visual_prompt or scene.title or "",
-                motion_description=scene.motion_description,
-                camera_movement=scene.camera_movement or "static",
-                reference_image_requirements=scene.reference_image_requirements,
-                preferred_provider=scene.preferred_provider,
-                target_duration=float(scene.estimated_duration_seconds or 5.0),
-                aspect_ratio=scene.aspect_ratio or "16:9",
+            # Build comprehensive narration-synchronized SceneMediaPlan
+            scene.media_plan = cls.build_demonstration_plan(
+                scene=scene,
+                topic=topic_clean,
+                is_first=is_first,
+                is_last=is_last,
             )
 
         return script
+
+    # Generic cross-domain instructional action patterns (multilingual: EN + AR)
+    _ACTION_RULES = [
+        ("cut", "chop_rhythm", ("chop", "slice", "cut", "dice", "trim", "carve", "strip", "تقطيع", "فرم", "نقطع", "قطّع", "قص")),
+        ("heat", "heat_pulse", ("heat", "boil", "simmer", "sauté", "saute", "fry", "melt", "roast", "bake", "oven", "preheat", "cook", "warm", "temperature", "thermal", "تسخين", "سلق", "غلي", "فرن", "خبز", "تذويب", "طهي", "حرارة")),
+        ("mix", "stir_circular", ("stir", "whisk", "mix", "blend", "combine", "beat", "fold", "knead", "dissolve", "agitate", "تقليب", "خلط", "خفق", "مزج", "نقلب", "نخلط")),
+        ("pour", "pour_stream", ("pour", "drizzle", "add", "fill", "drain", "strain", "inject", "dispense", "infuse", "سكب", "إضافة", "صب", "تصفية", "نضيف", "نسكب")),
+        ("assemble", "layer_stack", ("layer", "assemble", "stack", "mount", "install", "build", "arrange", "spread", "place", "tray", "align", "رص", "طبقة", "طبقات", "تجميع", "تركيب", "فرد", "صينية", "توزيع")),
+        ("measure", "highlight_scan", ("measure", "weigh", "calibrate", "gauge", "meter", "dose", "count", "ratio", "قياس", "وزن", "معايرة", "مقدار", "كمية")),
+        ("inspect", "highlight_scan", ("inspect", "verify", "check", "test", "diagnose", "scan", "audit", "examine", "observe", "فحص", "تحقق", "اختبار", "مراقبة", "ملاحظة")),
+        ("connect", "orbit_flow", ("connect", "wire", "solder", "circuit", "plug", "link", "route", "network", "pipeline", "توصيل", "ربط", "دائرة", "سلك", "شبكة")),
+        ("code", "orbit_flow", ("code", "function", "compile", "deploy", "execute", "script", "query", "api", "debug", "برمجة", "كود", "تشغيل", "تنفيذ")),
+        ("serve", "showcase_reveal", ("serve", "present", "plate", "garnish", "finish", "deliver", "lift", "reveal", "تقديم", "تزيين", "شريحة", "النتيجة", "النهائي")),
+        ("prepare", "slide_in", ("prepare", "gather", "setup", "set up", "organize", "ingredients", "tools", "materials", "equip", "تحضير", "تجهيز", "مكونات", "أدوات", "إعداد")),
+    ]
+
+    _STOPWORDS = {
+        "the", "and", "for", "with", "that", "this", "from", "into", "onto", "over", "then",
+        "your", "our", "you", "are", "was", "were", "will", "have", "has", "been", "being",
+        "about", "after", "before", "until", "while", "when", "where", "what", "which",
+        "step", "scene", "show", "showing", "demonstrate", "demonstrating", "explain",
+        "explaining", "using", "make", "making", "ensure", "properly", "carefully",
+        "في", "من", "على", "إلى", "عن", "مع", "هذا", "هذه", "التي", "الذي", "حتى",
+        "ثم", "بعد", "قبل", "عند", "كما", "أثناء", "خلال", "بين", "كل", "بشكل", "جيداً",
+    }
+
+    @classmethod
+    def _infer_action_and_movement(cls, text: str) -> tuple[str, str]:
+        """Infer generic action verb and procedural movement pattern from any instructional clause."""
+        low = (text or "").lower()
+        for action_verb, movement, keywords in cls._ACTION_RULES:
+            if any(k in low for k in keywords):
+                return action_verb, movement
+        return "highlight", "slide_in"
+
+    @classmethod
+    def _extract_scene_objects(cls, text: str, max_items: int = 6) -> List[str]:
+        """Extract concise domain object terms dynamically from scene text (no hardcoded topics)."""
+        tokens = re.findall(r"[\w\u0600-\u06FF\-]{3,}", text or "")
+        seen = set()
+        objects: List[str] = []
+        for tok in tokens:
+            clean = tok.strip("-_")
+            low = clean.lower()
+            if len(clean) < 3 or low in cls._STOPWORDS or low.isdigit():
+                continue
+            if low not in seen:
+                seen.add(low)
+                objects.append(clean)
+            if len(objects) >= max_items:
+                break
+        return objects
+
+    @classmethod
+    def _split_narration_clauses(cls, narration: str, fallback_title: str) -> List[str]:
+        """Split narration into 2-5 visual beat clauses for narration-synchronized animation."""
+        raw = (narration or "").strip()
+        if not raw:
+            return [fallback_title or "Visual demonstration"]
+
+        # Split on sentence boundaries (English & Arabic punctuation)
+        parts = [
+            p.strip()
+            for p in re.split(r"(?<=[.!?؟])\s+|[\n;؛]+", raw)
+            if p and p.strip()
+        ]
+        # If single long sentence, split on commas / conjunctions
+        if len(parts) == 1 and len(parts[0].split()) > 10:
+            sub_parts = [
+                p.strip()
+                for p in re.split(r"[,،]\s+|\s+(?:then|and then|next|after that|finally|ثم|وبعد ذلك|بعدها)\s+", parts[0], flags=re.IGNORECASE)
+                if p and p.strip()
+            ]
+            if len(sub_parts) >= 2:
+                parts = sub_parts
+
+        # Cap at 5 beats by merging trailing short clauses
+        while len(parts) > 5:
+            parts[-2] = f"{parts[-2]} {parts[-1]}".strip()
+            parts.pop()
+
+        return parts or [fallback_title or "Visual demonstration"]
+
+    @classmethod
+    def build_demonstration_plan(
+        cls,
+        scene: Any,
+        topic: str = "",
+        is_first: bool = False,
+        is_last: bool = False,
+    ) -> SceneMediaPlan:
+        """
+        Build a generic, narration-synchronized SceneMediaPlan with explicit
+        demonstration actions, required objects, object movement, and timed animation steps.
+        """
+        title = (getattr(scene, "title", "") or "").strip()
+        purpose = (getattr(scene, "purpose", "") or "Content delivery").strip()
+        narration = (getattr(scene, "narration", "") or "").strip()
+        vis_desc = (
+            getattr(scene, "visual_direction", "")
+            or getattr(scene, "visual_description", "")
+            or getattr(scene, "visual_prompt", "")
+            or title
+        ).strip()
+        media_type = str(getattr(scene, "media_type", "presenter") or "presenter").lower()
+        scene_type = str(getattr(scene, "scene_type", "presenter") or "presenter").lower()
+        target_duration = float(getattr(scene, "estimated_duration_seconds", 5.0) or 5.0)
+        transition = str(getattr(scene, "transition", "fade") or "fade")
+
+        # Determine if this scene is an active animated demonstration vs static card
+        is_quiz_or_title = media_type in ("quiz", "title") or scene_type in ("quiz", "title")
+        clauses = cls._split_narration_clauses(narration, title)
+
+        # Compute word-proportional normalized timing ratios [0.0 -> 1.0]
+        weights = [max(len(c.split()), 1) for c in clauses]
+        total_weight = float(sum(weights)) or 1.0
+
+        animation_steps: List[AnimationStep] = []
+        cursor = 0.0
+        all_objects: List[str] = []
+
+        for idx, clause in enumerate(clauses, start=1):
+            start_r = round(cursor, 4)
+            end_r = 1.0 if idx == len(clauses) else round(min(1.0, cursor + weights[idx - 1] / total_weight), 4)
+            cursor = end_r
+
+            action_verb, movement = cls._infer_action_and_movement(f"{clause} {vis_desc if idx == 1 else ''}")
+            if is_first and idx == 1 and action_verb == "highlight":
+                action_verb, movement = "present", "showcase_reveal"
+            elif is_last and idx == len(clauses) and action_verb == "highlight":
+                action_verb, movement = "serve", "showcase_reveal"
+
+            step_objs = cls._extract_scene_objects(clause, max_items=3)
+            for obj in step_objs:
+                if obj.lower() not in {o.lower() for o in all_objects}:
+                    all_objects.append(obj)
+
+            # Concise step label (first ~7 words of the clause)
+            words = clause.split()
+            short_label = " ".join(words[:7]) + ("..." if len(words) > 7 else "")
+
+            animation_steps.append(
+                AnimationStep(
+                    step_index=idx,
+                    label=short_label or f"Step {idx}",
+                    action_verb=action_verb,
+                    objects=step_objs,
+                    movement=movement,
+                    start_ratio=start_r,
+                    end_ratio=max(end_r, start_r),
+                    narration_segment=clause,
+                )
+            )
+
+        if not all_objects:
+            all_objects = cls._extract_scene_objects(f"{vis_desc} {title} {topic}", max_items=6)
+
+        primary_action, primary_movement = cls._infer_action_and_movement(f"{title} {vis_desc} {narration}")
+        if animation_steps and primary_action == "highlight":
+            primary_action = animation_steps[0].action_verb
+            primary_movement = animation_steps[0].movement
+
+        is_animated_demo = (not is_quiz_or_title) and (
+            media_type in ("broll", "motion_visual", "uploaded_video", "diagram")
+            or scene_type in ("visual_demo", "demonstration", "example", "explanation", "concept")
+            or len(animation_steps) >= 2
+            or primary_action in ("cut", "heat", "mix", "pour", "assemble", "measure", "inspect", "connect", "code", "prepare", "serve")
+        )
+
+        pref_provider = getattr(scene, "preferred_provider", None)
+        provider_hint = (
+            "uploaded_video"
+            if getattr(scene, "media_asset_path", None)
+            else ("veo" if str(pref_provider or "").lower() == "veo" else "local_motion")
+        )
+
+        return SceneMediaPlan(
+            scene_id=getattr(scene, "scene_id", "scene_1") or "scene_1",
+            purpose=purpose,
+            narration=narration,
+            visual_description=vis_desc,
+            motion_description=getattr(scene, "motion_description", None),
+            camera_movement=getattr(scene, "camera_movement", "static") or "static",
+            reference_image_requirements=getattr(scene, "reference_image_requirements", None),
+            preferred_provider=pref_provider,
+            target_duration=target_duration,
+            aspect_ratio=getattr(scene, "aspect_ratio", "16:9") or "16:9",
+            demonstration_action=f"{primary_action}: {title}" if title else primary_action,
+            required_objects=all_objects[:6],
+            object_movement=primary_movement,
+            animation_sequence=animation_steps,
+            transition_to_next=transition,
+            is_animated_demonstration=is_animated_demo,
+            animation_provider_hint=provider_hint,
+        )
 
     @staticmethod
     def _derive_search_terms(topic: str, title: str, purpose: str) -> List[str]:

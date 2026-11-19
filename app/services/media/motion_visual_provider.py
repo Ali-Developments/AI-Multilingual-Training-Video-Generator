@@ -62,7 +62,15 @@ class LocalMotionVisualProvider(SceneMediaProvider):
         out_video = output_dir / f"{scene.scene_id}_motion.mp4"
 
         dur = max(duration_seconds, 1.0)
-        cache_key = f"{scene.scene_id}:{locale}:{dur:.2f}:{scene.media_type}:{scene.layout_type}:v3_motion"
+        plan = getattr(scene, "media_plan", None)
+        plan_sig = ""
+        if plan is not None:
+            try:
+                plan_sig = f"{getattr(plan, 'demonstration_action', '')}:{len(getattr(plan, 'animation_sequence', []) or [])}"
+            except Exception:
+                plan_sig = ""
+        content_sig = hash_text(f"{getattr(scene, 'title', '')}|{getattr(scene, 'narration', '')}|{getattr(scene, 'visual_direction', '')}|{plan_sig}")
+        cache_key = f"{scene.scene_id}:{locale}:{dur:.2f}:{scene.media_type}:{scene.layout_type}:{content_sig}:v4_demo_motion"
         cache_hash = hash_text(cache_key)
 
         if out_video.exists() and out_video.stat().st_size > 1024:

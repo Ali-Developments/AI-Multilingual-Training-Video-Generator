@@ -1,5 +1,6 @@
 import os
 import shutil
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,6 +37,47 @@ from app.workflows.storyboard_planner import StoryboardPlanner
 router = APIRouter()
 manifest_manager = ProjectManifestManager()
 orchestrator = ProjectOrchestrator(manifest_manager=manifest_manager)
+
+_render_jobs_lock = threading.Lock()
+_active_render_jobs: Dict[str, threading.Thread] = {}
+
+
+def is_render_job_active(project_id: str) -> bool:
+    """Return True if a background render thread is currently active for project_id."""
+    with _render_jobs_lock:
+        worker = _active_render_jobs.get(project_id)
+        if worker is not None and worker.is_alive():
+            return True
+        if worker is not None:
+            _active_render_jobs.pop(project_id, None)
+        return False
+
+
+def _execute_background_render(project_id: str, request: Any, force_regenerate: bool) -> None:
+    """Execute synchronous rendering pipeline in a dedicated worker thread outside the asyncio event loop."""
+    try:
+        orchestrator.run_project(
+            project_id=project_id,
+            request=request,
+            force_regenerate=force_regenerate,
+        )
+    except Exception as exc:
+        logger.exception("Background rendering failed for project '%s': %s", project_id, exc)
+        try:
+            current = manifest_manager.load_manifest(project_id)
+            if current:
+                current.status = "failed"
+                current.record_error(
+                    stage="render",
+                    message=f"Project rendering error: {str(exc)}",
+                    code="RENDER_BACKGROUND_ERROR",
+                )
+                manifest_manager.save_manifest(current)
+        except Exception as save_exc:
+            logger.error("Failed to persist background render error for project '%s': %s", project_id, save_exc)
+    finally:
+        with _render_jobs_lock:
+            _active_render_jobs.pop(project_id, None)
 
 
 @router.post(
@@ -957,9 +999,9 @@ async def get_providers_status() -> Dict[str, Any]:
 @router.post(
     "/projects/{project_id}/render",
     response_model=ProjectManifest,
-    status_code=status.HTTP_200_OK,
-    summary="Render Project Video",
-    description="Execute the complete rendering pipeline (TTS, avatars, visuals, subtitles, composition) for an approved storyboard.",
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Render Project Video (Async Background Job)",
+    description="Start the complete rendering pipeline (TTS, avatars, visuals, subtitles, composition) in a background worker thread and return HTTP 202 Accepted immediately.",
 )
 async def render_project(
     project_id: str,
@@ -973,19 +1015,32 @@ async def render_project(
         )
 
     force_regen = payload.force_regenerate if payload else False
-    try:
-        updated = orchestrator.run_project(
-            project_id=project_id,
-            request=manifest.source_request,
-            force_regenerate=force_regen,
+
+    with _render_jobs_lock:
+        existing_worker = _active_render_jobs.get(project_id)
+        if existing_worker is not None and existing_worker.is_alive():
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"A rendering job is already in progress for project '{project_id}'.",
+            )
+
+        manifest.status = "rendering"
+        manifest.clear_stage_errors("render")
+        if force_regen:
+            manifest.composition_status = "pending"
+        manifest_manager.save_manifest(manifest)
+
+        worker = threading.Thread(
+            target=_execute_background_render,
+            args=(project_id, manifest.source_request, force_regen),
+            name=f"render-{project_id}",
+            daemon=True,
         )
-        return updated
-    except Exception as e:
-        logger.error("Error rendering project '%s': %s", project_id, e)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Project rendering error: {str(e)}",
-        )
+        _active_render_jobs[project_id] = worker
+        worker.start()
+
+    logger.info("Started background render job for project '%s' (force_regenerate=%s)", project_id, force_regen)
+    return manifest
 
 
 @router.post(
@@ -993,7 +1048,7 @@ async def render_project(
     response_model=ProjectManifest,
     status_code=status.HTTP_200_OK,
     summary="Run Project Pipeline",
-    description="Execute the complete end-to-end pipeline for the given project.",
+    description="Execute the complete end-to-end pipeline for the given project without blocking the asyncio event loop.",
 )
 async def run_project(
     project_id: str,
@@ -1008,7 +1063,8 @@ async def run_project(
 
     force_regen = payload.force_regenerate if payload else False
     try:
-        updated = orchestrator.run_project(
+        updated = await run_in_threadpool(
+            orchestrator.run_project,
             project_id=project_id,
             request=manifest.source_request,
             force_regenerate=force_regen,

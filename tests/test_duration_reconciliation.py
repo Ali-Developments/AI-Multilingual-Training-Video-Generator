@@ -174,6 +174,7 @@ def test_visual_scene_duration_follows_audio(tmp_path):
     measured_audio_duration = 7.92
 
     with patch("app.services.composition.ffmpeg_provider.check_ffmpeg_available", return_value=True), \
+         patch("app.services.composition.ffmpeg_utils.validate_video_file"), \
          patch("app.services.composition.ffmpeg_provider.get_video_duration", return_value=7.92), \
          patch("subprocess.run") as mock_run:
         mock_run.return_value = MagicMock(returncode=0, stderr="")
@@ -196,7 +197,7 @@ def test_visual_scene_duration_follows_audio(tmp_path):
         assert "-t" in cmd
         t_idx = cmd.index("-t")
         assert cmd[t_idx + 1] == str(measured_audio_duration)
-        assert "-shortest" in cmd
+        assert "-map" in cmd and "1:a:0" in cmd
 
 
 # ---------------------------------------------------------------------------
@@ -213,6 +214,7 @@ def test_avatar_scene_duration_follows_audio(tmp_path):
     measured_audio_duration = 8.35
 
     with patch("app.services.composition.ffmpeg_provider.check_ffmpeg_available", return_value=True), \
+         patch("app.services.composition.ffmpeg_utils.validate_video_file"), \
          patch("app.services.composition.ffmpeg_provider.get_video_duration", return_value=8.35), \
          patch("subprocess.run") as mock_run:
         mock_run.return_value = MagicMock(returncode=0, stderr="")
@@ -254,6 +256,7 @@ def test_final_duration_equals_sum_of_scene_durations(tmp_path):
     out_path = tmp_path / "final.mp4"
 
     with patch("app.services.composition.ffmpeg_provider.check_ffmpeg_available", return_value=True), \
+         patch("app.services.composition.ffmpeg_utils.validate_video_file"), \
          patch("app.services.composition.ffmpeg_provider.get_video_duration", return_value=44.21), \
          patch("subprocess.run") as mock_run:
         mock_run.return_value = MagicMock(returncode=0, stderr="")

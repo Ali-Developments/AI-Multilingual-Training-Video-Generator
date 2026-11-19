@@ -176,17 +176,25 @@ def test_render_endpoint_exists_and_calls_orchestrator(client, tmp_path, monkeyp
     mgr.create_manifest(project_id, req)
 
     with patch.object(orch, "run_project") as mock_run:
-        mock_manifest = mgr.load_manifest(project_id)
-        mock_manifest.status = "completed"
-        mock_run.return_value = mock_manifest
+        done_event = __import__("threading").Event()
+
+        def _fake_run(**kwargs):
+            m = mgr.load_manifest(project_id)
+            m.status = "completed"
+            mgr.save_manifest(m)
+            done_event.set()
+            return m
+
+        mock_run.side_effect = _fake_run
 
         res = client.post(f"/api/v1/projects/{project_id}/render", json={"force_regenerate": False})
-        assert res.status_code == 200
-        mock_run.assert_called_once_with(
-            project_id=project_id,
-            request=mock_manifest.source_request,
-            force_regenerate=False,
-        )
+        assert res.status_code == 202
+        assert res.json()["status"] == "rendering"
+        assert done_event.wait(timeout=5.0), "Background render worker did not finish in time"
+        mock_run.assert_called_once()
+        _, call_kwargs = mock_run.call_args
+        assert call_kwargs["project_id"] == project_id
+        assert call_kwargs["force_regenerate"] is False
 
 
 def test_storyboard_is_reused_during_run_project(tmp_path):
@@ -279,9 +287,18 @@ def test_failed_render_surfaces_error(client, tmp_path, monkeypatch):
 
     with patch.object(orch, "run_project", side_effect=RuntimeError("FFmpeg encoding failed: invalid audio stream")):
         res = client.post(f"/api/v1/projects/{project_id}/render", json={"force_regenerate": False})
-        assert res.status_code == 500
-        data = res.json()
-        assert "FFmpeg encoding failed: invalid audio stream" in data["detail"]
+        assert res.status_code == 202
+        import time
+        deadline = time.time() + 5.0
+        polled = None
+        while time.time() < deadline:
+            polled = client.get(f"/api/v1/projects/{project_id}").json()
+            if polled["status"] == "failed":
+                break
+            time.sleep(0.05)
+        assert polled is not None
+        assert polled["status"] == "failed"
+        assert any("FFmpeg encoding failed: invalid audio stream" in err for err in polled["errors"])
 
 
 def test_presenter_scene_invokes_sadtalker(tmp_path):

@@ -163,12 +163,15 @@ class CompositionService:
             motion_path: Optional[Path] = None
             try:
                 media_out_dir = self.output_base_dir / project_id / "media" / locale
+                # Only pass custom user-uploaded images as background_image_path; avoid
+                # layering procedural motion animations over a static Pillow snapshot of themselves.
+                motion_bg = None if getattr(scene, "media_asset_path", None) is None else vis_path
                 motion_path = self.media_service.generate_scene_media(
                     scene=scene,
                     locale=locale,
                     output_dir=media_out_dir,
                     duration_seconds=duration,
-                    background_image_path=vis_path,
+                    background_image_path=motion_bg,
                     project_storage_dir=self.output_base_dir / project_id,
                 )
             except Exception as e:

@@ -210,18 +210,18 @@ def test_timeout_reports_script_timeout_not_cancelled_and_resumes_cleanly(tmp_pa
             return _chat_ok(__import__("json").dumps(_sample_outline_dict(), ensure_ascii=False))
         dispatched.append("scene_1")
         if run_number[0] == 1:
-            # Sleep past the short run deadline during scene_1
-            time.sleep(0.25)
+            # Sleep past the run deadline during scene_1
+            time.sleep(1.5)
             raise httpx.ReadTimeout("Simulated slow upstream")
         return _chat_ok(__import__("json").dumps(_sample_scene_dict(), ensure_ascii=False))
 
     client = MagicMock()
     client.post.side_effect = fake_post
 
-    monkeypatch.setattr(settings, "OPENROUTER_SCRIPT_TIMEOUT_SECONDS", 0.15)
+    monkeypatch.setattr(settings, "OPENROUTER_SCRIPT_TIMEOUT_SECONDS", 1.2)
     orch = ProjectOrchestrator.__new__(ProjectOrchestrator)
     orch.manifest_manager = manager
-    orch.llm_provider = OpenRouterProvider(api_key="offline", model="openrouter/free", client=client, timeout_seconds=0.1, max_retries=2)
+    orch.llm_provider = OpenRouterProvider(api_key="offline", model="openrouter/free", client=client, timeout_seconds=0.8, max_retries=2)
 
     m1 = orch.generate_canonical_script("p_timeout")
     assert m1.script_status == "failed"

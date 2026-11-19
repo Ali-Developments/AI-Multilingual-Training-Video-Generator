@@ -56,6 +56,25 @@ class QuizData(BaseModel):
     explanation: Optional[str] = Field(default=None, description="Brief educational rationale for the answer")
 
 
+class AnimationStep(BaseModel):
+    """Single narration-synchronized visual action step within a scene demonstration."""
+
+    step_index: int = Field(..., ge=1, description="1-indexed step order within the scene animation")
+    label: str = Field(..., description="Short human-readable label describing the visual action")
+    action_verb: str = Field(
+        default="highlight",
+        description="Normalized generic action category (prepare, cut, heat, mix, pour, assemble, bake, inspect, measure, connect, code, flow, present, highlight)",
+    )
+    objects: List[str] = Field(default_factory=list, description="Domain objects involved in this visual step")
+    movement: str = Field(
+        default="highlight_scan",
+        description="Procedural movement pattern (chop_rhythm, heat_pulse, stir_circular, pour_stream, layer_stack, orbit_flow, highlight_scan, slide_in, showcase_reveal)",
+    )
+    start_ratio: float = Field(default=0.0, ge=0.0, le=1.0, description="Normalized start timestamp ratio (0.0-1.0) within scene duration")
+    end_ratio: float = Field(default=1.0, ge=0.0, le=1.0, description="Normalized end timestamp ratio (0.0-1.0) within scene duration")
+    narration_segment: str = Field(default="", description="Narration clause synchronized with this visual step")
+
+
 class SceneMediaPlan(BaseModel):
     """Structured media production plan for video, avatar, and b-roll generation."""
 
@@ -69,6 +88,14 @@ class SceneMediaPlan(BaseModel):
     preferred_provider: Optional[str] = Field(default=None, description="Target provider: heygen, veo, local_motion, mock, sadtalker, quiz")
     target_duration: float = Field(default=5.0, ge=0.1, description="Target duration in seconds")
     aspect_ratio: str = Field(default="16:9", description="Aspect ratio (16:9, 9:16, 1:1)")
+    # Structured instructional demonstration & animation synchronization fields
+    demonstration_action: Optional[str] = Field(default=None, description="Primary physical, procedural, or conceptual action being demonstrated")
+    required_objects: List[str] = Field(default_factory=list, description="Key objects, tools, materials, or UI elements depicted in the scene")
+    object_movement: Optional[str] = Field(default=None, description="Primary object motion pattern synchronized with narration")
+    animation_sequence: List[AnimationStep] = Field(default_factory=list, description="Ordered timeline of narration-synchronized visual animation steps")
+    transition_to_next: str = Field(default="fade", description="Transition into the next scene (fade, cut, slide, crossfade)")
+    is_animated_demonstration: bool = Field(default=False, description="True when scene depicts an active step-by-step visual demonstration rather than a static card")
+    animation_provider_hint: str = Field(default="local_motion", description="Provider-independent hint for animation synthesis (local_motion, veo, uploaded_video, external_ai_video)")
 
 
 class BrandingConfig(BaseModel):

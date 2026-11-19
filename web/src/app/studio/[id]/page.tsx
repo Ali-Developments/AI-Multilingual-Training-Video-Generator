@@ -60,8 +60,9 @@ export default function SceneStudioPage() {
   // Inspector form state
   const [activeScene, setActiveScene] = useState<SceneDraft | null>(null);
 
-  // Player state
+  // Player & polling refs
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
@@ -81,6 +82,80 @@ export default function SceneStudioPage() {
     }, 6000);
   }, []);
 
+  const stopRenderPolling = useCallback(() => {
+    if (pollIntervalRef.current) {
+      clearInterval(pollIntervalRef.current);
+      pollIntervalRef.current = null;
+    }
+  }, []);
+
+  const resolveRenderStageLabel = useCallback((proj: ProjectManifest, locale: string): string => {
+    if (proj.localization_status === 'running') return `Localizing narration for ${locale}...`;
+    if (proj.audio_status === 'running') return 'Synthesizing speech & measuring waveforms...';
+    if (proj.avatar_status === 'running') return 'Generating presenter avatars (SadTalker)...';
+    if (proj.visual_status === 'running') return 'Generating animated visual demonstrations...';
+    if (proj.subtitle_status === 'running') return 'Generating synchronized multilingual subtitles...';
+    if (proj.composition_status === 'running') return 'Composing scenes & concatenating final video with FFmpeg...';
+    return 'Rendering in progress on backend worker...';
+  }, []);
+
+  const startRenderPolling = useCallback(
+    (localeForReload: string) => {
+      stopRenderPolling();
+      setRendering(true);
+      setRenderError(null);
+
+      const pollOnce = async () => {
+        try {
+          const pollManifest = await fetchProject(projectId);
+          if (!pollManifest) return;
+          setManifest(pollManifest);
+
+          const st = pollManifest.status;
+          if (st === 'completed') {
+            stopRenderPolling();
+            setRenderStage('Loading rendered video assets...');
+            const updatedScenes = await fetchScenes(projectId, localeForReload).catch(() => []);
+            if (updatedScenes.length > 0) setScenes(updatedScenes);
+            setRendering(false);
+            setRenderStage('');
+            setPreviewMode('full');
+            showToast('success', 'Rendering Complete', 'Video generated successfully. Preview ready.');
+            return;
+          }
+
+          if (st === 'failed' || st === 'pending_approval') {
+            stopRenderPolling();
+            const errMsg =
+              pollManifest.errors?.[pollManifest.errors.length - 1] ||
+              (st === 'pending_approval' ? 'Paid media budget approval required before rendering.' : 'Rendering failed.');
+            setRenderError(errMsg);
+            setRendering(false);
+            setRenderStage('');
+            showToast('error', st === 'pending_approval' ? 'Approval Required' : 'Rendering Failed', errMsg);
+            return;
+          }
+
+          setRenderStage(resolveRenderStageLabel(pollManifest, localeForReload));
+        } catch {
+          // Transient poll errors do not abort background monitoring
+        }
+      };
+
+      void pollOnce();
+      pollIntervalRef.current = setInterval(() => {
+        void pollOnce();
+      }, 2500);
+    },
+    [projectId, resolveRenderStageLabel, showToast, stopRenderPolling]
+  );
+
+  useEffect(() => {
+    return () => {
+      stopRenderPolling();
+    };
+  }, [stopRenderPolling]);
+
   const loadProjectData = useCallback(async () => {
     try {
       setLoading(true);
@@ -99,12 +174,20 @@ export default function SceneStudioPage() {
 
       const mediaItems = await fetchProjectMedia(projectId).catch(() => []);
       setMediaList(mediaItems);
+
+      // Resume monitoring seamlessly if a background render is already in progress after browser refresh
+      if (proj.status === 'rendering' || proj.status === 'running') {
+        setRenderStage(resolveRenderStageLabel(proj, defaultLoc));
+        startRenderPolling(defaultLoc);
+      } else if (proj.status === 'completed' || proj.composition_status === 'completed') {
+        setPreviewMode('full');
+      }
     } catch (err) {
       console.error('Failed to load project:', err);
     } finally {
       setLoading(false);
     }
-  }, [projectId]);
+  }, [projectId, resolveRenderStageLabel, startRenderPolling]);
 
   useEffect(() => {
     if (projectId) {
@@ -171,78 +254,31 @@ export default function SceneStudioPage() {
   };
 
   const handleRunRender = async () => {
-    let pollInterval: NodeJS.Timeout | null = null;
     try {
       setRendering(true);
       setRenderError(null);
-      setRenderStage('Preparing render pipeline...');
+      setRenderStage('Starting background render job...');
 
-      const stageLabels = [
-        'Preparing audio & narration tracks...',
-        `Localizing narration for ${selectedLocale}...`,
-        'Synthesizing speech with Edge-TTS...',
-        'Measuring exact audio waveform durations...',
-        'Reconciling narration duration with target...',
-        'Generating presenter avatars (SadTalker Local GPU)...',
-        'Generating motion visuals and B-roll slides...',
-        'Rendering and composing individual scenes...',
-        'Composing final multilingual video with FFmpeg...',
-      ];
-      let stageIdx = 0;
+      // POST /api/v1/projects/{project_id}/render returns HTTP 202 Accepted immediately
+      const acceptedManifest = await renderProject(projectId, false);
+      setManifest(acceptedManifest);
+      setRenderStage(resolveRenderStageLabel(acceptedManifest, selectedLocale));
 
-      pollInterval = setInterval(async () => {
-        try {
-          const pollManifest = await fetchProject(projectId);
-          if (pollManifest) {
-            if (pollManifest.audio_status === 'running') {
-              setRenderStage('Synthesizing speech & measuring waveforms...');
-            } else if (pollManifest.avatar_status === 'running') {
-              setRenderStage('Generating presenter avatars (SadTalker)...');
-            } else if (pollManifest.visual_status === 'running') {
-              setRenderStage('Generating motion visuals and B-roll slides...');
-            } else if (pollManifest.composition_status === 'running') {
-              setRenderStage('Composing scenes & concatenating with FFmpeg...');
-            } else {
-              stageIdx = (stageIdx + 1) % stageLabels.length;
-              setRenderStage(stageLabels[stageIdx]);
-            }
-          }
-        } catch {
-          // ignore poller errors
-        }
-      }, 2500);
-
-      // Call conceptual POST /api/v1/projects/{project_id}/render
-      await renderProject(projectId, false);
-
-      if (pollInterval) clearInterval(pollInterval);
-      setRenderStage('Loading rendered video assets...');
-
-      const updated = await fetchProject(projectId);
-      setManifest(updated);
-
-      const updatedScenes = await fetchScenes(projectId, selectedLocale);
-      setScenes(updatedScenes);
-
-      if (updated.status === 'completed' || updated.composition_status === 'completed') {
-        showToast('success', 'Rendering Complete', 'Video generated successfully. Preview ready.');
-        setPreviewMode('full');
-      } else if (updated.status === 'failed' || (updated.errors && updated.errors.length > 0)) {
-        const errMsg = updated.errors?.[updated.errors.length - 1] || 'Rendering failed';
-        setRenderError(errMsg);
-        showToast('error', 'Rendering Incomplete', errMsg);
-      } else {
-        showToast('info', 'Render Finished', `Status: ${updated.status}`);
-      }
+      // Monitor background rendering progress every 2.5s until terminal state
+      startRenderPolling(selectedLocale);
     } catch (err: any) {
-      if (pollInterval) clearInterval(pollInterval);
       const msg = err?.message || String(err) || 'Rendering Failed';
+      if (msg.includes('409')) {
+        // A render job is already active for this project; attach poller cleanly
+        showToast('info', 'Render Already Running', 'Attached to the active background render job.');
+        startRenderPolling(selectedLocale);
+        return;
+      }
+      stopRenderPolling();
       setRenderError(msg);
-      showToast('error', 'Rendering Failed', msg);
-    } finally {
-      if (pollInterval) clearInterval(pollInterval);
       setRendering(false);
       setRenderStage('');
+      showToast('error', 'Rendering Failed', msg);
     }
   };
 
@@ -435,7 +471,6 @@ export default function SceneStudioPage() {
             )}
             {scenes.map((sc, idx) => {
               const isSelected = idx === selectedSceneIndex;
-              const isPresenter = sc.media_type === 'presenter' || sc.avatar_enabled;
               const isQuiz = sc.media_type === 'quiz';
 
               return (

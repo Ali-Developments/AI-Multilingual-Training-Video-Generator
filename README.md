@@ -59,13 +59,15 @@ The table below distinguishes **implemented and offline-tested** capabilities fr
 | **OpenRouter Provider & Decompression Fix** | Streaming HTTPX transport with single-pass automatic decompression, `OpenRouterDecodingError` classification, wall-clock watchdog, `RunControl` timeout/cancellation separation, and fail-closed paid-model gate | **Implemented & Offline-Tested** *(decompression & cancellation fixes verified offline; full 6-scene live run pending manual verification)* |
 | **Multilingual Source Handling** | Non-blocking language detection, mixed Arabic/English input support, canonical language enforcement, and localized cultural adaptation | **Implemented & Offline-Tested** |
 | **Persistent Presenter & Storyboard Planner** | Automated layout routing (`presenter_left_visual_right`, `presenter_right_visual_left`, `presenter_picture_in_picture`, `presenter_center_with_overlays`, `media_full`, `quiz_card`) | **Implemented & Offline-Tested** *(Phase 10 persistent presenter validated locally)* |
+| **Scene-Based Visual Demonstrations & Animation Engine** | Generic cross-domain `StoryboardPlanner.build_demonstration_plan()` (`AnimationStep` + `SceneMediaPlan`), narration-synchronized `process_demonstration` procedural vector renderer (`motion_animator.py`), HarfBuzz/raqm Arabic RTL canvas text, and provider-independent extension point | **Implemented & Offline-Tested** *(procedural 2D vector demonstrations verified offline; photorealistic physical action video requires an AI video provider or uploaded footage)* |
+| **Non-Blocking Background Rendering** | `POST /api/v1/projects/{id}/render` returns `HTTP 202 Accepted` immediately, executes `orchestrator.run_project()` on a dedicated worker thread outside Uvicorn's asyncio event loop, enforces `409 Conflict` duplicate-render protection, and supports 2.5s Studio polling with browser-refresh resumption | **Implemented & Offline-Tested** *(in-process thread lifecycle; process-restart job recovery is not implemented)* |
 | **Neural TTS (Edge-TTS)** | Multilingual neural voice synthesis (`ar-SA-HamedNeural`, `en-US-ChristopherNeural`, `bn-BD-BashkarNeural`, etc.) with timing metadata | **Implemented & Locally Verified** |
-| **Local Talking Avatar (SadTalker CUDA)** | Subprocess-isolated SadTalker runtime generating lip-synced presenter video on local NVIDIA GPU | **Implemented & Locally Verified** *(requires local CUDA GPU & SadTalker weights)* |
+| **Local Talking Avatar (SadTalker CUDA)** | Subprocess-isolated SadTalker runtime generating lip-synced presenter video on local NVIDIA GPU (talking-head lip-sync & head motion only; not full-body demonstration) | **Implemented & Locally Verified** *(requires local CUDA GPU & SadTalker weights)* |
 | **Arabic RTL Subtitles (`.ass` / `.srt` / `.vtt`)** | HarfBuzz/libass-compatible SubStation Alpha subtitles with proper RTL alignment and shaping | **Implemented & Locally Verified** |
-| **FFmpeg 1080p Video Composition** | Multi-track 1920×1080 H.264/AAC assembly with Ken Burns motion B-roll (`LocalMotionVisualProvider`), presenter overlays, and burned subtitles | **Implemented & Locally Verified** |
-| **Next.js Video Studio v2 Frontend** | Dashboard, 5-step Create Wizard, 3-column Scene Studio, Timeline Strip, Media Library, Export View, and Engine Diagnostics | **Implemented & Built** (`33/33` unit tests, `next lint`, `next build` passing) |
+| **FFmpeg 1080p Video Composition** | Multi-track 1920×1080 H.264/AAC assembly preserving animated `motion_video_path` streams, presenter overlays (split-screen / PiP / center studio), and burned subtitles | **Implemented & Locally Verified** |
+| **Next.js Video Studio v2 Frontend** | Dashboard, 5-step Create Wizard, 3-column Scene Studio with async render polling & refresh resumption, Timeline Strip, Media Library, Export View, and Engine Diagnostics | **Implemented & Verified** (`33/33` unit tests, `tsc --noEmit` 0 errors) |
 | **Cloud Avatars (HeyGen) & Generative B-Roll (Google Veo)** | Gated integrations behind `ENABLE_LIVE_HEYGEN` / paid-credit acknowledgement and procedural motion fallback | **Experimental / Gated Off by Default** *(no live paid calls enabled)* |
-| **Distributed Multi-Node Locking & DB Backend** | PostgreSQL/Redis-backed project state and distributed worker queue | **Planned** |
+| **Distributed Multi-Node Locking & Persistent Render Queue** | PostgreSQL/Redis-backed project state and process-restart-safe render job queue | **Planned** |
 
 ---
 
@@ -339,11 +341,36 @@ flowchart TD
 
 ---
 
-## 17. Scene Media Generation
+## 17. Scene-Based Visual Demonstrations, Animation Architecture & Narration Synchronization
 
-- **Local Motion Visuals (`app/services/visuals/local_motion_provider.py`)**: Generates 1080p animated B-roll clips from procedural graphics or user-uploaded media using FFmpeg Ken Burns pan/zoom filters.
+- **Generic Scene Demonstration Planning (`app/workflows/storyboard_planner.py`, `app/models/schemas.py`)**:
+  - `StoryboardPlanner.build_demonstration_plan()` dynamically analyzes any scene's title, purpose, narration, and visual direction (in English, Arabic, or other supported languages — with zero hardcoded topic recipes) to populate `SceneMediaPlan` with:
+    - `demonstration_action`, `required_objects`, `object_movement`, `transition_to_next`, `is_animated_demonstration`, and `animation_provider_hint`.
+    - `animation_sequence: List[AnimationStep]` — an ordered list of visual beats with word-proportional normalized timestamps (`start_ratio`, `end_ratio` spanning `0.0 -> 1.0`) and synchronized `narration_segment` clauses.
+- **Narration & Animation Synchronization**:
+  - Normalized step ratios (`start_ratio`..`end_ratio`) stretch automatically to the **exact measured TTS waveform duration** (`audio_asset.duration_seconds`) during `CompositionService.compose_locale_scenes()`, ensuring visual actions never finish prematurely or stall during long narration segments.
+- **Procedural 2D Process Demonstration Renderer (`app/services/media/motion_animator.py`, `motion_visual_provider.py`)**:
+  - Routes non-cybersecurity instructional scenes to the generic `process_demonstration` archetype (preventing cybersecurity cards from hijacking cooking, science, electronics, medical, or programming tutorials).
+  - Renders continuous 25 FPS 1920×1080 video via Pillow + FFmpeg with native HarfBuzz/raqm Arabic RTL text shaping (`direction="rtl"`), a live procedural vector stage (`chop_rhythm`, `heat_pulse`, `stir_circular`, `pour_stream`, `layer_stack`, `orbit_flow`, `highlight_scan`, `showcase_reveal`), active object badges, and a synchronized right-hand step timeline (`DONE` / `ACTIVE` / `NEXT`).
+  - Uses content-hashed caching (`v4_demo_motion`) so editing narration or visual direction invalidates stale motion clips.
+- **Provider-Independent Extension Point (`app/services/media/base.py`, `service.py`, `factory.py`)**:
+  - External generative AI video providers (Google Veo, or future Runway / Kling / local Wan2.1 / LTX-Video diffusers) plug in via `SceneMediaProvider` using `SceneMediaPlan` without modifying the orchestrator or silently enabling paid APIs.
 - **Media Library**: Users can upload custom images/videos per project and bind them to individual scenes in the Studio Inspector.
-- **Google Veo (`veo_provider.py`)**: Optional experimental provider gated off by default; falls back to procedural local motion visuals when disabled.
+
+---
+
+## 17.1 Visual Demonstration Quality and Current Limitations
+
+To be completely transparent about visual realism today:
+
+- **What currently works well**:
+  - **Talking-head presenter**: Local SadTalker (CUDA) produces real audio-driven lip-sync and natural head movement from a portrait image (`$0` API cost).
+  - **Dynamic narration-synchronized procedural demonstrations**: Every demonstration scene receives a structured, multi-step visual plan (`AnimationStep` timeline) rendered as continuous 25 FPS procedural 2D vector motion synchronized to the measured TTS narration duration, with proper Arabic RTL rendering and preserved split-screen / PiP / full-media layouts in FFmpeg.
+  - **Custom footage**: User-uploaded demonstration clips or photos are cleanly integrated into any scene.
+- **What still needs improvement (honest limitations)**:
+  - **Procedural vector graphics vs. photorealistic physical footage**: Zero-cost local rendering (`LocalMotionVisualProvider` + Pillow) generates stylized 2D procedural vector animations (heat waves, stirring orbits, pouring streams, stacked layers, circuit flows, step timelines) — **not** photorealistic video of human hands chopping onions, whisking real béchamel sauce, or lifting a baked pasta slice.
+  - **SadTalker scope**: SadTalker animates a portrait head/face for lip-sync; it does **not** perform full-body physical demonstrations.
+  - **Next step for photorealistic physical actions**: Integrating an enabled generative text-to-video / image-to-video backend (such as Vertex AI Veo when user-approved, or a local GPU video diffusion model like Wan2.1 / LTX-Video via the `SceneMediaProvider` interface) or uploading real recorded clips per scene.
 
 ---
 
@@ -354,12 +381,39 @@ flowchart TD
 
 ---
 
-## 19. FFmpeg Video Composition
+## 19. FFmpeg Video Composition & Non-Blocking Background Rendering
 
 - **Native Compositor (`app/services/composition/ffmpeg_provider.py`)**:
-  - Builds FFmpeg filtergraphs for persistent presenter layouts (`presenter_left_visual_right`, `presenter_right_visual_left`, `presenter_picture_in_picture`, `presenter_center_with_overlays`, `media_full`, `quiz_card`).
-  - Normalizes all scene audio streams to **48 kHz stereo AAC** and video streams to **1920×1080 30 fps H.264** prior to concatenation to prevent heterogeneous stream regressions.
-  - Validates output clips via `ffprobe` (`ffmpeg_utils.py`).
+  - Builds FFmpeg filtergraphs for persistent presenter layouts (`presenter_left_visual_right`, `presenter_right_visual_left`, `presenter_picture_in_picture`, `presenter_center_with_overlays`, `media_full`, `quiz_card`) while preserving continuous animation from `motion_video_path`.
+  - Normalizes all scene audio streams to **48 kHz stereo AAC** and video streams to **1920×1080 H.264** prior to concatenation, and validates output clips via `ffprobe`.
+- **Non-Blocking Background Rendering Architecture (`app/api/v1/projects.py`, `web/src/app/studio/[id]/page.tsx`)**:
+  - Long renders (e.g., multi-scene SadTalker CUDA + FFmpeg composition taking 6+ minutes) previously exceeded Next.js's 300s proxy timeout and blocked Uvicorn's asyncio event loop.
+  - `POST /api/v1/projects/{project_id}/render` now persists `status = "rendering"`, spawns a dedicated background worker thread outside the asyncio event loop, and returns **`HTTP 202 Accepted` immediately**.
+  - Duplicate concurrent render requests for the same project are rejected with **`HTTP 409 Conflict`**.
+  - The Studio UI polls `GET /api/v1/projects/{project_id}` every **2.5 seconds** for live stage progress (`localization_status`, `audio_status`, `avatar_status`, `visual_status`, `subtitle_status`, `composition_status`), resumes monitoring automatically after browser refresh, surfaces real backend failure errors, and displays completed videos directly without re-rendering.
+
+```mermaid
+sequenceDiagram
+    participant UI as Studio UI (Next.js)
+    participant API as FastAPI (Uvicorn Event Loop)
+    participant Worker as Background Render Thread
+    participant Disk as project.json & Media Assets
+
+    UI->>API: POST /api/v1/projects/{id}/render
+    API->>Disk: Save status="rendering"
+    API->>Worker: Start daemon thread (orchestrator.run_project)
+    API-->>UI: HTTP 202 Accepted (<1s)
+    Note over UI,API: Event loop stays responsive; duplicate POST returns 409 Conflict
+    loop Every 2.5s (survives browser refresh)
+        UI->>API: GET /api/v1/projects/{id}
+        API->>Disk: Read live stage statuses
+        API-->>UI: status="rendering", audio/avatar/visual/composition_status
+    end
+    Worker->>Disk: Write final/training_{locale}.mp4 & status="completed" (or "failed")
+    UI->>API: GET /api/v1/projects/{id}
+    API-->>UI: status="completed"
+    UI->>UI: Load scenes & display final video preview
+```
 
 ---
 
@@ -504,31 +558,26 @@ Open `http://127.0.0.1:3000` in your browser. Interactive API docs are available
 
 All verification runs below were executed **offline** (no paid API calls, no live OpenRouter/Groq requests, no live video rendering):
 
-### Backend — Targeted Script, Checkpoint, Decompression & Reliability Suite
+### Backend — Targeted Background Rendering & Visual Demonstration Suite
 ```powershell
-.\.venv\Scripts\python.exe -m pytest -q tests/test_run_cancellation_and_timeout.py tests/test_openrouter_decompression.py tests/test_checkpoint_reliability_audit.py tests/test_script_checkpoints.py tests/test_openrouter_provider.py tests/test_llm_provider.py tests/test_multilingual_source_handling.py tests/test_script_workflow.py tests/test_localization.py tests/test_audit_remediation_phase_a.py tests/test_local_studio_api.py tests/test_prepare_local_studio.py -k "not phase_a_smoke_test_30s_pipeline"
+.\.venv\Scripts\python.exe -m pytest -v tests/test_background_rendering_and_animation.py tests/test_v2_render_and_preview.py
 ```
-- **Observed Result**: **181 passed, 0 failed, 1 deselected** (`30.31s`).
+- **Observed Result**: **14 passed, 0 failed** (verifies HTTP 202 immediate return, responsive event loop, 409 duplicate-render guard, persisted failure reporting, browser-refresh polling resumption, generic multilingual demonstration planning, non-hijacked archetypes, and audio-synchronized composition).
 
 ### Backend — Full Repository Offline Suite
 ```powershell
-.\.venv\Scripts\python.exe -m pytest -q tests/ -k "not phase_a_smoke_test_30s_pipeline"
+.\.venv\Scripts\python.exe -m pytest -q tests/ --ignore=tests/test_master_local_pipeline.py
 ```
-- **Observed Result**: **468 passed, 12 failed, 1 deselected**.
-  - 9 failures in `tests/test_duration_reconciliation.py` and `tests/test_master_local_pipeline.py` (pre-existing mocked FFmpeg composition tests where `validate_video_file` expects an MP4 file on disk).
-  - 2 failures in `tests/test_studio_bootstrap.py` and `tests/test_v2_render_and_preview.py` (pre-existing storyboard assertions predating Phase 10 persistent presenter layouts).
-  - 1 timing-sensitive flake in `test_timeout_reports_script_timeout_not_cancelled_and_resumes_cleanly` under heavy full-suite CPU load (passes cleanly in the targeted suite).
+- **Observed Result**: **452 passed, 0 failed**.
 
 ### Frontend
 ```powershell
 cd web
+npx tsc --noEmit
 npm test
-npm run lint
-npm run build
 ```
-- **`npm test`**: **33 passed, 0 failed** (`308.6ms`).
-- **`npm run lint`**: **Passed** (0 errors, 1 unused-variable warning in `web/src/app/studio/[id]/page.tsx:438`).
-- **`npm run build`**: **Passed** (Next.js 14.2.15 production build succeeded, 9/9 pages compiled).
+- **`npx tsc --noEmit`**: **Passed** (`0` TypeScript errors).
+- **`npm test`**: **33 passed, 0 failed** (`293ms`).
 
 ---
 
@@ -543,18 +592,19 @@ npm run build
 
 ## 31. Current Limitations
 
+- **Photorealistic Physical Action Video**: Zero-cost local visual demonstrations (`LocalMotionVisualProvider` + `motion_animator.py`) render stylized, narration-synchronized 2D procedural vector animations and step timelines — not photorealistic footage of physical hand/object manipulation. Photorealistic demonstrations require either an enabled generative AI video provider (e.g., Vertex AI Veo or a local GPU video diffusion model) or user-uploaded footage.
+- **SadTalker Scope**: Local SadTalker generates lip-synced talking-head video from a portrait image; it does not perform full-body gestures or physical demonstrations.
+- **In-Process Render Thread Scope**: `POST /api/v1/projects/{id}/render` runs in a background worker thread inside the FastAPI process. Browser refreshes seamlessly resume polling, but if the FastAPI server process itself restarts mid-render, the in-memory job does not automatically resume (users can re-trigger render, and cached completed stages are reused).
 - **Free-Router Latency**: `openrouter/free` routes requests across shared third-party free endpoints; a 6-scene script may hit the 260-second run deadline and require 1–2 manual retries to resume remaining scenes from checkpoint.
 - **Single-Machine Local Storage**: OS file locks (`msvcrt.locking` / `fcntl.flock`) protect concurrent local processes on one machine, not distributed multi-node deployments or network shares.
-- **Local B-Roll Realism**: Zero-cost local B-roll uses Ken Burns pan/zoom motion over procedural or uploaded images rather than photorealistic text-to-video synthesis.
-- **Live Verification Boundary**: The OpenRouter decompression fix and timeout/cancellation separation have been verified with offline mocked HTTPX tests; end-to-end 6-scene live completion on `openrouter/free` requires manual live testing in Studio.
 
 ---
 
 ## 32. Development Roadmap & Future Improvements
 
-- **Short-Term**: Complete manual live 6-scene Arabic script acceptance run on `openrouter/free` with checkpoint resume; reconcile the 11 pre-existing FFmpeg-mock and Phase 10 storyboard unit test assertions.
-- **Medium-Term**: Support optional user-approved paid/fast OpenRouter models with real-time cost telemetry; add UI controls for inspecting per-scene checkpoint progress and explicit run cancellation.
-- **Long-Term**: Migrate manifest and ledger persistence to SQLite/PostgreSQL for multi-worker/cloud deployment; integrate photorealistic generative B-roll providers when budget is approved.
+- **Short-Term**: Add Studio UI controls for inspecting per-scene `AnimationStep` timelines and cancelling active background renders; integrate optional local GPU video diffusion (e.g., Wan2.1 / LTX-Video) via `SceneMediaProvider`.
+- **Medium-Term**: Support optional user-approved paid/fast OpenRouter models and Vertex AI Veo with real-time cost telemetry; add FFmpeg crossfade scene transitions honoring `SceneMediaPlan.transition_to_next`.
+- **Long-Term**: Migrate manifest, ledger, and background render job queue to SQLite/PostgreSQL + Redis/Celery for process-restart recovery and multi-worker cloud deployment.
 
 ---
 

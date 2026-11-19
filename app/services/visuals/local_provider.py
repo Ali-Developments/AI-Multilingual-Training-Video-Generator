@@ -12,6 +12,7 @@ from app.services.media.motion_animator import (
     _render_email_security_frame,
     _render_safe_handling_frame,
     _render_incident_response_frame,
+    _render_process_demonstration_frame,
     _render_general_concept_frame,
     _get_font,
     _wrap_text,
@@ -101,6 +102,8 @@ class LocalVisualProvider(VisualAssetProvider):
                 image = _render_safe_handling_frame(width, height, sec, dur, scene)
             elif archetype == "incident_response":
                 image = _render_incident_response_frame(width, height, sec, dur, scene)
+            elif archetype == "process_demonstration":
+                image = _render_process_demonstration_frame(width, height, sec, dur, scene)
             else:
                 image = _render_general_concept_frame(width, height, sec, dur, scene)
 

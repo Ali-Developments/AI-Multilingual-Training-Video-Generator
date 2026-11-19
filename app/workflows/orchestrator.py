@@ -474,7 +474,10 @@ class ProjectOrchestrator:
                 has_existing_storyboard = all(
                     getattr(s, "layout_type", None)
                     and getattr(s, "media_type", None)
-                    and getattr(s, "preferred_provider", None) is not None
+                    and (
+                        getattr(s, "preferred_provider", None) is not None
+                        or bool(getattr(s, "visual_prompt", None))
+                    )
                     for s in manifest.final_script.scenes
                 )
                 if force_regenerate or not has_existing_storyboard:
